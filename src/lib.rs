@@ -4,6 +4,7 @@
 compile_error!("le-wm-nv is Linux/NVIDIA CUDA only.");
 
 pub mod checkpoint;
+pub mod data;
 
 #[cfg(feature = "hub")]
 pub mod hub;

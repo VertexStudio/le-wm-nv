@@ -36,7 +36,8 @@ crate that preserves device residency.
   CUDA preprocessing, NV12 CUDA preprocessing, and NVDECODE capability/parser
   plumbing.
 - LeWM training surface: PLDM, VCReg, temporal-straightening losses,
-  batch-loss API, AdamW training CLI, and safetensors save/reload.
+  batch-loss API, AdamW training CLIs, PushT HDF5 dataset streaming, and
+  safetensors save/reload.
 - Python bootstrap tooling: official `stable-worldmodel[train]` package via
   `uv`, checkpoint conversion, PushT batch export, Python parity fixture export,
   and Python-vs-Rust image-planning benchmark scripts.
@@ -201,6 +202,35 @@ cargo run --release --locked --bin lewm-train-batch -- \
   --lr 1e-5 \
   --output target/pusht-lewm-trained.safetensors
 ```
+
+Train LeWM from the PushT HDF5 dataset without Python in the data/training
+path:
+
+```bash
+cargo run --release --locked --bin lewm-train-pusht -- \
+  --device cuda \
+  --dataset-h5 ~/.stable_worldmodel/pusht_expert_train.h5 \
+  --epochs 100 \
+  --batch-size 64 \
+  --history-size 3 \
+  --action-block 5 \
+  --output-dir target/pusht-from-scratch
+```
+
+`lewm-train-pusht` reads `pusht_expert_train.h5` natively through Rust HDF5
+with in-process Blosc filter support. It reproduces the Python exporter dataset
+semantics: valid row selection from `episode_idx`, `step_idx`, and `ep_len`;
+image history rows at `row + idx * action_block`; flattened action blocks; and
+dataset-wide action mean/std normalization. Because PushT H5 pixels are already
+decoded RGB arrays, the optimized path is HDF5 host reads, raw RGB
+host-to-CUDA transfer, CUDA resize/normalize/history assembly, and LeWM
+training on Candle CUDA tensors. It does not use nvJPEG or NVDECODE.
+
+The trainer writes `metrics.jsonl`, `dataset-summary.json`, `model-config.json`,
+`training-state.json`, `latest.safetensors`, periodic
+`checkpoint-step-*.safetensors` files, and `final.safetensors`. Resume is
+currently weights-only via `--init-safetensors`; AdamW moment state is recorded
+as not serialized in `training-state.json`.
 
 ## Reports
 
