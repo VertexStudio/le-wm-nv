@@ -274,6 +274,19 @@ uv run --locked --no-dev \
   --output-dir target/reports/pusht-lewm-demo
 ```
 
+Run the same demo with a locally trained Rust checkpoint:
+
+```bash
+uv run --locked --no-dev \
+  python tools/run_pusht_lewm_rust_demo.py \
+  --weights target/pusht-from-scratch/latest.safetensors \
+  --config target/pusht-from-scratch/model-config.json \
+  --planner icem \
+  --history-size 1 \
+  --replans 2 \
+  --output-dir target/reports/pusht-from-scratch-demo
+```
+
 Run Python-vs-Rust image-planning benchmark tooling:
 
 ```bash

@@ -141,7 +141,7 @@ fn main() -> anyhow::Result<()> {
     let load_started = Instant::now();
     let (weights, config) = resolve_files(&args)?;
     let cfg = match config.as_ref() {
-        Some(path) => LeWmConfig::from_stable_worldmodel_json_file(path)?,
+        Some(path) => LeWmConfig::from_json_file(path)?,
         None => LeWmConfig::tiny_patch14_224(2),
     };
     let checkpoint_history = cfg.history_size;

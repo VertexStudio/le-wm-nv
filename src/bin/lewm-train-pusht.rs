@@ -485,17 +485,7 @@ fn load_or_default_config(
 }
 
 fn load_config(path: &PathBuf) -> anyhow::Result<LeWmConfig> {
-    let json = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    match LeWmConfig::from_stable_worldmodel_json_str(&json) {
-        Ok(cfg) => Ok(cfg),
-        Err(stable_err) => serde_json::from_str(&json).with_context(|| {
-            format!(
-                "failed to parse {} as stable-worldmodel or repo-native LeWM config; stable parse error: {stable_err}",
-                path.display()
-            )
-        }),
-    }
+    LeWmConfig::from_json_file(path)
 }
 
 fn validate_model_config(cfg: &LeWmConfig, dataset: &PushTDataset) -> anyhow::Result<()> {

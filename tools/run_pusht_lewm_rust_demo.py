@@ -20,6 +20,8 @@ def parse_args() -> argparse.Namespace:
     default_pusht_h5 = Path.home() / ".stable_worldmodel" / "pusht_expert_train.h5"
     parser.add_argument("--output-dir", type=Path, default=Path("target/reports/pusht-demo"))
     parser.add_argument("--hf-repo", default="quentinll/lewm-pusht")
+    parser.add_argument("--weights", type=Path, default=None)
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--planner", choices=("cem", "mppi", "icem"), default="icem")
     parser.add_argument("--samples", type=int, default=1024)
     parser.add_argument("--iterations", type=int, default=5)
@@ -142,6 +144,8 @@ def main() -> None:
         "seed": args.seed,
         "env": "swm/PushT-v1",
         "hf_repo": args.hf_repo,
+        "weights": str(args.weights) if args.weights is not None else None,
+        "config": str(args.config) if args.config is not None else None,
         "dataset": {
             "path": str(args.dataset_h5),
             "row": eval_case["row"],
@@ -220,6 +224,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--goal-offset-steps must be greater than zero")
     if args.eval_index < 0:
         raise ValueError("--eval-index must be non-negative")
+    if (args.weights is None) != (args.config is None):
+        raise ValueError("--weights and --config must be provided together")
 
 
 def save_history(input_dir: Path, frames: list[np.ndarray], label: int | str) -> list[Path]:
@@ -305,13 +311,9 @@ def run_rust_planner(
         "run",
         "--release",
         "--locked",
-        "--features",
-        "hub",
         "--bin",
         "lewm-plan-images",
         "--",
-        "--hf-repo",
-        args.hf_repo,
         "--goal",
         str(goal_path),
         "--planner",
@@ -329,6 +331,11 @@ def run_rust_planner(
         "--output",
         str(output_html),
     ]
+    if args.weights is not None and args.config is not None:
+        cmd.extend(["--weights", str(args.weights), "--config", str(args.config)])
+    else:
+        cmd[4:4] = ["--features", "hub"]
+        cmd.extend(["--hf-repo", args.hf_repo])
     for path in current_paths:
         cmd.extend(["--current", str(path)])
     subprocess.run(cmd, check=True)
@@ -425,6 +432,11 @@ def render_demo_html(payload: dict) -> str:
         f'<img src="{rel(path)}" alt="final history frame">'
         for path in payload["final_history"]
     )
+    checkpoint = (
+        f'weights <code>{payload["weights"]}</code>'
+        if payload.get("weights")
+        else f'<code>{payload["hf_repo"]}</code>'
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -447,7 +459,7 @@ code {{ color: #dbe4ef; }}
 <body>
 <main>
 <h1>PushT LeWM Rust Demo</h1>
-<p><code>swm/PushT-v1</code> frames, <code>{payload["hf_repo"]}</code> checkpoint, Rust/Candle CUDA planner, then selected actions executed in PushT.</p>
+<p><code>swm/PushT-v1</code> frames, {checkpoint} checkpoint, Rust/Candle CUDA planner, then selected actions executed in PushT.</p>
 <section class="grid">
 <div class="panel"><h2>Initial Current History</h2><div class="history">{current_images}</div></div>
 <div class="panel"><h2>Goal</h2><img src="{rel(payload["goal_image"])}" alt="goal"></div>

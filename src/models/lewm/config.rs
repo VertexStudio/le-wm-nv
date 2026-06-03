@@ -137,6 +137,24 @@ impl LeWmConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
+    pub fn from_json_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let json = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Self::from_json_str(&json).with_context(|| format!("failed to parse {}", path.display()))
+    }
+
+    pub fn from_json_str(json: &str) -> anyhow::Result<Self> {
+        match Self::from_stable_worldmodel_json_str(json) {
+            Ok(cfg) => Ok(cfg),
+            Err(stable_err) => serde_json::from_str(json).with_context(|| {
+                format!(
+                    "failed to parse as stable-worldmodel or repo-native LeWM config; stable parse error: {stable_err}"
+                )
+            }),
+        }
+    }
+
     pub fn from_stable_worldmodel_json_str(json: &str) -> anyhow::Result<Self> {
         let stable: StableLeWmConfig = serde_json::from_str(json)?;
         stable.try_into()

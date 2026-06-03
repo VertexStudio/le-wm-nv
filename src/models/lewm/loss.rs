@@ -114,7 +114,29 @@ fn cosine_similarity(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
 }
 
 fn norm_last_dim(x: &Tensor) -> Result<Tensor> {
-    let norm = x.sqr()?.sum(D::Minus1)?.sqrt()?;
-    let floor = Tensor::new(COSINE_EPS as f32, norm.device())?.broadcast_as(norm.shape())?;
-    norm.broadcast_maximum(&floor)
+    (x.sqr()?.sum(D::Minus1)? + COSINE_EPS)?.sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use candle::{DType, Device, Result, Var};
+
+    use super::*;
+
+    #[test]
+    fn temporal_straightening_backward_is_finite_for_zero_motion() -> Result<()> {
+        let device = Device::Cpu;
+        let x = Var::zeros((2, 3, 4), DType::F32, &device)?;
+        let loss = temporal_straightening_loss(x.as_tensor())?;
+        let grads = loss.backward()?;
+        let grad = grads
+            .get(x.as_tensor())
+            .expect("zero-motion input should receive a gradient");
+        let values = grad.flatten_all()?.to_vec1::<f32>()?;
+        assert!(
+            values.iter().all(|value| value.is_finite()),
+            "gradient contains non-finite values: {values:?}"
+        );
+        Ok(())
+    }
 }
