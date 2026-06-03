@@ -1,0 +1,51 @@
+[package]
+name = "le-wm-nv"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "NVIDIA/CUDA-first LeWM training and inference runtime."
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+candle = { package = "candle-core", version = "0.10.2", features = ["cuda", "cudnn"] }
+candle-nn = { package = "candle-nn", version = "0.10.2", features = ["cuda", "cudnn"] }
+candle-transformers = { version = "0.10.2", features = ["cuda", "cudnn"] }
+
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"], optional = true }
+nvjpeg-sys = "0.1.0"
+
+[features]
+hub = ["dep:hf-hub"]
+
+[lib]
+name = "le_wm_nv"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "lewm-inspect"
+path = "src/bin/lewm-inspect.rs"
+
+[[bin]]
+name = "lewm-compare-fixture"
+path = "src/bin/lewm-compare-fixture.rs"
+
+[[bin]]
+name = "lewm-plan-fixture"
+path = "src/bin/lewm-plan-fixture.rs"
+
+[[bin]]
+name = "lewm-plan-images"
+path = "src/bin/lewm-plan-images.rs"
+
+[[bin]]
+name = "lewm-compare-training-loss"
+path = "src/bin/lewm-compare-training-loss.rs"
+
+[[bin]]
+name = "lewm-train-batch"
+path = "src/bin/lewm-train-batch.rs"

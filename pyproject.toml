@@ -1,0 +1,21 @@
+[project]
+name = "le-wm-nv-tools"
+version = "0.1.0"
+description = "Python parity tooling for le-wm-nv."
+requires-python = ">=3.12"
+dependencies = [
+    "h5py>=3.16.0",
+    "hdf5plugin>=6.0.0",
+    "imageio>=2.37.0",
+    "numpy>=2.0",
+    "opencv-python-headless>=4.13.0.92",
+    "pygame>=2.6.0",
+    "pymunk>=7.0.0",
+    "safetensors>=0.7.0",
+    "shapely>=2.0.0",
+    "stable-worldmodel[train]>=0.1.0",
+    "transformers<5",
+]
+
+[tool.uv]
+package = false
