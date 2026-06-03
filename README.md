@@ -2,6 +2,8 @@
 
 NVIDIA/CUDA-first LeWM training and inference runtime.
 
+![le-wm-nv CUDA runtime architecture](docs/le-wm-nv.png)
+
 This repo is focused on one model family: LeWM image world models from
 `stable-worldmodel`. The runtime target is Linux with NVIDIA hardware, CUDA,
 cuDNN, nvJPEG, NVDECODE, and Candle CUDA tensors. The hot path is:
