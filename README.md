@@ -228,9 +228,25 @@ training on Candle CUDA tensors. It does not use nvJPEG or NVDECODE.
 
 The trainer writes `metrics.jsonl`, `dataset-summary.json`, `model-config.json`,
 `training-state.json`, `latest.safetensors`, periodic
-`checkpoint-step-*.safetensors` files, and `final.safetensors`. Resume is
-currently weights-only via `--init-safetensors`; AdamW moment state is recorded
-as not serialized in `training-state.json`.
+`checkpoint-step-*.safetensors` files, `optimizer.safetensors`, periodic
+`optimizer-step-*.safetensors` files, `final.safetensors`, and
+`final-optimizer.safetensors`. Use `--init-safetensors` for a weights-only warm
+start. Use `--resume-dir` for exact continuation from `latest.safetensors`,
+`optimizer.safetensors`, and `training-state.json`; the trainer resumes from the
+saved `global_step`, which maps deterministically back to the same epoch shuffle
+and next batch.
+
+```bash
+cargo run --release --locked --bin lewm-train-pusht -- \
+  --device cuda \
+  --dataset-h5 ~/.stable_worldmodel/pusht_expert_train.h5 \
+  --resume-dir target/pusht-from-scratch \
+  --epochs 100 \
+  --batch-size 64 \
+  --history-size 3 \
+  --action-block 5 \
+  --output-dir target/pusht-from-scratch
+```
 
 ## Reports
 

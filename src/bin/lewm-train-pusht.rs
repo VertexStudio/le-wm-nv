@@ -7,15 +7,16 @@ use std::{
 
 use anyhow::{Context, ensure};
 use candle::{DType, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use candle_nn::{ParamsAdamW, VarBuilder, VarMap};
 use clap::Parser;
 use hdf5::filters::blosc_set_nthreads;
 use le_wm_nv::{
     data::pusht::{PushTBatchConfig, PushTDataset, PushTDatasetSummary},
     models::lewm::{LeWm, LeWmBatchLoss, LeWmConfig, LeWmLossWeights, batch_loss},
+    optim::StatefulAdamW,
     runtime::{DTypeSpec, DeviceSpec},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -34,6 +35,10 @@ struct Args {
     /// Optional trainable initialization or weights-only resume checkpoint.
     #[arg(long)]
     init_safetensors: Option<PathBuf>,
+
+    /// Resume weights, AdamW state, and sampler position from a previous output directory.
+    #[arg(long)]
+    resume_dir: Option<PathBuf>,
 
     #[arg(long, default_value_t = DeviceSpec::Cuda(0))]
     device: DeviceSpec,
@@ -139,6 +144,14 @@ fn main() -> anyhow::Result<()> {
         dataset.valid_rows().len(),
         args.batch_size
     );
+    let run = RunSettings::from_args(&args, &dataset_path);
+    let resume_state = match args.resume_dir.as_ref() {
+        Some(dir) => Some(load_resume_state(dir)?),
+        None => None,
+    };
+    if let Some(state) = resume_state.as_ref() {
+        ensure_resume_compatible(&run, &state.run)?;
+    }
 
     let device = args.device.resolve()?;
     let dtype = args.dtype.dtype();
@@ -165,7 +178,12 @@ fn main() -> anyhow::Result<()> {
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, dtype, &device);
     let model = LeWm::new(cfg.clone(), vb)?;
-    if let Some(path) = args.init_safetensors.as_ref() {
+    if let Some(dir) = args.resume_dir.as_ref() {
+        let path = dir.join("latest.safetensors");
+        varmap
+            .load(&path)
+            .with_context(|| format!("failed to load {}", path.display()))?;
+    } else if let Some(path) = args.init_safetensors.as_ref() {
         varmap
             .load(path)
             .with_context(|| format!("failed to load {}", path.display()))?;
@@ -176,9 +194,21 @@ fn main() -> anyhow::Result<()> {
         weight_decay: args.weight_decay,
         ..ParamsAdamW::default()
     };
-    let mut optimizer = AdamW::new(varmap.all_vars(), params)?;
+    let mut optimizer = StatefulAdamW::new_from_varmap(&varmap, params)?;
+    let start_step = if let Some(state) = resume_state.as_ref() {
+        let dir = args
+            .resume_dir
+            .as_ref()
+            .expect("resume state requires resume dir");
+        let path = dir.join("optimizer.safetensors");
+        optimizer
+            .load_state(&path, state.global_step)
+            .with_context(|| format!("failed to load {}", path.display()))?;
+        state.global_step
+    } else {
+        0
+    };
     let loss_weights = loss_weights(&args);
-    let run = RunSettings::from_args(&args, &dataset_path);
     let metrics_path = args.output_dir.join("metrics.jsonl");
     let metrics_file = File::create(&metrics_path)
         .with_context(|| format!("failed to create {}", metrics_path.display()))?;
@@ -203,82 +233,106 @@ fn main() -> anyhow::Result<()> {
         args.lr,
         args.weight_decay,
     );
+    if let Some(dir) = args.resume_dir.as_ref() {
+        println!(
+            "resume_dir={} start_step={} optimizer_step={}",
+            dir.display(),
+            start_step,
+            optimizer.step_t()
+        );
+    }
 
-    let mut global_step = 0usize;
+    let epoch_steps = args
+        .epochs
+        .checked_mul(batches_per_epoch)
+        .context("--epochs * batches_per_epoch overflowed")?;
+    let target_steps = args
+        .max_steps
+        .map(|max_steps| max_steps.min(epoch_steps))
+        .unwrap_or(epoch_steps);
+    ensure!(
+        start_step < target_steps,
+        "resume start_step {start_step} is already at or beyond target_steps {target_steps}"
+    );
+
+    let mut global_step = start_step;
     let mut last_loss = None;
-    let mut last_epoch = 0usize;
-    let mut last_batch_index = 0usize;
-    'epochs: for epoch in 0..args.epochs {
-        let seed = args
-            .seed
-            .wrapping_add((epoch as u64).wrapping_mul(0x9E3779B97F4A7C15));
-        let rows = dataset.shuffled_valid_rows(seed);
-        for (batch_index, chunk) in rows
-            .chunks_exact(args.batch_size)
-            .take(batches_per_epoch)
-            .enumerate()
-        {
-            if args
-                .max_steps
-                .is_some_and(|max_steps| global_step >= max_steps)
-            {
-                break 'epochs;
-            }
-            let data = dataset.batch(chunk, dtype, &device)?;
-            let loss = batch_loss(&model, &data.pixels, &data.actions, loss_weights)?;
-            let scalars = loss_scalars(&loss)?;
-            ensure_finite_loss(global_step + 1, scalars.total)?;
-            optimizer.backward_step(&loss.total_loss)?;
-            global_step += 1;
-            last_epoch = epoch;
-            last_batch_index = batch_index;
-            last_loss = Some(scalars.clone());
+    let mut last_epoch = start_step / batches_per_epoch;
+    let mut last_batch_index = start_step % batches_per_epoch;
+    let mut cached_epoch = None;
+    let mut cached_rows = Vec::new();
+    for step_index in start_step..target_steps {
+        let epoch = step_index / batches_per_epoch;
+        let batch_index = step_index % batches_per_epoch;
+        if cached_epoch != Some(epoch) {
+            cached_rows = dataset.shuffled_valid_rows(epoch_seed(args.seed, epoch));
+            cached_epoch = Some(epoch);
+        }
+        let row_start = batch_index * args.batch_size;
+        let row_end = row_start + args.batch_size;
+        let data = dataset.batch(&cached_rows[row_start..row_end], dtype, &device)?;
+        let loss = batch_loss(&model, &data.pixels, &data.actions, loss_weights)?;
+        let scalars = loss_scalars(&loss)?;
+        ensure_finite_loss(step_index + 1, scalars.total)?;
+        optimizer.backward_step(&loss.total_loss)?;
+        global_step = step_index + 1;
+        last_epoch = epoch;
+        last_batch_index = batch_index;
+        last_loss = Some(scalars.clone());
 
-            if global_step == 1 || global_step % args.log_every == 0 {
-                print_loss(global_step, epoch, batch_index, &scalars);
-                let row = MetricsRow {
-                    kind: "train",
-                    step: global_step,
-                    epoch,
-                    batch_index,
-                    rows: data.meta.rows,
-                    episode_idx: data.meta.episode_idx,
-                    step_idx: data.meta.step_idx,
-                    lr: args.lr,
-                    weight_decay: args.weight_decay,
-                    elapsed_sec: started.elapsed().as_secs_f64(),
-                    loss: scalars.clone(),
-                };
-                write_json_line(&mut metrics, &row)?;
-            }
+        if global_step == 1 || global_step % args.log_every == 0 {
+            print_loss(global_step, epoch, batch_index, &scalars);
+            let row = MetricsRow {
+                kind: "train",
+                step: global_step,
+                epoch,
+                batch_index,
+                rows: data.meta.rows,
+                episode_idx: data.meta.episode_idx,
+                step_idx: data.meta.step_idx,
+                lr: args.lr,
+                weight_decay: args.weight_decay,
+                elapsed_sec: started.elapsed().as_secs_f64(),
+                loss: scalars.clone(),
+            };
+            write_json_line(&mut metrics, &row)?;
+        }
 
-            if args.save_every > 0 && global_step % args.save_every == 0 {
-                let checkpoint = args
-                    .output_dir
-                    .join(format!("checkpoint-step-{global_step:08}.safetensors"));
-                save_weights(&varmap, &checkpoint)?;
-                save_weights(&varmap, &args.output_dir.join("latest.safetensors"))?;
-                let state = TrainingState::new(
-                    started_at_unix,
-                    &run,
-                    &dataset_summary,
-                    &cfg,
-                    global_step,
-                    epoch,
-                    batch_index,
-                    batches_per_epoch,
-                    Some(&checkpoint),
-                    last_loss.as_ref(),
-                );
-                write_pretty_json(&args.output_dir.join("training-state.json"), &state)?;
-            }
+        if args.save_every > 0 && global_step % args.save_every == 0 {
+            let checkpoint = args
+                .output_dir
+                .join(format!("checkpoint-step-{global_step:08}.safetensors"));
+            let optimizer_checkpoint = args
+                .output_dir
+                .join(format!("optimizer-step-{global_step:08}.safetensors"));
+            save_weights(&varmap, &checkpoint)?;
+            save_optimizer(&optimizer, &optimizer_checkpoint)?;
+            save_weights(&varmap, &args.output_dir.join("latest.safetensors"))?;
+            save_optimizer(&optimizer, &args.output_dir.join("optimizer.safetensors"))?;
+            let state = TrainingState::new(
+                started_at_unix,
+                &run,
+                &dataset_summary,
+                &cfg,
+                global_step,
+                epoch,
+                batch_index,
+                batches_per_epoch,
+                Some(&checkpoint),
+                Some(&optimizer_checkpoint),
+                last_loss.as_ref(),
+            );
+            write_pretty_json(&args.output_dir.join("training-state.json"), &state)?;
         }
     }
 
     ensure!(global_step > 0, "no optimizer steps were run");
     let final_checkpoint = args.output_dir.join("final.safetensors");
+    let final_optimizer = args.output_dir.join("final-optimizer.safetensors");
     save_weights(&varmap, &final_checkpoint)?;
+    save_optimizer(&optimizer, &final_optimizer)?;
     save_weights(&varmap, &args.output_dir.join("latest.safetensors"))?;
+    save_optimizer(&optimizer, &args.output_dir.join("optimizer.safetensors"))?;
     let state = TrainingState::new(
         started_at_unix,
         &run,
@@ -289,6 +343,7 @@ fn main() -> anyhow::Result<()> {
         last_batch_index,
         batches_per_epoch,
         Some(&final_checkpoint),
+        Some(&final_optimizer),
         last_loss.as_ref(),
     );
     write_pretty_json(&args.output_dir.join("training-state.json"), &state)?;
@@ -326,6 +381,10 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         ensure!(max_steps > 0, "--max-steps must be greater than zero");
     }
     ensure!(
+        !(args.resume_dir.is_some() && args.init_safetensors.is_some()),
+        "--resume-dir and --init-safetensors are mutually exclusive"
+    );
+    ensure!(
         args.lr.is_finite() && args.lr > 0.0,
         "--lr must be finite and greater than zero"
     );
@@ -362,6 +421,49 @@ fn default_pusht_dataset_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".stable_worldmodel")
         .join("pusht_expert_train.h5")
+}
+
+fn epoch_seed(seed: u64, epoch: usize) -> u64 {
+    seed.wrapping_add((epoch as u64).wrapping_mul(0x9E3779B97F4A7C15))
+}
+
+fn load_resume_state(dir: &Path) -> anyhow::Result<SavedTrainingState> {
+    let path = dir.join("training-state.json");
+    let json =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&json).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn ensure_resume_compatible(current: &RunSettings, saved: &RunSettings) -> anyhow::Result<()> {
+    ensure_eq("dataset_h5", &current.dataset_h5, &saved.dataset_h5)?;
+    ensure_eq("config", &current.config, &saved.config)?;
+    ensure_eq("device", &current.device, &saved.device)?;
+    ensure_eq("dtype", &current.dtype, &saved.dtype)?;
+    ensure_eq("batch_size", &current.batch_size, &saved.batch_size)?;
+    ensure_eq("history_size", &current.history_size, &saved.history_size)?;
+    ensure_eq("action_block", &current.action_block, &saved.action_block)?;
+    ensure_eq("image_size", &current.image_size, &saved.image_size)?;
+    ensure_eq("seed", &current.seed, &saved.seed)?;
+    ensure_eq(
+        "normalize_actions",
+        &current.normalize_actions,
+        &saved.normalize_actions,
+    )?;
+    ensure_eq("lr", &current.lr, &saved.lr)?;
+    ensure_eq("weight_decay", &current.weight_decay, &saved.weight_decay)?;
+    ensure_eq("loss_weights", &current.loss_weights, &saved.loss_weights)?;
+    Ok(())
+}
+
+fn ensure_eq<T>(name: &str, current: &T, saved: &T) -> anyhow::Result<()>
+where
+    T: std::fmt::Debug + PartialEq,
+{
+    ensure!(
+        current == saved,
+        "resume setting `{name}` mismatch: current={current:?} saved={saved:?}"
+    );
+    Ok(())
 }
 
 fn load_or_default_config(
@@ -487,6 +589,15 @@ fn save_weights(varmap: &VarMap, path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("failed to save {}", path.display()))
 }
 
+fn save_optimizer(optimizer: &StatefulAdamW, path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    optimizer
+        .save_state(path)
+        .with_context(|| format!("failed to save {}", path.display()))
+}
+
 fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -536,7 +647,13 @@ struct MetricsRow {
     loss: LossScalars,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Deserialize)]
+struct SavedTrainingState {
+    global_step: usize,
+    run: RunSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunSettings {
     dataset_h5: PathBuf,
     config: Option<PathBuf>,
@@ -593,7 +710,7 @@ impl RunSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SerializableLossWeights {
     prediction: f64,
     temporal_alignment: f64,
@@ -612,6 +729,7 @@ struct TrainingState<'a> {
     batch_index: usize,
     batches_per_epoch: usize,
     latest_checkpoint: Option<PathBuf>,
+    latest_optimizer_checkpoint: Option<PathBuf>,
     last_loss: Option<&'a LossScalars>,
     run: &'a RunSettings,
     dataset: &'a PushTDatasetSummary,
@@ -630,6 +748,7 @@ impl<'a> TrainingState<'a> {
         batch_index: usize,
         batches_per_epoch: usize,
         latest_checkpoint: Option<&Path>,
+        latest_optimizer_checkpoint: Option<&Path>,
         last_loss: Option<&'a LossScalars>,
     ) -> Self {
         Self {
@@ -639,11 +758,12 @@ impl<'a> TrainingState<'a> {
             batch_index,
             batches_per_epoch,
             latest_checkpoint: latest_checkpoint.map(Path::to_path_buf),
+            latest_optimizer_checkpoint: latest_optimizer_checkpoint.map(Path::to_path_buf),
             last_loss,
             run,
             dataset,
             model_config,
-            optimizer_state: "not_serialized; resume is weights-only via --init-safetensors",
+            optimizer_state: "serialized; resume with --resume-dir",
         }
     }
 }

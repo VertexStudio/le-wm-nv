@@ -11,6 +11,7 @@ pub mod hub;
 
 pub mod media;
 pub mod models;
+pub mod optim;
 pub mod planner;
 pub mod preprocess;
 pub mod runtime;

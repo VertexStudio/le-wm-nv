@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use candle::{DType, Device, Tensor};
 use hdf5::{Dataset, File};
 use ndarray::{Array, Ix3, s};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::media::{
     ImageHistoryPreprocessor, ImagePreprocess as CudaImagePreprocess, PackedImageFormat,
@@ -14,7 +14,7 @@ use crate::media::{
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PushTBatchConfig {
     pub batch_size: usize,
     pub history_size: usize,
@@ -39,13 +39,13 @@ impl PushTBatchConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushTActionStats {
     pub mean: Vec<f32>,
     pub std: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushTDatasetSummary {
     pub path: PathBuf,
     pub rows: usize,
