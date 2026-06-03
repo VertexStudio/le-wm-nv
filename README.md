@@ -139,6 +139,19 @@ PyTorch `2.12.0+cu130`, CUDA `13.0`:
 
 Cost argmin was stable for the fixture batch.
 
+## Performance Snapshot
+
+![LeWM PushT image planning latency: Python/PyTorch vs Rust/Candle](docs/lewm-image-plan-python-rust-benchmark.svg)
+
+Snapshot on 2026-06-03, RTX 4090, `quentinll/lewm-pusht`, CUDA 13.0,
+`planner=icem`, `samples=1024`, `iterations=5`, `horizon=5`, `history_size=3`.
+Metric is synchronized CUDA p50 wall time after 2 warmup runs and 5 measured
+runs. Python is vanilla `stable-worldmodel` LeWM through PyTorch; Rust is
+`lewm-plan-images` with nvJPEG decode, Candle CUDA encode/rollout/scoring, and
+Rust-native planning. In this image-input PushT benchmark, Rust/Candle is faster
+across the hot path: 3-4x for media decode/preprocess, 1.37-1.51x for image
+encoding, 1.13x for iCEM planning, and 1.66x for selected-score evaluation.
+
 ## Image Planning
 
 Plan from JPEG current/goal images through nvJPEG, CUDA preprocessing, LeWM,

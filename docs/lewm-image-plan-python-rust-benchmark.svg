@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="510" viewBox="0 0 1120 510" role="img">
+<style>
+text{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#172026}
+.title{font-size:28px;font-weight:760}.sub{font-size:14px;fill:#52606d}.label{font-size:15px;font-weight:650}
+.value{font-size:13px;fill:#303b45}.axis{stroke:#d7dde3;stroke-width:1}.py{fill:#c2410c}.rs{fill:#0f766e}
+.grid{stroke:#edf1f5;stroke-width:1}.speed{font-size:13px;font-weight:700;fill:#172026}
+</style>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text class="title" x="28" y="38">LeWM PushT Image Planning Latency</text>
+<text class="sub" x="28" y="62">Metric: synchronized CUDA wall time in ms. Planner=icem; samples=1024; iterations=5; horizon=5. Lower is faster.</text>
+<text class="sub" x="230" y="86">Python / PyTorch</text>
+<rect class="py" x="355" y="74" width="14" height="14" rx="2"/>
+<text class="sub" x="385" y="86">Rust / Candle</text>
+<rect class="rs" x="480" y="74" width="14" height="14" rx="2"/>
+<line class="grid" x1="230.0" y1="96" x2="230.0" y2="482"/>
+<text class="sub" x="230.0" y="500" text-anchor="middle">0ms</text>
+<line class="grid" x1="392.5" y1="96" x2="392.5" y2="482"/>
+<text class="sub" x="392.5" y="500" text-anchor="middle">35ms</text>
+<line class="grid" x1="555.0" y1="96" x2="555.0" y2="482"/>
+<text class="sub" x="555.0" y="500" text-anchor="middle">71ms</text>
+<line class="grid" x1="717.5" y1="96" x2="717.5" y2="482"/>
+<text class="sub" x="717.5" y="500" text-anchor="middle">106ms</text>
+<line class="grid" x1="880.0" y1="96" x2="880.0" y2="482"/>
+<text class="sub" x="880.0" y="500" text-anchor="middle">142ms</text>
+<line class="axis" x1="230" y1="482" x2="880" y2="482"/>
+<text class="label" x="28" y="123">current media</text>
+<rect class="py" x="230" y="104" width="7.9" height="18" rx="4"/>
+<rect class="rs" x="230" y="128" width="2.0" height="18" rx="4"/>
+<text class="value" x="245.9" y="118" text-anchor="start">1.731 ms</text>
+<text class="value" x="240.0" y="142" text-anchor="start">0.432 ms</text>
+<text class="speed" x="904" y="131">4.01x</text>
+<text class="label" x="28" y="185">goal media</text>
+<rect class="py" x="230" y="166" width="7.0" height="18" rx="4"/>
+<rect class="rs" x="230" y="190" width="2.2" height="18" rx="4"/>
+<text class="value" x="245.0" y="180" text-anchor="start">1.522 ms</text>
+<text class="value" x="240.2" y="204" text-anchor="start">0.473 ms</text>
+<text class="speed" x="904" y="193">3.22x</text>
+<text class="label" x="28" y="247">current encode</text>
+<rect class="py" x="230" y="228" width="17.8" height="18" rx="4"/>
+<rect class="rs" x="230" y="252" width="11.8" height="18" rx="4"/>
+<text class="value" x="255.8" y="242" text-anchor="start">3.878 ms</text>
+<text class="value" x="249.8" y="266" text-anchor="start">2.564 ms</text>
+<text class="speed" x="904" y="255">1.51x</text>
+<text class="label" x="28" y="309">goal encode</text>
+<rect class="py" x="230" y="290" width="15.6" height="18" rx="4"/>
+<rect class="rs" x="230" y="314" width="11.3" height="18" rx="4"/>
+<text class="value" x="253.6" y="304" text-anchor="start">3.397 ms</text>
+<text class="value" x="249.3" y="328" text-anchor="start">2.474 ms</text>
+<text class="speed" x="904" y="317">1.37x</text>
+<text class="label" x="28" y="371">iCEM planning</text>
+<rect class="py" x="230" y="352" width="650.0" height="18" rx="4"/>
+<rect class="rs" x="230" y="376" width="576.2" height="18" rx="4"/>
+<text class="value" x="872.0" y="366" text-anchor="end">141.717 ms</text>
+<text class="value" x="798.2" y="390" text-anchor="end">125.627 ms</text>
+<text class="speed" x="904" y="379">1.13x</text>
+<text class="label" x="28" y="433">selected score</text>
+<rect class="py" x="230" y="414" width="55.4" height="18" rx="4"/>
+<rect class="rs" x="230" y="438" width="33.3" height="18" rx="4"/>
+<text class="value" x="293.4" y="428" text-anchor="start">12.079 ms</text>
+<text class="value" x="271.3" y="452" text-anchor="start">7.268 ms</text>
+<text class="speed" x="904" y="441">1.66x</text>
+</svg>
