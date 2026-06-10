@@ -217,17 +217,31 @@ cargo run --release --locked --bin lewm-train-batch -- \
 ```
 
 Train LeWM from the PushT HDF5 dataset without Python in the data/training
-path:
+path. Long-running training outputs should live outside `target/`, because
+`target/` is disposable build output:
+
+```bash
+tools/launch_pusht_from_scratch.sh
+```
+
+By default the launcher writes checkpoints, optimizer state, metrics, logs, and
+`train.pid` to
+`~/.stable_worldmodel/le-wm-nv-runs/pusht-from-scratch-b96`. If
+`training-state.json` already exists there, it resumes from that run directory.
+Override settings with environment variables, for example
+`RUN_DIR=/mnt/runs/pusht-b96 BATCH_SIZE=64 tools/launch_pusht_from_scratch.sh`.
+
+Equivalent direct command:
 
 ```bash
 cargo run --release --locked --bin lewm-train-pusht -- \
   --device cuda \
   --dataset-h5 ~/.stable_worldmodel/pusht_expert_train.h5 \
   --epochs 100 \
-  --batch-size 64 \
+  --batch-size 96 \
   --history-size 3 \
   --action-block 5 \
-  --output-dir target/pusht-from-scratch
+  --output-dir ~/.stable_worldmodel/le-wm-nv-runs/pusht-from-scratch-b96
 ```
 
 `lewm-train-pusht` reads `pusht_expert_train.h5` natively through Rust HDF5
@@ -253,12 +267,12 @@ and next batch.
 cargo run --release --locked --bin lewm-train-pusht -- \
   --device cuda \
   --dataset-h5 ~/.stable_worldmodel/pusht_expert_train.h5 \
-  --resume-dir target/pusht-from-scratch \
+  --resume-dir ~/.stable_worldmodel/le-wm-nv-runs/pusht-from-scratch-b96 \
   --epochs 100 \
-  --batch-size 64 \
+  --batch-size 96 \
   --history-size 3 \
   --action-block 5 \
-  --output-dir target/pusht-from-scratch
+  --output-dir ~/.stable_worldmodel/le-wm-nv-runs/pusht-from-scratch-b96
 ```
 
 ## Reports
@@ -279,12 +293,12 @@ Run the same demo with a locally trained Rust checkpoint:
 ```bash
 uv run --locked --no-dev \
   python tools/run_pusht_lewm_rust_demo.py \
-  --weights target/pusht-from-scratch/latest.safetensors \
-  --config target/pusht-from-scratch/model-config.json \
+  --weights ~/.stable_worldmodel/le-wm-nv-runs/pusht-from-scratch-b96/latest.safetensors \
+  --config ~/.stable_worldmodel/le-wm-nv-runs/pusht-from-scratch-b96/model-config.json \
   --planner icem \
   --history-size 1 \
   --replans 2 \
-  --output-dir target/reports/pusht-from-scratch-demo
+  --output-dir ~/.stable_worldmodel/le-wm-nv-reports/pusht-from-scratch-demo
 ```
 
 Run Python-vs-Rust image-planning benchmark tooling:
