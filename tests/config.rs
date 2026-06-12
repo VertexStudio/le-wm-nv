@@ -1,4 +1,7 @@
-use le_wm_nv::models::lewm::{LeWmConfig, NormKind};
+use le_wm_nv::models::{
+    lewm::{LeWmConfig, NormKind},
+    world_model::WorldModelConfig,
+};
 
 #[test]
 fn tiny_patch14_defaults_match_python_config() {
@@ -30,6 +33,18 @@ fn config_round_trips_through_json() {
     assert_eq!(decoded.action_encoder.input_dim, 4);
     assert_eq!(decoded.encoder.patch_size, cfg.encoder.patch_size);
     assert_eq!(decoded.predictor.hidden_dim, cfg.predictor.hidden_dim);
+}
+
+#[test]
+fn vector_world_model_config_round_trips_through_json() {
+    let cfg = WorldModelConfig::vector_drone_default(20, 4, 13);
+    let json = serde_json::to_string(&cfg).unwrap();
+    let decoded: WorldModelConfig = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(decoded.history_size, cfg.history_size);
+    assert_eq!(decoded.action_encoder.input_dim, 4);
+    assert_eq!(decoded.observation_encoder.output_dim(), 192);
+    assert_eq!(decoded.state_head.unwrap().output_dim(), 13);
 }
 
 #[test]

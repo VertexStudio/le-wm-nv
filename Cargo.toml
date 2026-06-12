@@ -5,12 +5,18 @@ edition = "2024"
 license = "MIT"
 description = "NVIDIA/CUDA-first LeWM training and inference runtime."
 
+[workspace]
+members = ["crates/drone-viewer"]
+resolver = "3"
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 ndarray = "0.17.2"
+csv = "1.4.0"
+walkdir = "2.5.0"
 
 candle = { package = "candle-core", version = "0.10.2", features = ["cuda", "cudnn"] }
 candle-nn = { package = "candle-nn", version = "0.10.2", features = ["cuda", "cudnn"] }
@@ -55,3 +61,19 @@ path = "src/bin/lewm-train-batch.rs"
 [[bin]]
 name = "lewm-train-pusht"
 path = "src/bin/lewm-train-pusht.rs"
+
+[[bin]]
+name = "lewm-drone-import"
+path = "src/bin/lewm-drone-import.rs"
+
+[[bin]]
+name = "lewm-train-drone"
+path = "src/bin/lewm-train-drone.rs"
+
+[[bin]]
+name = "lewm-eval-drone"
+path = "src/bin/lewm-eval-drone.rs"
+
+[[bin]]
+name = "lewm-plan-drone-gates"
+path = "src/bin/lewm-plan-drone-gates.rs"

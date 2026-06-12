@@ -3,3 +3,22 @@
 __pycache__/
 *.py[cod]
 /.DS_Store
+
+# Local datasets, release downloads, and generated training artifacts.
+/data/
+/runs/
+/reports/
+/artifacts/
+/drone-racing-dataset/
+/le-wm-nv-data/
+/le-wm-nv-runs/
+/le-wm-nv-reports/
+/autonomous_zipchunk*
+/piloted_zipchunk*
+/autonomous.zip
+/piloted.zip
+*.h5
+*.hdf5
+*.safetensors
+*.npz
+*.jsonl

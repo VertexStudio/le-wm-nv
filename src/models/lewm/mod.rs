@@ -1,9 +1,9 @@
 pub mod config;
 pub mod loss;
 mod model;
-mod modules;
+pub(crate) mod modules;
 pub mod training;
-mod vit;
+pub(crate) mod vit;
 
 pub use config::{
     ActionEmbedderConfig, LeWmConfig, MlpConfig, NormKind, PredictorConfig, VitEncoderConfig,
