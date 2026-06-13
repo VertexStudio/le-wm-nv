@@ -187,29 +187,46 @@ struct Attention {
     norm: LayerNorm,
     to_qkv: Linear,
     to_out: Linear,
+    causal_invalid_mask: Tensor,
+    causal_neg_inf: Tensor,
     heads: usize,
     dim_head: usize,
     scale: f64,
 }
 
 impl Attention {
-    fn new(dim: usize, heads: usize, dim_head: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        dim: usize,
+        heads: usize,
+        dim_head: usize,
+        max_seq_len: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let inner_dim = heads * dim_head;
         let norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("norm"))?;
         let to_qkv = linear_no_bias(dim, inner_dim * 3, vb.pp("to_qkv"))?;
         let to_out = linear(inner_dim, dim, vb.pp("to_out").pp("0"))?;
+        let (causal_invalid_mask, causal_neg_inf) =
+            Self::causal_tensors(max_seq_len, vb.dtype(), vb.device())?;
         Ok(Self {
             norm,
             to_qkv,
             to_out,
+            causal_invalid_mask,
+            causal_neg_inf,
             heads,
             dim_head,
             scale: (dim_head as f64).powf(-0.5),
         })
     }
 
-    fn causal_mask(seq_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
-        Tensor::tril2(seq_len, dtype, device)
+    fn causal_tensors(seq_len: usize, dtype: DType, device: &Device) -> Result<(Tensor, Tensor)> {
+        let shape = (1, 1, seq_len, seq_len);
+        let invalid_mask = Tensor::tril2(seq_len, DType::F32, device)?
+            .eq(0f32)?
+            .reshape(shape)?;
+        let neg_inf = Tensor::full(f32::NEG_INFINITY, shape, device)?.to_dtype(dtype)?;
+        Ok((invalid_mask, neg_inf))
     }
 }
 
@@ -226,12 +243,18 @@ impl Module for Attention {
         let k = qkv.i(1)?.contiguous()?;
         let v = qkv.i(2)?.contiguous()?;
         let mut scores = q.matmul(&k.t()?)?;
-        let mask = Self::causal_mask(t, scores.dtype(), scores.device())?
-            .reshape((1, 1, t, t))?
+        let mask = self
+            .causal_invalid_mask
+            .i((.., .., ..t, ..t))?
             .broadcast_as(scores.shape())?;
-        let neg_inf = Tensor::full(f32::NEG_INFINITY, scores.shape(), scores.device())?
-            .to_dtype(scores.dtype())?;
-        scores = mask.eq(0f32)?.where_cond(&neg_inf, &scores)?;
+        let neg_inf = self.causal_neg_inf.i((.., .., ..t, ..t))?;
+        let neg_inf = if neg_inf.dtype() == scores.dtype() {
+            neg_inf
+        } else {
+            neg_inf.to_dtype(scores.dtype())?
+        };
+        let neg_inf = neg_inf.broadcast_as(scores.shape())?;
+        scores = mask.where_cond(&neg_inf, &scores)?;
         let attn = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = attn
             .matmul(&v)?
@@ -255,9 +278,10 @@ impl ConditionalBlock {
         heads: usize,
         dim_head: usize,
         mlp_dim: usize,
+        max_seq_len: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let attn = Attention::new(dim, heads, dim_head, vb.pp("attn"))?;
+        let attn = Attention::new(dim, heads, dim_head, max_seq_len, vb.pp("attn"))?;
         let mlp = FeedForward::new(dim, mlp_dim, vb.pp("mlp"))?;
         let ada_ln = linear(dim, 6 * dim, vb.pp("adaLN_modulation").pp("1"))?;
         Ok(Self { attn, mlp, ada_ln })
@@ -300,6 +324,7 @@ impl Transformer {
                     cfg.heads,
                     cfg.dim_head,
                     cfg.mlp_dim,
+                    cfg.num_frames,
                     vb.pp("layers").pp(idx),
                 )
             })

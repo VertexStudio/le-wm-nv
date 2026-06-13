@@ -103,6 +103,9 @@ Baseline on 2026-06-13 for the all-data drone checkpoint, CUDA F32,
 `samples=528`, `horizon=40`: total mean `0.207182s`, rollout mean
 `0.203848s`, state-head mean `0.003058s`, denorm/slice mean `0.000055s`.
 That is `2548.5` candidate rollouts/s or `101939.5` predicted state steps/s.
+After caching the causal attention mask and `-inf` masking tensor per attention
+layer, the same benchmark measured total mean `0.201853s`, rollout mean
+`0.199148s`, state-head mean `0.002468s`, and `2615.8` candidate rollouts/s.
 
 ## Prerequisites
 
