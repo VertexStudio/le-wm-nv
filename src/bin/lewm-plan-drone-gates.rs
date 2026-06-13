@@ -555,7 +555,6 @@ fn sample_plan<P: SamplingPlanner>(
         target_normalized,
         device.clone(),
         dtype,
-        args.history_steps,
         args.next_gate_weight,
         args.min_altitude,
         args.max_speed,
@@ -1032,7 +1031,6 @@ struct DroneGateScorer<'a> {
     target_normalized: bool,
     device: candle::Device,
     dtype: DType,
-    history_steps: usize,
     next_gate_weight: f64,
     min_altitude: f64,
     max_speed: f64,
@@ -1098,21 +1096,19 @@ impl CandidateScorer for DroneGateScorer<'_> {
         let rollout =
             self.model
                 .rollout_embeddings_with_history(&emb_init, &model_actions, history)?;
-        let rollout_time = rollout.dim(2)?;
-        let pred = self
-            .model
-            .predict_state_deltas_from_embeddings(&rollout.reshape((
-                samples,
-                rollout_time,
-                emb_dim,
-            ))?)?;
+        let future_emb = rollout
+            .i((0, .., history..history + _horizon, ..))?
+            .contiguous()?;
+        let pred = self.model.predict_state_deltas_from_embeddings(
+            &future_emb.reshape((samples, _horizon, emb_dim))?,
+        )?;
         let deltas = if self.target_normalized {
             pred.broadcast_mul(&self.target_std)?
                 .broadcast_add(&self.target_mean)?
         } else {
             pred
         };
-        self.score_candidates_cuda(action_candidates, &deltas, rollout_time, samples)?
+        self.score_candidates_cuda(action_candidates, &deltas, _horizon, samples)?
             .reshape((1, samples))
     }
 }
@@ -1131,7 +1127,6 @@ impl DroneGateScorer<'_> {
         target_normalized: bool,
         device: candle::Device,
         dtype: DType,
-        history_steps: usize,
         next_gate_weight: f64,
         min_altitude: f64,
         max_speed: f64,
@@ -1200,7 +1195,6 @@ impl DroneGateScorer<'_> {
             target_normalized,
             device,
             dtype,
-            history_steps,
             next_gate_weight,
             min_altitude,
             max_speed,
@@ -1228,7 +1222,7 @@ impl DroneGateScorer<'_> {
                 DRONE_ACTION_DIM
             );
         }
-        let start_step = self.history_steps.min(rollout_time.saturating_sub(1));
+        let start_step = 0usize;
         let has_next_gate = self.next_gate_center.is_some() && self.next_gate_weight > 0.0;
         let next_gate_center = self.next_gate_center.as_ref().unwrap_or(&self.gate_center);
 

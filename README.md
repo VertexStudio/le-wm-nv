@@ -106,6 +106,11 @@ That is `2548.5` candidate rollouts/s or `101939.5` predicted state steps/s.
 After caching the causal attention mask and `-inf` masking tensor per attention
 layer, the same benchmark measured total mean `0.201853s`, rollout mean
 `0.199148s`, state-head mean `0.002468s`, and `2615.8` candidate rollouts/s.
+After the Candle-only rollout specialization that projects only the last
+autoregressive token and runs the drone state head only on future embeddings,
+the same benchmark with 4 warmups and 30 measured iterations reached total mean
+`0.194838s`, rollout mean `0.191593s`, state-head mean `0.003001s`, and
+`2709.9` candidate rollouts/s. The checksum remained `40992.58`.
 
 ## Prerequisites
 

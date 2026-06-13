@@ -146,8 +146,15 @@ fn main() -> anyhow::Result<()> {
             &prepared.actions,
             prepared.history,
         )?;
-        let pred = predict_state_deltas(&model, &rollout, prepared.samples, prepared.emb_dim)?;
-        let future = future_deltas(&pred, prepared.history, args.horizon, &target_stats)?;
+        let pred = predict_future_state_deltas(
+            &model,
+            &rollout,
+            prepared.samples,
+            prepared.emb_dim,
+            prepared.history,
+            args.horizon,
+        )?;
+        let future = denormalize_deltas(&pred, &target_stats)?;
         device.synchronize()?;
         let _ = future.sum_all()?.to_scalar::<f32>()?;
     }
@@ -165,11 +172,17 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
         let (pred, state_head_sec) = timed(&device, || {
-            predict_state_deltas(&model, &rollout, prepared.samples, prepared.emb_dim)
+            predict_future_state_deltas(
+                &model,
+                &rollout,
+                prepared.samples,
+                prepared.emb_dim,
+                prepared.history,
+                args.horizon,
+            )
         })?;
-        let (future, denorm_slice_sec) = timed(&device, || {
-            future_deltas(&pred, prepared.history, args.horizon, &target_stats)
-        })?;
+        let (future, denorm_slice_sec) =
+            timed(&device, || denormalize_deltas(&pred, &target_stats))?;
         let checksum_started = Instant::now();
         let checksum = future.sum_all()?.to_scalar::<f32>()?;
         let checksum_sec = checksum_started.elapsed().as_secs_f64();
@@ -372,28 +385,26 @@ fn target_stats_tensors(
     })
 }
 
-fn predict_state_deltas(
+fn predict_future_state_deltas(
     model: &WorldModel,
     rollout: &Tensor,
     samples: usize,
     emb_dim: usize,
+    history: usize,
+    horizon: usize,
 ) -> candle::Result<Tensor> {
-    let rollout_time = rollout.dim(2)?;
-    let flat = rollout.reshape((samples, rollout_time, emb_dim))?;
+    let future = rollout
+        .i((0, .., history..history + horizon, ..))?
+        .contiguous()?;
+    let flat = future.reshape((samples, horizon, emb_dim))?;
     model.predict_state_deltas_from_embeddings(&flat)
 }
 
-fn future_deltas(
-    pred: &Tensor,
-    history: usize,
-    horizon: usize,
-    target_stats: &TargetStatsTensors,
-) -> candle::Result<Tensor> {
-    let deltas = match (&target_stats.mean, &target_stats.std) {
-        (Some(mean), Some(std)) => pred.broadcast_mul(std)?.broadcast_add(mean)?,
-        _ => pred.clone(),
-    };
-    deltas.i((.., history..history + horizon, ..))
+fn denormalize_deltas(pred: &Tensor, target_stats: &TargetStatsTensors) -> candle::Result<Tensor> {
+    match (&target_stats.mean, &target_stats.std) {
+        (Some(mean), Some(std)) => pred.broadcast_mul(std)?.broadcast_add(mean),
+        _ => Ok(pred.clone()),
+    }
 }
 
 fn deterministic_action_batch(

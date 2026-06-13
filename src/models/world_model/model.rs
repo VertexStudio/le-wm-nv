@@ -70,6 +70,19 @@ impl WorldModel {
         projected.reshape((b, t, ()))
     }
 
+    fn predict_last_from_action_embeddings(
+        &self,
+        emb: &Tensor,
+        act_emb: &Tensor,
+    ) -> Result<Tensor> {
+        let dims = emb.dims();
+        if dims.len() != 3 {
+            candle::bail!("predict expects [batch, time, dim], got {:?}", emb.shape());
+        }
+        let last_pred = self.predictor.forward_last(emb, act_emb)?;
+        self.pred_proj.forward(&last_pred)
+    }
+
     pub fn predict(&self, emb: &Tensor, actions: &Tensor) -> Result<Tensor> {
         let act_emb = self.encode_actions(actions)?;
         self.predict_from_action_embeddings(emb, &act_emb)
@@ -139,9 +152,7 @@ impl WorldModel {
             let refs = frames[lo..].iter().collect::<Vec<_>>();
             let emb_trunc = Tensor::stack(&refs, 1)?;
             let act_trunc = all_act_emb.narrow(1, lo, upper - lo)?;
-            let pred = self.predict_from_action_embeddings(&emb_trunc, &act_trunc)?;
-            let last = pred.dim(1)? - 1;
-            frames.push(pred.narrow(1, last, 1)?.squeeze(1)?);
+            frames.push(self.predict_last_from_action_embeddings(&emb_trunc, &act_trunc)?);
         }
 
         let refs = frames.iter().collect::<Vec<_>>();
