@@ -467,11 +467,11 @@ fn draw_current_state_overlay(
     let replan_text = active_replan
         .map(|replan| {
             format!(
-                "gate={} score={:.2} mean={:.2} grad/s={:.0}",
+                "gate={} score={:.2} mean={:.2} eval/s={:.0}",
                 replan.gate_name,
                 replan.score_summary.best,
                 replan.score_summary.mean,
-                replan.grad_evals_per_sec
+                replan.planner_evals_per_sec
             )
         })
         .unwrap_or_else(|| "no replan metadata".to_string());
@@ -680,7 +680,7 @@ struct ReplanStep {
     path_anchor: [f32; 3],
     carrot: [f32; 3],
     score_summary: ScoreSummary,
-    grad_evals_per_sec: f32,
+    planner_evals_per_sec: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
