@@ -10,7 +10,8 @@ use clap::Parser;
 use le_wm_nv::{
     data::drone_racing::{
         DRONE_ACTION_DIM, DRONE_STATE_DELTA_DIM, DroneBatchConfig, DroneFrame, DroneRacingDataset,
-        GateSequenceFile, GateSpec, RunningStats,
+        FlightGates, GateSequenceFile, GateSpec, RunningStats, add3, mat3_from_rotvec, mat3_mul,
+        mat3_mul_vec3, norm3, sub3,
     },
     models::world_model::{WorldModel, WorldModelConfig},
     planner::{ActionBounds, CandidateScorer, CemConfig, CemPlanner},
@@ -72,6 +73,18 @@ struct Args {
     #[arg(long, default_value_t = 7)]
     seed: u64,
 
+    /// If set, run receding-horizon planning for this many model steps over the gate loop.
+    #[arg(long)]
+    loop_steps: Option<usize>,
+
+    /// Number of actions to execute before replanning in loop mode.
+    #[arg(long, default_value_t = 5)]
+    control_stride: usize,
+
+    /// Stop loop mode after this many completed laps. Zero disables the lap stop.
+    #[arg(long, default_value_t = 1)]
+    laps: usize,
+
     #[arg(long)]
     no_observation_normalize: bool,
 
@@ -125,6 +138,22 @@ fn main() -> anyhow::Result<()> {
     let history = dataset.batch(&[row], dtype, &device)?;
     let emb = model.encode_vector(&history.observations)?;
     let current = dataset.frame(row + args.history_steps - 1)?;
+    if let Some(loop_steps) = args.loop_steps {
+        let flight = select_flight(&gates, current.episode_idx)?;
+        let report = run_gate_loop(
+            &args, &dataset, &model, emb, current, flight, loop_steps, dtype, &device,
+        )?;
+        write_pretty_json(&output, &report)?;
+        println!(
+            "planned loop row={} episode={} frames={} output={}",
+            row,
+            report.episode_idx,
+            report.frames.len(),
+            output.display()
+        );
+        return Ok(());
+    }
+
     let scorer = DroneGateScorer::new(
         &model,
         emb,
@@ -138,21 +167,7 @@ fn main() -> anyhow::Result<()> {
         dtype,
         args.history_steps,
     )?;
-    let mut cfg = CemConfig::new(
-        args.horizon.max(args.history_steps),
-        args.samples,
-        args.elites,
-        DRONE_ACTION_DIM,
-    );
-    cfg.iterations = args.iterations;
-    cfg.seed = Some(args.seed);
-    cfg.action_bounds = ActionBounds {
-        low: vec![-1.0, -1.0, 0.0, -1.0],
-        high: vec![1.0, 1.0, 1.0, 1.0],
-    };
-    cfg.init_std = 0.5;
-    cfg.min_std = 0.02;
-    let planner = CemPlanner::new(cfg);
+    let planner = CemPlanner::new(cem_config(&args));
     let result = planner.plan(&scorer)?;
     let sequence = result.sequence.flatten_all()?.to_vec1::<f32>()?;
     let scores = result.scores.flatten_all()?.to_vec1::<f32>()?;
@@ -192,7 +207,280 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     ensure!(args.samples > 0, "--samples must be greater than zero");
     ensure!(args.elites >= 2, "--elites must be at least two");
     ensure!(args.elites <= args.samples, "--elites must be <= --samples");
+    ensure!(
+        args.control_stride > 0,
+        "--control-stride must be greater than zero"
+    );
+    ensure!(
+        args.control_stride <= args.horizon,
+        "--control-stride must be <= --horizon"
+    );
     Ok(())
+}
+
+fn cem_config(args: &Args) -> CemConfig {
+    let mut cfg = CemConfig::new(
+        args.horizon.max(args.history_steps),
+        args.samples,
+        args.elites,
+        DRONE_ACTION_DIM,
+    );
+    cfg.iterations = args.iterations;
+    cfg.seed = Some(args.seed);
+    cfg.action_bounds = ActionBounds {
+        low: vec![-1.0, -1.0, 0.0, -1.0],
+        high: vec![1.0, 1.0, 1.0, 1.0],
+    };
+    cfg.init_std = 0.5;
+    cfg.min_std = 0.02;
+    cfg
+}
+
+fn run_gate_loop(
+    args: &Args,
+    dataset: &DroneRacingDataset,
+    model: &WorldModel,
+    mut emb: Tensor,
+    mut current: DroneFrame,
+    flight: &FlightGates,
+    loop_steps: usize,
+    dtype: DType,
+    device: &candle::Device,
+) -> anyhow::Result<LoopPlanReport> {
+    ensure!(!flight.gates.is_empty(), "selected flight has no gates");
+    let mut gate_index = args.gate_index % flight.gates.len();
+    let mut completed_laps = 0usize;
+    let mut executed_steps = 0usize;
+    let mut frames = vec![current.clone()];
+    let mut actions = Vec::new();
+    let mut replans = Vec::new();
+    let planner = CemPlanner::new(cem_config(args));
+
+    while executed_steps < loop_steps {
+        let gate = flight.gates[gate_index].clone();
+        let scorer = DroneGateScorer::new(
+            model,
+            emb.clone(),
+            current.clone(),
+            gate.clone(),
+            dataset.metadata().normalization.action.clone(),
+            dataset.metadata().normalization.target_delta.clone(),
+            !args.no_action_normalize,
+            !args.no_target_normalize,
+            device.clone(),
+            dtype,
+            args.history_steps,
+        )?;
+        let result = planner.plan(&scorer)?;
+        let sequence = result.sequence.flatten_all()?.to_vec1::<f32>()?;
+        let action_sequence = sequence
+            .chunks_exact(DRONE_ACTION_DIM)
+            .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
+            .collect::<Vec<_>>();
+        let stride = args
+            .control_stride
+            .min(action_sequence.len())
+            .min(loop_steps - executed_steps);
+        let previous = current.clone();
+        let advance = advance_with_lewm(
+            model,
+            emb,
+            current,
+            &action_sequence,
+            stride,
+            &dataset.metadata().normalization.action,
+            &dataset.metadata().normalization.target_delta,
+            !args.no_action_normalize,
+            !args.no_target_normalize,
+            args.history_steps,
+            dtype,
+            device,
+        )?;
+        emb = advance.emb;
+        current = advance.current;
+        frames.extend(advance.frames);
+        actions.extend(action_sequence.iter().take(stride).copied());
+        executed_steps += stride;
+        let passed = gate_passed(previous.pos_world, current.pos_world, &gate);
+        replans.push(ReplanStep {
+            executed_steps,
+            gate_index,
+            gate_name: gate.name.clone(),
+            passed_gate: passed,
+            iterations_completed: result.iterations_completed,
+            best_indices: result.best_indices,
+            best_score: result
+                .scores
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .first()
+                .copied(),
+        });
+        if passed {
+            gate_index += 1;
+            if gate_index == flight.gates.len() {
+                gate_index = 0;
+                completed_laps += 1;
+                if args.laps > 0 && completed_laps >= args.laps {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(LoopPlanReport {
+        mode: "gate_loop".to_string(),
+        dataset_dir: dataset.root().to_path_buf(),
+        weights: args.weights.clone().unwrap_or_else(default_weights),
+        config: args.config.clone().unwrap_or_else(default_config),
+        episode_idx: flight.episode_idx,
+        flight: flight.flight.clone(),
+        horizon: args.horizon.max(args.history_steps),
+        samples: args.samples,
+        elites: args.elites,
+        iterations: args.iterations,
+        control_stride: args.control_stride,
+        requested_loop_steps: loop_steps,
+        executed_steps,
+        completed_laps,
+        next_gate_index: gate_index,
+        sample_rate_hz: dataset.metadata().sample_rate_hz,
+        actual: frames.clone(),
+        predicted: frames.clone(),
+        baseline: frames.clone(),
+        gates: GateSequenceFile {
+            flights: vec![flight.clone()],
+        },
+        gate_loop: flight.gates.clone(),
+        frames,
+        actions,
+        replans,
+    })
+}
+
+struct AdvanceResult {
+    emb: Tensor,
+    current: DroneFrame,
+    frames: Vec<DroneFrame>,
+}
+
+fn advance_with_lewm(
+    model: &WorldModel,
+    emb: Tensor,
+    mut current: DroneFrame,
+    action_sequence: &[[f32; DRONE_ACTION_DIM]],
+    stride: usize,
+    action_stats: &RunningStats,
+    target_stats: &RunningStats,
+    action_normalized: bool,
+    target_normalized: bool,
+    history_steps: usize,
+    dtype: DType,
+    device: &candle::Device,
+) -> anyhow::Result<AdvanceResult> {
+    ensure!(stride > 0, "cannot advance zero steps");
+    ensure!(
+        action_sequence.len() >= stride,
+        "action sequence shorter than stride"
+    );
+    let horizon = action_sequence.len();
+    let mut action_values = Vec::with_capacity(horizon * DRONE_ACTION_DIM);
+    for action in action_sequence {
+        let mut values = *action;
+        if action_normalized {
+            for idx in 0..DRONE_ACTION_DIM {
+                values[idx] =
+                    (values[idx] - action_stats.mean[idx]) / action_stats.std[idx].max(1e-6);
+            }
+        }
+        action_values.extend_from_slice(&values);
+    }
+    let actions = Tensor::from_vec(action_values, (1, 1, horizon, DRONE_ACTION_DIM), device)?
+        .to_dtype(dtype)?;
+    let emb_init = emb.unsqueeze(1)?;
+    let rollout = model.rollout_embeddings_with_history(&emb_init, &actions, history_steps)?;
+    let (_, _, rollout_time, emb_dim) = rollout.dims4()?;
+    ensure!(
+        stride + history_steps <= rollout_time,
+        "rollout_time {rollout_time} too short for stride {stride} and history {history_steps}"
+    );
+    let pred = model.predict_state_deltas_from_embeddings(&rollout.reshape((
+        1,
+        rollout_time,
+        emb_dim,
+    ))?)?;
+    let pred_values = pred.flatten_all()?.to_vec1::<f32>()?;
+    let mut frames = Vec::with_capacity(stride);
+    for step in 0..stride {
+        let delta_idx = history_steps + step;
+        let delta = denormalized_delta(
+            &pred_values
+                [delta_idx * DRONE_STATE_DELTA_DIM..(delta_idx + 1) * DRONE_STATE_DELTA_DIM],
+            target_stats,
+            target_normalized,
+        );
+        current = apply_delta(&current, &delta);
+        current.row = current.row.saturating_add(1);
+        current.step_idx += 1;
+        frames.push(current.clone());
+    }
+    let emb = rollout
+        .i((0, 0, stride..stride + history_steps, ..))?
+        .reshape((1, history_steps, emb_dim))?;
+    Ok(AdvanceResult {
+        emb,
+        current,
+        frames,
+    })
+}
+
+fn denormalized_delta(
+    values: &[f32],
+    stats: &RunningStats,
+    normalized: bool,
+) -> [f32; DRONE_STATE_DELTA_DIM] {
+    let mut out = [0f32; DRONE_STATE_DELTA_DIM];
+    for idx in 0..DRONE_STATE_DELTA_DIM {
+        out[idx] = if normalized {
+            values[idx] * stats.std[idx] + stats.mean[idx]
+        } else {
+            values[idx]
+        };
+    }
+    out
+}
+
+fn apply_delta(frame: &DroneFrame, delta: &[f32; DRONE_STATE_DELTA_DIM]) -> DroneFrame {
+    let delta_pos_body = [delta[0], delta[1], delta[2]];
+    let delta_rot_body = [delta[3], delta[4], delta[5]];
+    let delta_pos_world = mat3_mul_vec3(frame.rotmat_world_from_body, delta_pos_body);
+    let delta_rot = mat3_from_rotvec(delta_rot_body);
+    let next_rot = mat3_mul(frame.rotmat_world_from_body, delta_rot);
+    DroneFrame {
+        pos_world: add3(frame.pos_world, delta_pos_world),
+        rotmat_world_from_body: next_rot,
+        lin_vel_body: [delta[6], delta[7], delta[8]],
+        ang_vel_body: [delta[9], delta[10], delta[11]],
+        vbat: frame.vbat + delta[12],
+        ..frame.clone()
+    }
+}
+
+fn gate_passed(prev_pos: [f32; 3], current_pos: [f32; 3], gate: &GateSpec) -> bool {
+    let prev_rel = sub3(prev_pos, gate.center);
+    let current_rel = sub3(current_pos, gate.center);
+    let prev_plane = dot3(prev_rel, gate.normal);
+    let current_plane = dot3(current_rel, gate.normal);
+    let crossed = prev_plane.signum() != current_plane.signum()
+        || prev_plane.abs().min(current_plane.abs()) < 0.25;
+    let lateral = dot3(current_rel, gate.right).abs();
+    let vertical = dot3(current_rel, gate.up).abs();
+    let inside = lateral <= gate.half_width * 1.25 && vertical <= gate.half_height * 1.25;
+    crossed && inside || norm3(current_rel) < gate.half_width.max(gate.half_height)
+}
+
+fn dot3(lhs: [f32; 3], rhs: [f32; 3]) -> f32 {
+    lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2]
 }
 
 struct DroneGateScorer<'a> {
@@ -468,17 +756,21 @@ fn select_gate(
     episode: i64,
     gate_index: usize,
 ) -> anyhow::Result<GateSpec> {
-    let flight = gates
-        .flights
-        .iter()
-        .find(|flight| flight.episode_idx == episode)
-        .or_else(|| gates.flights.first())
-        .context("gate file does not contain any flights")?;
+    let flight = select_flight(gates, episode)?;
     flight
         .gates
         .get(gate_index)
         .cloned()
         .with_context(|| format!("flight {} has no gate at index {gate_index}", flight.flight))
+}
+
+fn select_flight(gates: &GateSequenceFile, episode: i64) -> anyhow::Result<&FlightGates> {
+    gates
+        .flights
+        .iter()
+        .find(|flight| flight.episode_idx == episode)
+        .or_else(|| gates.flights.first())
+        .context("gate file does not contain any flights")
 }
 
 fn default_dataset_dir() -> PathBuf {
@@ -540,4 +832,43 @@ struct PlanReport {
     best_indices: Vec<usize>,
     best_sequence: Vec<[f32; 4]>,
     scores: Vec<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct LoopPlanReport {
+    mode: String,
+    dataset_dir: PathBuf,
+    weights: PathBuf,
+    config: PathBuf,
+    episode_idx: i64,
+    flight: String,
+    horizon: usize,
+    samples: usize,
+    elites: usize,
+    iterations: usize,
+    control_stride: usize,
+    requested_loop_steps: usize,
+    executed_steps: usize,
+    completed_laps: usize,
+    next_gate_index: usize,
+    sample_rate_hz: usize,
+    actual: Vec<DroneFrame>,
+    predicted: Vec<DroneFrame>,
+    baseline: Vec<DroneFrame>,
+    gates: GateSequenceFile,
+    gate_loop: Vec<GateSpec>,
+    frames: Vec<DroneFrame>,
+    actions: Vec<[f32; DRONE_ACTION_DIM]>,
+    replans: Vec<ReplanStep>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplanStep {
+    executed_steps: usize,
+    gate_index: usize,
+    gate_name: String,
+    passed_gate: bool,
+    iterations_completed: usize,
+    best_indices: Vec<usize>,
+    best_score: Option<f32>,
 }

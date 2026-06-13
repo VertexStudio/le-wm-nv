@@ -4,13 +4,14 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
-use candle::DType;
+use candle::{DType, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use clap::Parser;
 use le_wm_nv::{
     data::drone_racing::{
-        DRONE_STATE_DELTA_DIM, DroneBatchConfig, DroneFrame, DroneRacingDataset, GateSequenceFile,
-        add3, mat3_from_rotvec, mat3_mul, mat3_mul_vec3, norm3, scale3, sub3,
+        DRONE_ACTION_DIM, DRONE_OBSERVATION_DIM, DRONE_STATE_DELTA_DIM, DroneBatchConfig,
+        DroneFrame, DroneRacingDataset, GateSequenceFile, RunningStats, add3, mat3_from_rotvec,
+        mat3_mul, mat3_mul_vec3, norm3, scale3, sub3,
     },
     models::world_model::{
         VectorLossScalars, VectorLossWeights, WorldModel, WorldModelConfig, vector_batch_loss,
@@ -55,6 +56,18 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     max_batches: usize,
 
+    /// Dataset row to use for replay. Defaults to the highest-motion held-out window.
+    #[arg(long)]
+    replay_row: Option<usize>,
+
+    /// Held-out episode to use for replay. Defaults to the episode containing the selected replay row.
+    #[arg(long)]
+    replay_episode: Option<i64>,
+
+    /// Emit only one model horizon instead of the full selected episode.
+    #[arg(long)]
+    replay_window: bool,
+
     #[arg(long)]
     no_observation_normalize: bool,
 
@@ -75,11 +88,17 @@ fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
-    let sequence_steps = args
-        .history_steps
-        .checked_add(args.horizon_steps)
-        .and_then(|value| value.checked_add(1))
-        .context("history_steps + horizon_steps + 1 overflowed")?;
+    let cfg: WorldModelConfig = serde_json::from_str(
+        &fs::read_to_string(&config)
+            .with_context(|| format!("failed to read {}", config.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", config.display()))?;
+    let sequence_steps = cfg.predictor.num_frames;
+    ensure!(
+        sequence_steps > 1,
+        "model config predictor.num_frames must be greater than one"
+    );
+    let replay_chunk_steps = args.horizon_steps.min(sequence_steps - 1);
     let batch_cfg = DroneBatchConfig {
         batch_size: args.batch_size,
         sequence_steps,
@@ -90,11 +109,6 @@ fn main() -> anyhow::Result<()> {
     let dataset = DroneRacingDataset::open(&dataset_dir, batch_cfg)?;
     let eval_rows = dataset.eval_rows();
     ensure!(!eval_rows.is_empty(), "dataset has no eval rows");
-    let cfg: WorldModelConfig = serde_json::from_str(
-        &fs::read_to_string(&config)
-            .with_context(|| format!("failed to read {}", config.display()))?,
-    )
-    .with_context(|| format!("failed to parse {}", config.display()))?;
     let device = args.device.resolve()?;
     let dtype = args.dtype.dtype();
     if dtype != DType::F32 {
@@ -115,15 +129,37 @@ fn main() -> anyhow::Result<()> {
         dtype,
         &device,
     )?;
-    let replay = build_replay(
-        &model,
+    let candidate_replay_rows = replay_candidate_rows(&dataset, &eval_rows, args.replay_episode)?;
+    let replay_row = select_replay_row(
         &dataset,
-        eval_rows[0],
-        args.horizon_steps,
-        dtype,
-        &device,
-        !args.no_target_normalize,
+        &candidate_replay_rows,
+        replay_chunk_steps,
+        args.replay_row,
     )?;
+    let replay_episode = args
+        .replay_episode
+        .unwrap_or(dataset.frame(replay_row)?.episode_idx);
+    let replay = if args.replay_window {
+        build_replay_window(
+            &model,
+            &dataset,
+            replay_row,
+            replay_chunk_steps,
+            dtype,
+            &device,
+            !args.no_target_normalize,
+        )?
+    } else {
+        build_episode_replay(
+            &model,
+            &dataset,
+            replay_episode,
+            replay_chunk_steps,
+            dtype,
+            &device,
+            !args.no_target_normalize,
+        )?
+    };
     write_pretty_json(&output_dir.join("metrics.json"), &metrics)?;
     write_pretty_json(&output_dir.join("replay.json"), &replay)?;
     println!(
@@ -132,6 +168,18 @@ fn main() -> anyhow::Result<()> {
         metrics.batches,
         metrics.mean_loss.total,
         metrics.mean_loss.state_prediction
+    );
+    println!(
+        "replay kind={} prediction_mode={} row={} episode={} frames={} duration_s={:.2} actual_path_m={:.3} actual_net_m={:.3} model_chunk_steps={}",
+        replay.replay_kind,
+        replay.prediction_mode,
+        replay.start_row,
+        replay.episode_idx,
+        replay.actual.len(),
+        replay.duration_s,
+        replay.actual_path_m,
+        replay.actual_net_m,
+        replay.model_chunk_steps,
     );
     println!("wrote {}", output_dir.join("replay.json").display());
     Ok(())
@@ -196,11 +244,75 @@ fn evaluate_batches(
     })
 }
 
-fn build_replay(
+fn replay_candidate_rows(
+    dataset: &DroneRacingDataset,
+    eval_rows: &[usize],
+    replay_episode: Option<i64>,
+) -> anyhow::Result<Vec<usize>> {
+    let Some(episode) = replay_episode else {
+        return Ok(eval_rows.to_vec());
+    };
+    let rows = eval_rows
+        .iter()
+        .copied()
+        .filter(|row| {
+            dataset
+                .frame(*row)
+                .is_ok_and(|frame| frame.episode_idx == episode)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        !rows.is_empty(),
+        "--replay-episode {episode} has no valid held-out replay rows"
+    );
+    Ok(rows)
+}
+
+fn select_replay_row(
+    dataset: &DroneRacingDataset,
+    eval_rows: &[usize],
+    horizon_steps: usize,
+    replay_row: Option<usize>,
+) -> anyhow::Result<usize> {
+    if let Some(row) = replay_row {
+        ensure!(
+            eval_rows.contains(&row),
+            "--replay-row {row} is not a valid held-out replay row for this history/horizon"
+        );
+        return Ok(row);
+    }
+    let steps = horizon_steps.min(dataset.config().sequence_steps - 1);
+    eval_rows
+        .iter()
+        .copied()
+        .map(|row| Ok((row, replay_path_length(dataset, row, steps)?)))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .max_by(|(_, lhs), (_, rhs)| lhs.total_cmp(rhs))
+        .map(|(row, _)| row)
+        .context("failed to select replay row")
+}
+
+fn replay_path_length(
+    dataset: &DroneRacingDataset,
+    row: usize,
+    steps: usize,
+) -> anyhow::Result<f32> {
+    let mut total = 0.0f32;
+    let mut prev = dataset.frame(row)?.pos_world;
+    for idx in 1..=steps {
+        let current = dataset.frame(row + idx)?.pos_world;
+        total += norm3(sub3(current, prev));
+        prev = current;
+    }
+    Ok(total)
+}
+
+fn build_replay_window(
     model: &WorldModel,
     dataset: &DroneRacingDataset,
     row: usize,
-    horizon_steps: usize,
+    replay_chunk_steps: usize,
     dtype: DType,
     device: &candle::Device,
     target_normalized: bool,
@@ -210,11 +322,13 @@ fn build_replay(
     let pred_emb = model.predict(&emb, &batch.actions)?;
     let pred_delta = model.predict_state_deltas_from_embeddings(&pred_emb)?;
     let pred_values = pred_delta.flatten_all()?.to_vec1::<f32>()?;
-    let steps = horizon_steps.min(dataset.config().sequence_steps - 1);
+    let steps = replay_chunk_steps.min(dataset.config().sequence_steps - 1);
     let mut actual = Vec::with_capacity(steps + 1);
     for idx in 0..=steps {
         actual.push(dataset.frame(row + idx)?);
     }
+    let actual_path_m = path_length(&actual);
+    let actual_net_m = net_displacement(&actual);
     let mut predicted = Vec::with_capacity(steps + 1);
     let mut baseline = Vec::with_capacity(steps + 1);
     predicted.push(actual[0].clone());
@@ -240,9 +354,250 @@ fn build_replay(
         baseline.push(baseline_state.clone());
     }
 
-    let mut errors = Vec::with_capacity(steps + 1);
-    for idx in 0..=steps {
-        errors.push(FrameError {
+    let errors = frame_errors(&actual, &predicted, &baseline);
+
+    Ok(ReplayReport {
+        dataset_dir: dataset.root().to_path_buf(),
+        source_data_h5: dataset.data_h5().to_path_buf(),
+        replay_kind: "window".to_string(),
+        prediction_mode: "single_open_loop_window".to_string(),
+        start_row: row,
+        episode_idx: actual[0].episode_idx,
+        sample_rate_hz: dataset.metadata().sample_rate_hz,
+        duration_s: replay_duration_s(&actual, dataset.metadata().sample_rate_hz),
+        model_chunk_steps: steps,
+        actual_path_m,
+        actual_net_m,
+        actual,
+        predicted,
+        baseline,
+        errors,
+        gates: read_gates(dataset.root()).unwrap_or(GateSequenceFile {
+            flights: Vec::new(),
+        }),
+    })
+}
+
+fn build_episode_replay(
+    model: &WorldModel,
+    dataset: &DroneRacingDataset,
+    episode: i64,
+    replay_chunk_steps: usize,
+    dtype: DType,
+    device: &candle::Device,
+    target_normalized: bool,
+) -> anyhow::Result<ReplayReport> {
+    let episode_rows = dataset.replay_rows_for_episode(episode);
+    ensure!(!episode_rows.is_empty(), "episode {episode} has no rows");
+    let actual = episode_rows
+        .iter()
+        .copied()
+        .map(|row| dataset.frame(row))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let predicted =
+        build_autoregressive_prediction(model, dataset, &actual, dtype, device, target_normalized)?;
+    let baseline = build_chunked_baseline(&actual, replay_chunk_steps);
+    let actual_path_m = path_length(&actual);
+    let actual_net_m = net_displacement(&actual);
+    let errors = frame_errors(&actual, &predicted, &baseline);
+    Ok(ReplayReport {
+        dataset_dir: dataset.root().to_path_buf(),
+        source_data_h5: dataset.data_h5().to_path_buf(),
+        replay_kind: "full_episode".to_string(),
+        prediction_mode: "autoregressive_full_episode".to_string(),
+        start_row: actual[0].row,
+        episode_idx: episode,
+        sample_rate_hz: dataset.metadata().sample_rate_hz,
+        duration_s: replay_duration_s(&actual, dataset.metadata().sample_rate_hz),
+        model_chunk_steps: actual.len().saturating_sub(1),
+        actual_path_m,
+        actual_net_m,
+        actual,
+        predicted,
+        baseline,
+        errors,
+        gates: read_gates(dataset.root()).unwrap_or(GateSequenceFile {
+            flights: Vec::new(),
+        }),
+    })
+}
+
+fn build_autoregressive_prediction(
+    model: &WorldModel,
+    dataset: &DroneRacingDataset,
+    actual: &[DroneFrame],
+    dtype: DType,
+    device: &candle::Device,
+    target_normalized: bool,
+) -> anyhow::Result<Vec<DroneFrame>> {
+    ensure!(
+        !actual.is_empty(),
+        "cannot build prediction for empty replay"
+    );
+    let history_size = model
+        .config()
+        .history_size
+        .min(dataset.config().sequence_steps);
+    ensure!(
+        history_size > 0,
+        "model history_size must be greater than zero"
+    );
+    if actual.len() <= history_size {
+        return Ok(actual.to_vec());
+    }
+
+    let observations = initial_observations(dataset, actual, history_size, dtype, device)?;
+    let emb_init = model.encode_vector(&observations)?.unsqueeze(1)?;
+    let action_count = actual.len() - 1;
+    let actions = replay_actions(dataset, actual, action_count, dtype, device)?
+        .unsqueeze(0)?
+        .unsqueeze(0)?;
+    let rollout = model.rollout_embeddings_with_history(&emb_init, &actions, history_size)?;
+    let (_, _, rollout_time, emb_dim) = rollout.dims4()?;
+    let pred = model.predict_state_deltas_from_embeddings(&rollout.reshape((
+        1,
+        rollout_time,
+        emb_dim,
+    ))?)?;
+    let pred_values = pred.flatten_all()?.to_vec1::<f32>()?;
+
+    let mut predicted = actual[..history_size].to_vec();
+    let mut pred_state = actual[history_size - 1].clone();
+    for step in 0..actual.len() - history_size {
+        let delta_idx = history_size + step;
+        let delta = denormalized_delta(
+            &pred_values
+                [delta_idx * DRONE_STATE_DELTA_DIM..(delta_idx + 1) * DRONE_STATE_DELTA_DIM],
+            &dataset.metadata().normalization.target_delta,
+            target_normalized,
+        );
+        pred_state = apply_delta(&pred_state, &delta);
+        let actual_frame = &actual[history_size + step];
+        pred_state.row = actual_frame.row;
+        pred_state.step_idx = actual_frame.step_idx;
+        predicted.push(pred_state.clone());
+    }
+    Ok(predicted)
+}
+
+fn build_chunked_baseline(actual: &[DroneFrame], replay_chunk_steps: usize) -> Vec<DroneFrame> {
+    if actual.is_empty() {
+        return Vec::new();
+    }
+    let mut baseline = Vec::with_capacity(actual.len());
+    baseline.push(actual[0].clone());
+    let mut offset = 0usize;
+    while offset + 1 < actual.len() {
+        let steps = replay_chunk_steps.min(actual.len() - offset - 1);
+        let mut state = actual[offset].clone();
+        let start_vel_world = mat3_mul_vec3(state.rotmat_world_from_body, state.lin_vel_body);
+        for local_step in 0..steps {
+            let actual_frame = &actual[offset + local_step];
+            let next_actual = &actual[offset + local_step + 1];
+            state.pos_world = add3(state.pos_world, scale3(start_vel_world, actual_frame.dt));
+            state.row = next_actual.row;
+            state.step_idx = next_actual.step_idx;
+            baseline.push(state.clone());
+        }
+        offset += steps;
+    }
+    baseline
+}
+
+fn initial_observations(
+    dataset: &DroneRacingDataset,
+    actual: &[DroneFrame],
+    history_size: usize,
+    dtype: DType,
+    device: &candle::Device,
+) -> anyhow::Result<Tensor> {
+    let mut values = vec![0f32; history_size * DRONE_OBSERVATION_DIM];
+    for idx in 0..history_size {
+        let frame = &actual[idx];
+        let base = idx * DRONE_OBSERVATION_DIM;
+        values[base..base + 9].copy_from_slice(&frame.rotmat_world_from_body);
+        values[base + 9..base + 12].copy_from_slice(&frame.lin_vel_body);
+        values[base + 12..base + 15].copy_from_slice(&frame.ang_vel_body);
+        values[base + 15] = frame.vbat;
+        let prev_action = if idx > 0 {
+            actual[idx - 1].channels_norm
+        } else {
+            frame.channels_norm
+        };
+        values[base + 16..base + 20].copy_from_slice(&prev_action);
+        if dataset.config().normalize_observations {
+            normalize_in_place(
+                &mut values[base..base + DRONE_OBSERVATION_DIM],
+                &dataset.metadata().normalization.observation,
+            )?;
+        }
+    }
+    Ok(
+        Tensor::from_vec(values, (1, history_size, DRONE_OBSERVATION_DIM), device)?
+            .to_dtype(dtype)?,
+    )
+}
+
+fn replay_actions(
+    dataset: &DroneRacingDataset,
+    actual: &[DroneFrame],
+    action_count: usize,
+    dtype: DType,
+    device: &candle::Device,
+) -> anyhow::Result<Tensor> {
+    let mut values = vec![0f32; action_count * DRONE_ACTION_DIM];
+    for idx in 0..action_count {
+        let base = idx * DRONE_ACTION_DIM;
+        values[base..base + DRONE_ACTION_DIM].copy_from_slice(&actual[idx].channels_norm);
+        if dataset.config().normalize_actions {
+            normalize_in_place(
+                &mut values[base..base + DRONE_ACTION_DIM],
+                &dataset.metadata().normalization.action,
+            )?;
+        }
+    }
+    Ok(Tensor::from_vec(values, (action_count, DRONE_ACTION_DIM), device)?.to_dtype(dtype)?)
+}
+
+fn normalize_in_place(values: &mut [f32], stats: &RunningStats) -> anyhow::Result<()> {
+    ensure!(
+        values.len() == stats.mean.len() && values.len() == stats.std.len(),
+        "normalization shape mismatch: values={} mean={} std={}",
+        values.len(),
+        stats.mean.len(),
+        stats.std.len()
+    );
+    for (idx, value) in values.iter_mut().enumerate() {
+        *value = (*value - stats.mean[idx]) / stats.std[idx].max(1e-6);
+    }
+    Ok(())
+}
+
+fn path_length(frames: &[DroneFrame]) -> f32 {
+    frames
+        .windows(2)
+        .map(|pair| norm3(sub3(pair[1].pos_world, pair[0].pos_world)))
+        .sum()
+}
+
+fn net_displacement(frames: &[DroneFrame]) -> f32 {
+    let Some(first) = frames.first() else {
+        return 0.0;
+    };
+    let Some(last) = frames.last() else {
+        return 0.0;
+    };
+    norm3(sub3(last.pos_world, first.pos_world))
+}
+
+fn frame_errors(
+    actual: &[DroneFrame],
+    predicted: &[DroneFrame],
+    baseline: &[DroneFrame],
+) -> Vec<FrameError> {
+    let len = actual.len().min(predicted.len()).min(baseline.len());
+    (0..len)
+        .map(|idx| FrameError {
             step: idx,
             position_error_m: norm3(sub3(predicted[idx].pos_world, actual[idx].pos_world)),
             baseline_position_error_m: norm3(sub3(baseline[idx].pos_world, actual[idx].pos_world)),
@@ -255,23 +610,16 @@ fn build_replay(
                 predicted[idx].ang_vel_body,
                 actual[idx].ang_vel_body,
             )),
-        });
-    }
+        })
+        .collect()
+}
 
-    Ok(ReplayReport {
-        dataset_dir: dataset.root().to_path_buf(),
-        source_data_h5: dataset.data_h5().to_path_buf(),
-        start_row: row,
-        episode_idx: actual[0].episode_idx,
-        sample_rate_hz: dataset.metadata().sample_rate_hz,
-        actual,
-        predicted,
-        baseline,
-        errors,
-        gates: read_gates(dataset.root()).unwrap_or(GateSequenceFile {
-            flights: Vec::new(),
-        }),
-    })
+fn replay_duration_s(frames: &[DroneFrame], sample_rate_hz: usize) -> f32 {
+    if frames.len() <= 1 || sample_rate_hz == 0 {
+        0.0
+    } else {
+        (frames.len() - 1) as f32 / sample_rate_hz as f32
+    }
 }
 
 fn denormalized_delta(
@@ -413,9 +761,15 @@ impl LossTotals {
 struct ReplayReport {
     dataset_dir: PathBuf,
     source_data_h5: PathBuf,
+    replay_kind: String,
+    prediction_mode: String,
     start_row: usize,
     episode_idx: i64,
     sample_rate_hz: usize,
+    duration_s: f32,
+    model_chunk_steps: usize,
+    actual_path_m: f32,
+    actual_net_m: f32,
     actual: Vec<DroneFrame>,
     predicted: Vec<DroneFrame>,
     baseline: Vec<DroneFrame>,

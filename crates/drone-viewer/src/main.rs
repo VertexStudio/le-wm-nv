@@ -1,6 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::Context;
+use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
 use serde::Deserialize;
 
@@ -18,6 +19,7 @@ fn main() -> anyhow::Result<()> {
             frame: 0,
             playing: true,
             speed: 1.0,
+            follow_predicted: false,
             accumulator: 0.0,
         })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -29,7 +31,15 @@ fn main() -> anyhow::Result<()> {
             ..default()
         }))
         .add_systems(Startup, setup)
-        .add_systems(Update, (playback_controls, update_drone, draw_paths))
+        .add_systems(
+            Update,
+            (
+                playback_controls,
+                free_camera_controls,
+                update_drone,
+                draw_paths,
+            ),
+        )
         .run();
     Ok(())
 }
@@ -72,7 +82,17 @@ struct ReplayState {
     frame: usize,
     playing: bool,
     speed: f32,
+    follow_predicted: bool,
     accumulator: f32,
+}
+
+#[derive(Component)]
+struct FreeCamera {
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+    fast_multiplier: f32,
+    sensitivity: f32,
 }
 
 #[derive(Component)]
@@ -88,9 +108,22 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     replay: Res<ReplayState>,
 ) {
+    let bounds = replay_bounds(&replay.replay);
+    let center = bounds.center();
+    let radius = bounds.radius().max(4.0);
+    let camera_pos = center + Vec3::new(-0.9 * radius, -1.4 * radius, 0.8 * radius);
+    let camera_transform = Transform::from_translation(camera_pos).looking_at(center, Vec3::Z);
+    let (yaw, pitch, _) = camera_transform.rotation.to_euler(EulerRot::YXZ);
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(-8.0, 7.0, 5.0).looking_at(Vec3::new(0.0, 0.0, 1.0), Vec3::Z),
+        camera_transform,
+        FreeCamera {
+            yaw,
+            pitch,
+            speed: (radius * 0.5).max(4.0),
+            fast_multiplier: 4.0,
+            sensitivity: 0.002,
+        },
     ));
     commands.spawn((
         PointLight {
@@ -98,16 +131,20 @@ fn setup(
             shadows_enabled: true,
             ..default()
         },
-        Transform::from_xyz(-3.0, 6.0, 8.0),
+        Transform::from_translation(center + Vec3::new(-0.5 * radius, 0.7 * radius, radius)),
     ));
 
-    let floor_mesh = meshes.add(Plane3d::default().mesh().size(30.0, 30.0));
+    let floor_mesh = meshes.add(Plane3d::default().mesh().size(radius * 4.0, radius * 4.0));
     let floor_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.08, 0.09, 0.09),
         perceptual_roughness: 0.9,
         ..default()
     });
-    commands.spawn((Mesh3d(floor_mesh), MeshMaterial3d(floor_mat)));
+    commands.spawn((
+        Mesh3d(floor_mesh),
+        MeshMaterial3d(floor_mat),
+        Transform::from_xyz(center.x, center.y, 0.0),
+    ));
 
     let body_mesh = meshes.add(Cuboid::new(0.45, 0.18, 0.12));
     let arm_x_mesh = meshes.add(Cuboid::new(0.9, 0.05, 0.04));
@@ -138,7 +175,16 @@ fn setup(
         ..default()
     });
     let bar = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let has_matching_gates = replay
+        .replay
+        .gates
+        .flights
+        .iter()
+        .any(|flight| flight.episode_idx == replay.replay.episode_idx);
     for flight in &replay.replay.gates.flights {
+        if has_matching_gates && flight.episode_idx != replay.replay.episode_idx {
+            continue;
+        }
         for gate in &flight.gates {
             spawn_gate(&mut commands, &bar, &gate_mat, gate);
         }
@@ -152,6 +198,9 @@ fn playback_controls(
 ) {
     if keys.just_pressed(KeyCode::Space) {
         state.playing = !state.playing;
+    }
+    if keys.just_pressed(KeyCode::Tab) {
+        state.follow_predicted = !state.follow_predicted;
     }
     if keys.just_pressed(KeyCode::ArrowRight) {
         state.frame = (state.frame + 1).min(state.replay.actual.len().saturating_sub(1));
@@ -175,8 +224,68 @@ fn playback_controls(
     }
 }
 
+fn free_camera_controls(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut mouse_motion: MessageReader<MouseMotion>,
+    mut query: Query<(&mut Transform, &mut FreeCamera)>,
+) {
+    let Ok((mut transform, mut camera)) = query.single_mut() else {
+        return;
+    };
+
+    let mut mouse_delta = Vec2::ZERO;
+    for event in mouse_motion.read() {
+        if mouse_buttons.pressed(MouseButton::Right) {
+            mouse_delta += event.delta;
+        }
+    }
+    if mouse_delta != Vec2::ZERO {
+        camera.yaw -= mouse_delta.x * camera.sensitivity;
+        camera.pitch = (camera.pitch - mouse_delta.y * camera.sensitivity).clamp(-1.5, 1.5);
+        transform.rotation = Quat::from_euler(EulerRot::YXZ, camera.yaw, camera.pitch, 0.0);
+    }
+
+    let forward = transform.rotation * -Vec3::Z;
+    let right = transform.rotation * Vec3::X;
+    let mut movement = Vec3::ZERO;
+    if keys.pressed(KeyCode::KeyW) {
+        movement += forward;
+    }
+    if keys.pressed(KeyCode::KeyS) {
+        movement -= forward;
+    }
+    if keys.pressed(KeyCode::KeyD) {
+        movement += right;
+    }
+    if keys.pressed(KeyCode::KeyA) {
+        movement -= right;
+    }
+    if keys.pressed(KeyCode::KeyE) {
+        movement += Vec3::Z;
+    }
+    if keys.pressed(KeyCode::KeyQ) {
+        movement -= Vec3::Z;
+    }
+    if movement.length_squared() > 0.0 {
+        let multiplier = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+            camera.fast_multiplier
+        } else {
+            1.0
+        };
+        transform.translation +=
+            movement.normalize() * camera.speed * multiplier * time.delta_secs();
+    }
+}
+
 fn update_drone(state: Res<ReplayState>, mut query: Query<(&DronePart, &mut Transform)>) {
-    let Some(frame) = state.replay.predicted.get(state.frame) else {
+    let frames = if state.follow_predicted {
+        &state.replay.predicted
+    } else {
+        &state.replay.actual
+    };
+    let Some(frame) = frames.get(state.frame) else {
         return;
     };
     let base = transform_from_frame(frame);
@@ -207,7 +316,11 @@ fn draw_paths(mut gizmos: Gizmos, state: Res<ReplayState>) {
     );
     if let Some(frame) = state.replay.actual.get(state.frame) {
         let pos = vec3(frame.pos_world);
-        gizmos.sphere(pos, 0.12, Color::srgb(1.0, 1.0, 1.0));
+        gizmos.sphere(pos, 0.12, Color::srgb(0.15, 1.0, 0.35));
+    }
+    if let Some(frame) = state.replay.predicted.get(state.frame) {
+        let pos = vec3(frame.pos_world);
+        gizmos.sphere(pos, 0.1, Color::srgb(1.0, 0.9, 0.1));
     }
 }
 
@@ -273,8 +386,68 @@ fn vec3(value: [f32; 3]) -> Vec3 {
     Vec3::new(value[0], value[1], value[2])
 }
 
+#[derive(Clone, Copy)]
+struct SceneBounds {
+    min: Vec3,
+    max: Vec3,
+}
+
+impl SceneBounds {
+    fn empty() -> Self {
+        Self {
+            min: Vec3::splat(f32::INFINITY),
+            max: Vec3::splat(f32::NEG_INFINITY),
+        }
+    }
+
+    fn include(&mut self, point: Vec3) {
+        self.min = self.min.min(point);
+        self.max = self.max.max(point);
+    }
+
+    fn center(&self) -> Vec3 {
+        if self.min.is_finite() && self.max.is_finite() {
+            (self.min + self.max) * 0.5
+        } else {
+            Vec3::ZERO
+        }
+    }
+
+    fn radius(&self) -> f32 {
+        if self.min.is_finite() && self.max.is_finite() {
+            (self.max - self.min).length() * 0.5
+        } else {
+            10.0
+        }
+    }
+}
+
+fn replay_bounds(replay: &ReplayReport) -> SceneBounds {
+    let mut bounds = SceneBounds::empty();
+    for frame in &replay.actual {
+        bounds.include(vec3(frame.pos_world));
+    }
+    for flight in &replay.gates.flights {
+        if flight.episode_idx != replay.episode_idx {
+            continue;
+        }
+        for gate in &flight.gates {
+            let center = vec3(gate.center);
+            let right = vec3(gate.right).normalize_or_zero() * gate.half_width;
+            let up = vec3(gate.up).normalize_or_zero() * gate.half_height;
+            for sx in [-1.0, 1.0] {
+                for sy in [-1.0, 1.0] {
+                    bounds.include(center + right * sx + up * sy);
+                }
+            }
+        }
+    }
+    bounds
+}
+
 #[derive(Debug, Deserialize)]
 struct ReplayReport {
+    episode_idx: i64,
     sample_rate_hz: usize,
     actual: Vec<DroneFrame>,
     predicted: Vec<DroneFrame>,
@@ -295,6 +468,7 @@ struct GateSequenceFile {
 
 #[derive(Debug, Deserialize)]
 struct FlightGates {
+    episode_idx: i64,
     gates: Vec<GateSpec>,
 }
 
