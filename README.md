@@ -4,12 +4,15 @@ NVIDIA/CUDA-first LeWM training and inference runtime.
 
 ![le-wm-nv CUDA runtime architecture](docs/le-wm-nv.png)
 
-This repo is focused on one model family: LeWM image world models from
-`stable-worldmodel`. The runtime target is Linux with NVIDIA hardware, CUDA,
-cuDNN, nvJPEG, NVDECODE, and Candle CUDA tensors. The hot path is:
+This repo is focused on one model family: LeWM world models from
+`stable-worldmodel`. It started with image LeWM checkpoints and now also
+supports repo-native modular observation encoders for non-vision state models.
+The runtime target is Linux with NVIDIA hardware, CUDA, cuDNN, nvJPEG,
+NVDECODE, and Candle CUDA tensors. The hot paths are:
 
 ```text
 image/video observation -> CUDA preprocess -> LeWM encode -> candidate rollout -> cost -> action
+vector/state observation -> normalize -> LeWM encode -> candidate rollout -> cost -> action
 ```
 
 ## Mandate
@@ -29,15 +32,16 @@ crate that preserves device residency.
 
 ## Capabilities
 
-- LeWM model runtime: ViT-Tiny encoder, projector, action encoder, predictor,
-  latent rollout, goal embedding, goal cost, and session caching.
+- LeWM model runtime: ViT-Tiny image encoder, vector MLP observation encoder,
+  projector, action encoder, predictor, latent rollout, goal embedding, goal
+  cost, optional state-delta head, and session caching.
 - LeWM planning: CEM, MPPI, and iCEM over Candle CUDA tensors.
 - NVIDIA image/video ingest: nvJPEG decode into CUDA tensors, packed RGB/BGR
   CUDA preprocessing, NV12 CUDA preprocessing, and NVDECODE capability/parser
   plumbing.
 - LeWM training surface: PLDM, VCReg, temporal-straightening losses,
-  batch-loss API, AdamW training CLIs, PushT HDF5 dataset streaming, and
-  safetensors save/reload.
+  batch-loss API, AdamW training CLIs, PushT HDF5 dataset streaming, drone
+  vector-state dataset training, and safetensors save/reload.
 - Python bootstrap tooling: official `stable-worldmodel[train]` package via
   `uv`, checkpoint conversion, PushT batch export, Python parity fixture export,
   and Python-vs-Rust image-planning benchmark scripts.
@@ -45,6 +49,39 @@ crate that preserves device residency.
 
 The audited upstream `stable-worldmodel` commit is tracked in
 [docs/upstream-stable-worldmodel.md](docs/upstream-stable-worldmodel.md).
+
+## LeWM Runtime Extensions
+
+The image LeWM runtime is a Rust/Candle port of the audited upstream
+`stable-worldmodel` architecture: ViT image encoder, projector, action encoder,
+AdaLN-conditioned predictor, prediction projection, autoregressive latent
+rollout, and goal-embedding cost. Checkpoint tensor layout and model math are
+kept compatible with upstream image LeWM parity fixtures.
+
+Repo-native extensions live around that core instead of replacing it:
+
+- Modular observation encoders: image observations use the upstream-compatible
+  ViT path; vector/state observations use a `VectorMlp` encoder with the same
+  LeWM action encoder, predictor, and autoregressive rollout pattern.
+- Optional state-delta head: vector models can predict normalized state deltas
+  from predicted latent embeddings for dynamics tasks where the cost is defined
+  over state geometry instead of image-goal embedding distance.
+- Drone state LeWM: `lewm-train-drone`, `lewm-probe-drone-actions`, and
+  `lewm-plan-drone-gates` exercise the vector observation path on imported
+  drone racing data, keeping planning rollouts and scoring on CUDA.
+
+Architecture-preserving performance work is allowed and should be documented
+here when landed. It may cache non-learned tensors, reduce tensor assembly,
+reuse fixed-shape workspaces, add focused CUDA kernels, or use CUDA graph
+capture. It must not change learned layer shapes, checkpoint tensor layout,
+positional-embedding semantics, history semantics, predictor depth/heads, action
+encoder math, or silently introduce CPU planning/scoring paths.
+
+Current profiler finding for drone planning: the custom CUDA gate scorer and
+CUDA top-k are negligible; the bottleneck is the official-style autoregressive
+LeWM rollout loop, which repeatedly builds sliding history tensors and runs the
+predictor for each rollout step. The next LeWM runtime optimization target is an
+exact-semantics faster rollout path for fixed-shape CUDA planning.
 
 ## Prerequisites
 
