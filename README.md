@@ -75,7 +75,9 @@ here when landed. It may cache non-learned tensors, reduce tensor assembly,
 reuse fixed-shape workspaces, add focused CUDA kernels, or use CUDA graph
 capture. It must not change learned layer shapes, checkpoint tensor layout,
 positional-embedding semantics, history semantics, predictor depth/heads, action
-encoder math, or silently introduce CPU planning/scoring paths.
+encoder math, rollout horizon, planner sample budget, controller cadence, or
+silently introduce CPU planning/scoring paths. Runtime optimization benchmarks
+must hold planner settings fixed.
 
 Current profiler finding for drone planning: the custom CUDA gate scorer and
 CUDA top-k are negligible; the bottleneck is the official-style autoregressive
@@ -113,6 +115,14 @@ autoregressive token and runs the drone state head only on future embeddings,
 the same benchmark with 4 warmups and 30 measured iterations reached total mean
 `0.194838s`, rollout mean `0.191593s`, state-head mean `0.003001s`, and
 `2709.9` candidate rollouts/s. The checksum remained `40992.58`.
+
+## Drone Planner Budget Experiments
+
+Planner budget changes are controller changes, not LeWM runtime optimizations.
+Changing horizon, samples, iterations, elite count, or control stride can change
+the selected action sequence and the resulting flight behavior. These reports
+are useful for planning tradeoff analysis, but their speedups must not be mixed
+with behavior-preserving LeWM/Candle runtime gains.
 
 Drone loop planning reports also write budget and timing comparison fields:
 `planner_budget` compares the active settings to the old heavy iCEM defaults
