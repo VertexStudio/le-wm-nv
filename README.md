@@ -83,6 +83,27 @@ LeWM rollout loop, which repeatedly builds sliding history tensors and runs the
 predictor for each rollout step. The next LeWM runtime optimization target is an
 exact-semantics faster rollout path for fixed-shape CUDA planning.
 
+The fixed-shape drone rollout benchmark isolates that hot path:
+
+```bash
+cargo run --release --locked --bin lewm-bench-drone-rollout -- \
+  --device cuda \
+  --dataset-dir "$HOME/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz" \
+  --weights "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors" \
+  --config "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/model-config.json" \
+  --row 40847 \
+  --samples 528 \
+  --horizon 40 \
+  --warmup 2 \
+  --iterations 10 \
+  --output target/bench/drone-rollout-h40-s528.json
+```
+
+Baseline on 2026-06-13 for the all-data drone checkpoint, CUDA F32,
+`samples=528`, `horizon=40`: total mean `0.207182s`, rollout mean
+`0.203848s`, state-head mean `0.003058s`, denorm/slice mean `0.000055s`.
+That is `2548.5` candidate rollouts/s or `101939.5` predicted state steps/s.
+
 ## Prerequisites
 
 - Linux host with NVIDIA GPU

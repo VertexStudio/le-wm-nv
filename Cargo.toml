@@ -77,3 +77,7 @@ path = "src/bin/lewm-eval-drone.rs"
 [[bin]]
 name = "lewm-plan-drone-gates"
 path = "src/bin/lewm-plan-drone-gates.rs"
+
+[[bin]]
+name = "lewm-bench-drone-rollout"
+path = "src/bin/lewm-bench-drone-rollout.rs"
