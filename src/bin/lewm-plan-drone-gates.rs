@@ -72,7 +72,7 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     history_steps: usize,
 
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 25)]
     horizon: usize,
 
     /// Planner used to choose future action sequences.
@@ -80,19 +80,19 @@ struct Args {
     planner: PlannerKind,
 
     /// Sampling planner candidate sequences per iteration.
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 256)]
     samples: usize,
 
     /// Sampling planner elite sequences per iteration.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 32)]
     elites: usize,
 
     /// iCEM elite sequences carried into the next iteration.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 8)]
     keep_elites: usize,
 
     /// Sampling planner refinement iterations.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 2)]
     iterations: usize,
 
     /// Sampling planner RNG seed.
@@ -116,7 +116,7 @@ struct Args {
     loop_steps: Option<usize>,
 
     /// Number of actions to execute before replanning in loop mode.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 8)]
     control_stride: usize,
 
     /// Stop loop mode after this many completed laps. Zero disables the lap stop.
@@ -171,6 +171,12 @@ enum PlannerKind {
     Cem,
     Gradient,
 }
+
+const LEGACY_ICEM_HORIZON: usize = 50;
+const LEGACY_ICEM_SAMPLES: usize = 512;
+const LEGACY_ICEM_KEEP_ELITES: usize = 16;
+const LEGACY_ICEM_ITERATIONS: usize = 4;
+const LEGACY_ICEM_CONTROL_STRIDE: usize = 5;
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -288,6 +294,7 @@ fn main() -> anyhow::Result<()> {
         iterations: args.iterations,
         grad_steps: args.grad_steps,
         grad_lr: args.grad_lr,
+        planner_budget: planner_budget_summary(&args),
         planner_evals: plan.planner_evals,
         planner_elapsed_sec: plan.planner_elapsed_sec,
         planner_evals_per_sec: throughput(plan.planner_evals, plan.planner_elapsed_sec),
@@ -585,6 +592,146 @@ fn sampling_evals(args: &Args, planner: PlannerKind, iterations_completed: usize
         PlannerKind::Cem => args.samples * iterations_completed,
         PlannerKind::Gradient => args.grad_steps,
     }
+}
+
+fn sampling_evals_budget(args: &Args) -> usize {
+    match args.planner {
+        PlannerKind::Icem => {
+            args.samples + (args.iterations - 1) * (args.samples + args.keep_elites)
+        }
+        PlannerKind::Cem => args.samples * args.iterations,
+        PlannerKind::Gradient => args.grad_steps,
+    }
+}
+
+fn legacy_icem_evals_per_replan() -> usize {
+    LEGACY_ICEM_SAMPLES
+        + (LEGACY_ICEM_ITERATIONS - 1) * (LEGACY_ICEM_SAMPLES + LEGACY_ICEM_KEEP_ELITES)
+}
+
+fn planner_budget_summary(args: &Args) -> PlannerBudgetSummary {
+    let current = sampling_evals_budget(args);
+    let legacy = legacy_icem_evals_per_replan();
+    PlannerBudgetSummary {
+        current_per_replan_evals: current,
+        legacy_icem_per_replan_evals: legacy,
+        current_horizon: args.horizon,
+        legacy_icem_horizon: LEGACY_ICEM_HORIZON,
+        current_control_stride: args.control_stride,
+        legacy_icem_control_stride: LEGACY_ICEM_CONTROL_STRIDE,
+        current_samples: args.samples,
+        legacy_icem_samples: LEGACY_ICEM_SAMPLES,
+        current_keep_elites: args.keep_elites,
+        legacy_icem_keep_elites: LEGACY_ICEM_KEEP_ELITES,
+        current_iterations: args.iterations,
+        legacy_icem_iterations: LEGACY_ICEM_ITERATIONS,
+        per_replan_eval_ratio_vs_legacy_icem: ratio(current, legacy),
+        per_replan_eval_reduction_pct_vs_legacy_icem: reduction_pct(current, legacy),
+    }
+}
+
+fn loop_planner_benchmark(
+    args: &Args,
+    requested_loop_steps: usize,
+    executed_steps: usize,
+    replans: &[ReplanStep],
+    total_planner_elapsed_sec: f64,
+    total_planner_evals: usize,
+) -> LoopPlannerBenchmark {
+    let current_expected_replans = ceil_div(requested_loop_steps, args.control_stride);
+    let legacy_expected_replans = ceil_div(requested_loop_steps, LEGACY_ICEM_CONTROL_STRIDE);
+    let current_budget_total_evals = current_expected_replans * sampling_evals_budget(args);
+    let legacy_icem_budget_total_evals = legacy_expected_replans * legacy_icem_evals_per_replan();
+    LoopPlannerBenchmark {
+        current_expected_replans,
+        legacy_icem_expected_replans: legacy_expected_replans,
+        current_budget_total_evals,
+        legacy_icem_budget_total_evals,
+        budget_eval_ratio_vs_legacy_icem: ratio(
+            current_budget_total_evals,
+            legacy_icem_budget_total_evals,
+        ),
+        budget_eval_reduction_pct_vs_legacy_icem: reduction_pct(
+            current_budget_total_evals,
+            legacy_icem_budget_total_evals,
+        ),
+        actual_total_planner_elapsed_sec: total_planner_elapsed_sec,
+        actual_total_planner_evals: total_planner_evals,
+        actual_planner_evals_per_sec: throughput(total_planner_evals, total_planner_elapsed_sec),
+        actual_planner_evals_per_executed_step: ratio(total_planner_evals, executed_steps),
+        actual_planner_ms_per_executed_step: if executed_steps > 0 {
+            total_planner_elapsed_sec * 1000.0 / executed_steps as f64
+        } else {
+            0.0
+        },
+        planner_elapsed: timing_summary_secs(
+            replans.iter().map(|replan| replan.planner_elapsed_sec),
+        ),
+        model_advance_elapsed: timing_summary_secs(
+            replans
+                .iter()
+                .map(|replan| replan.model_advance_elapsed_sec),
+        ),
+    }
+}
+
+fn ceil_div(numerator: usize, denominator: usize) -> usize {
+    if numerator == 0 {
+        0
+    } else {
+        ((numerator - 1) / denominator) + 1
+    }
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator > 0 {
+        numerator as f64 / denominator as f64
+    } else {
+        0.0
+    }
+}
+
+fn reduction_pct(current: usize, baseline: usize) -> f64 {
+    if baseline > 0 {
+        (1.0 - current as f64 / baseline as f64) * 100.0
+    } else {
+        0.0
+    }
+}
+
+fn timing_summary_secs(values: impl Iterator<Item = f64>) -> TimingSummary {
+    let mut values = values.filter(|value| value.is_finite()).collect::<Vec<_>>();
+    if values.is_empty() {
+        return TimingSummary {
+            count: 0,
+            total_sec: 0.0,
+            mean_sec: 0.0,
+            p50_sec: 0.0,
+            p90_sec: 0.0,
+            min_sec: 0.0,
+            max_sec: 0.0,
+        };
+    }
+
+    values.sort_by(|a, b| a.total_cmp(b));
+    let total_sec = values.iter().sum::<f64>();
+    let count = values.len();
+    TimingSummary {
+        count,
+        total_sec,
+        mean_sec: total_sec / count as f64,
+        p50_sec: percentile_sorted(&values, 0.50),
+        p90_sec: percentile_sorted(&values, 0.90),
+        min_sec: values[0],
+        max_sec: values[count - 1],
+    }
+}
+
+fn percentile_sorted(values: &[f64], percentile: f64) -> f64 {
+    let idx = ((values.len() as f64 * percentile).ceil() as usize)
+        .saturating_sub(1)
+        .min(values.len() - 1);
+    values[idx]
 }
 
 fn cem_config(args: &Args) -> CemConfig {
@@ -1723,6 +1870,15 @@ fn run_gate_loop(
         .iter()
         .map(|replan| replan.planner_evals)
         .sum::<usize>();
+    let planner_budget = planner_budget_summary(args);
+    let planner_benchmark = loop_planner_benchmark(
+        args,
+        loop_steps,
+        executed_steps,
+        &replans,
+        total_planner_elapsed_sec,
+        total_planner_evals,
+    );
     Ok(LoopPlanReport {
         dataset_dir: dataset.root().to_path_buf(),
         weights: args.weights.clone().unwrap_or_else(default_weights),
@@ -1753,6 +1909,8 @@ fn run_gate_loop(
         total_planner_elapsed_sec,
         total_planner_evals,
         planner_evals_per_sec: throughput(total_planner_evals, total_planner_elapsed_sec),
+        planner_budget,
+        planner_benchmark,
         sample_rate_hz: dataset.metadata().sample_rate_hz,
         gate_loop: flight.gates.clone(),
         frames,
@@ -2109,6 +2267,7 @@ struct PlanReport {
     iterations: usize,
     grad_steps: usize,
     grad_lr: f64,
+    planner_budget: PlannerBudgetSummary,
     planner_evals: usize,
     planner_elapsed_sec: f64,
     planner_evals_per_sec: f64,
@@ -2147,11 +2306,59 @@ struct LoopPlanReport {
     total_planner_elapsed_sec: f64,
     total_planner_evals: usize,
     planner_evals_per_sec: f64,
+    planner_budget: PlannerBudgetSummary,
+    planner_benchmark: LoopPlannerBenchmark,
     sample_rate_hz: usize,
     gate_loop: Vec<GateSpec>,
     frames: Vec<DroneFrame>,
     actions: Vec<[f32; DRONE_ACTION_DIM]>,
     replans: Vec<ReplanStep>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlannerBudgetSummary {
+    current_per_replan_evals: usize,
+    legacy_icem_per_replan_evals: usize,
+    current_horizon: usize,
+    legacy_icem_horizon: usize,
+    current_control_stride: usize,
+    legacy_icem_control_stride: usize,
+    current_samples: usize,
+    legacy_icem_samples: usize,
+    current_keep_elites: usize,
+    legacy_icem_keep_elites: usize,
+    current_iterations: usize,
+    legacy_icem_iterations: usize,
+    per_replan_eval_ratio_vs_legacy_icem: f64,
+    per_replan_eval_reduction_pct_vs_legacy_icem: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct LoopPlannerBenchmark {
+    current_expected_replans: usize,
+    legacy_icem_expected_replans: usize,
+    current_budget_total_evals: usize,
+    legacy_icem_budget_total_evals: usize,
+    budget_eval_ratio_vs_legacy_icem: f64,
+    budget_eval_reduction_pct_vs_legacy_icem: f64,
+    actual_total_planner_elapsed_sec: f64,
+    actual_total_planner_evals: usize,
+    actual_planner_evals_per_sec: f64,
+    actual_planner_evals_per_executed_step: f64,
+    actual_planner_ms_per_executed_step: f64,
+    planner_elapsed: TimingSummary,
+    model_advance_elapsed: TimingSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct TimingSummary {
+    count: usize,
+    total_sec: f64,
+    mean_sec: f64,
+    p50_sec: f64,
+    p90_sec: f64,
+    min_sec: f64,
+    max_sec: f64,
 }
 
 #[derive(Debug, Serialize)]
