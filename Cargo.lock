@@ -4141,6 +4141,8 @@ dependencies = [
  "anyhow",
  "bevy",
  "bevy_camera_controller",
+ "candle-core",
+ "le-wm-nv",
  "serde",
  "serde_json",
 ]

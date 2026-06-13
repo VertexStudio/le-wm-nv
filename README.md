@@ -162,6 +162,28 @@ cargo run --release --locked --bin lewm-plan-drone-gates -- \
   --output target/drone-plans/defaults-full-lap-passcheck.json
 ```
 
+## Interactive Drone Simulator
+
+`lewm-drone-sim` is an interactive Bevy viewer that drives the learned drone
+world model directly. The simulation step uses the trained LeWM model on CUDA:
+current vector observation history and live RC-channel input are encoded,
+rolled forward one model step, decoded through the state-delta head, and then
+the tiny predicted state is copied back for Bevy rendering.
+
+```bash
+cargo run --release --locked -p lewm-drone-viewer --bin lewm-drone-sim -- \
+  --dataset-dir "$HOME/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz" \
+  --weights "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors" \
+  --config "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/model-config.json" \
+  --row 40847
+```
+
+Controls: `W/S` pitch, `A/D` roll, `Q/E` yaw, `R/F` throttle, `Z` zero
+roll/pitch/yaw, `X` return throttle to trim, `P` pause, and Backspace reset.
+The camera is a spring follow camera so WASD is reserved for piloting. Use
+`[`/`]` for follow distance, `3`/`4` for camera height, and `1`/`2` for spring
+strength.
+
 ## Prerequisites
 
 - Linux host with NVIDIA GPU

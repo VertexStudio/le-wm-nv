@@ -9,5 +9,7 @@ description = "Bevy replay viewer for le-wm-nv drone world-model reports."
 anyhow = "1.0.102"
 bevy = { git = "https://github.com/bevyengine/bevy", branch = "release-0.19.0", default-features = false, features = ["3d", "ui"] }
 bevy_camera_controller = { git = "https://github.com/bevyengine/bevy", branch = "release-0.19.0", default-features = false, features = ["free_camera"] }
+candle = { package = "candle-core", version = "0.10.2", features = ["cuda", "cudnn"] }
+le-wm-nv = { path = "../.." }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
