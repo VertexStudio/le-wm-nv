@@ -118,18 +118,27 @@ Drone loop planning reports also write budget and timing comparison fields:
 `planner_budget` compares the active settings to the old heavy iCEM defaults
 (`horizon=50`, `samples=512`, `keep_elites=16`, `iterations=4`,
 `control_stride=5`), and `planner_benchmark` records actual planner throughput,
-planner milliseconds per executed model step, and per-replan timing summaries.
+planner milliseconds per executed model step, model-step budget, and per-replan
+timing summaries.
 
-On 2026-06-13, same all-data checkpoint, row `40847`, `loop_steps=80`, CUDA
-F32, the lighter default iCEM budget (`horizon=25`, `samples=256`,
-`keep_elites=8`, `iterations=2`, `control_stride=8`) ran 10 replans / 5,200
-planner evals with `1.539551s` total planner time, `3377.6` evals/s, and
-`19.24ms` planner time per executed model step. The old heavy budget ran 16
-replans / 33,536 evals with `15.134337s` total planner time, `2215.9` evals/s,
-and `189.18ms` per executed model step. That is an `84.49%` lower eval budget
-and a `9.83x` lower measured planner-time-per-step for this comparison.
+On 2026-06-13, same all-data checkpoint, row `40847`, `loop_steps=800`, CUDA
+F32, the current default iCEM budget (`horizon=40`, `samples=512`,
+`keep_elites=16`, `iterations=4`, `control_stride=5`) completed a full 7-gate
+lap in 645 executed model steps. It ran 129 replans / 270,384 planner evals
+with `96.947329s` total planner time, `2789.0` evals/s, and `150.31ms`
+planner time per executed model step. Compared with the old heavy
+`horizon=50` budget, the eval count is unchanged but the candidate model-step
+budget is `20%` lower.
 
-The current fast loop benchmark command is:
+An aggressive profiling budget (`horizon=25`, `samples=256`, `keep_elites=8`,
+`iterations=2`, `control_stride=8`) cut the planned eval budget by `84.49%` and
+measured `17.47ms` planner time per executed model step over 1,200 steps, but
+it only passed `gate1` and remained on `gate2`; it is not the default. A
+half-sample budget (`horizon=40`, `samples=256`, `iterations=4`,
+`control_stride=5`) passed through `gate5` but did not complete the lap within
+800 steps.
+
+The current all-gates loop benchmark command is:
 
 ```bash
 cargo run --release --locked --bin lewm-plan-drone-gates -- \
@@ -138,9 +147,9 @@ cargo run --release --locked --bin lewm-plan-drone-gates -- \
   --weights "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors" \
   --config "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/model-config.json" \
   --row 40847 \
-  --loop-steps 80 \
+  --loop-steps 800 \
   --laps 1 \
-  --output target/drone-plans/bench-fast-defaults-loop80.json
+  --output target/drone-plans/defaults-full-lap-passcheck.json
 ```
 
 ## Prerequisites

@@ -72,7 +72,7 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     history_steps: usize,
 
-    #[arg(long, default_value_t = 25)]
+    #[arg(long, default_value_t = 40)]
     horizon: usize,
 
     /// Planner used to choose future action sequences.
@@ -80,19 +80,19 @@ struct Args {
     planner: PlannerKind,
 
     /// Sampling planner candidate sequences per iteration.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 512)]
     samples: usize,
 
     /// Sampling planner elite sequences per iteration.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 64)]
     elites: usize,
 
     /// iCEM elite sequences carried into the next iteration.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     keep_elites: usize,
 
     /// Sampling planner refinement iterations.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 4)]
     iterations: usize,
 
     /// Sampling planner RNG seed.
@@ -116,7 +116,7 @@ struct Args {
     loop_steps: Option<usize>,
 
     /// Number of actions to execute before replanning in loop mode.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 5)]
     control_stride: usize,
 
     /// Stop loop mode after this many completed laps. Zero disables the lap stop.
@@ -615,6 +615,8 @@ fn planner_budget_summary(args: &Args) -> PlannerBudgetSummary {
     PlannerBudgetSummary {
         current_per_replan_evals: current,
         legacy_icem_per_replan_evals: legacy,
+        current_per_replan_model_steps: current * args.horizon,
+        legacy_icem_per_replan_model_steps: legacy * LEGACY_ICEM_HORIZON,
         current_horizon: args.horizon,
         legacy_icem_horizon: LEGACY_ICEM_HORIZON,
         current_control_stride: args.control_stride,
@@ -627,6 +629,14 @@ fn planner_budget_summary(args: &Args) -> PlannerBudgetSummary {
         legacy_icem_iterations: LEGACY_ICEM_ITERATIONS,
         per_replan_eval_ratio_vs_legacy_icem: ratio(current, legacy),
         per_replan_eval_reduction_pct_vs_legacy_icem: reduction_pct(current, legacy),
+        per_replan_model_step_ratio_vs_legacy_icem: ratio(
+            current * args.horizon,
+            legacy * LEGACY_ICEM_HORIZON,
+        ),
+        per_replan_model_step_reduction_pct_vs_legacy_icem: reduction_pct(
+            current * args.horizon,
+            legacy * LEGACY_ICEM_HORIZON,
+        ),
     }
 }
 
@@ -642,11 +652,15 @@ fn loop_planner_benchmark(
     let legacy_expected_replans = ceil_div(requested_loop_steps, LEGACY_ICEM_CONTROL_STRIDE);
     let current_budget_total_evals = current_expected_replans * sampling_evals_budget(args);
     let legacy_icem_budget_total_evals = legacy_expected_replans * legacy_icem_evals_per_replan();
+    let current_budget_total_model_steps = current_budget_total_evals * args.horizon;
+    let legacy_icem_budget_total_model_steps = legacy_icem_budget_total_evals * LEGACY_ICEM_HORIZON;
     LoopPlannerBenchmark {
         current_expected_replans,
         legacy_icem_expected_replans: legacy_expected_replans,
         current_budget_total_evals,
         legacy_icem_budget_total_evals,
+        current_budget_total_model_steps,
+        legacy_icem_budget_total_model_steps,
         budget_eval_ratio_vs_legacy_icem: ratio(
             current_budget_total_evals,
             legacy_icem_budget_total_evals,
@@ -654,6 +668,14 @@ fn loop_planner_benchmark(
         budget_eval_reduction_pct_vs_legacy_icem: reduction_pct(
             current_budget_total_evals,
             legacy_icem_budget_total_evals,
+        ),
+        budget_model_step_ratio_vs_legacy_icem: ratio(
+            current_budget_total_model_steps,
+            legacy_icem_budget_total_model_steps,
+        ),
+        budget_model_step_reduction_pct_vs_legacy_icem: reduction_pct(
+            current_budget_total_model_steps,
+            legacy_icem_budget_total_model_steps,
         ),
         actual_total_planner_elapsed_sec: total_planner_elapsed_sec,
         actual_total_planner_evals: total_planner_evals,
@@ -2319,6 +2341,8 @@ struct LoopPlanReport {
 struct PlannerBudgetSummary {
     current_per_replan_evals: usize,
     legacy_icem_per_replan_evals: usize,
+    current_per_replan_model_steps: usize,
+    legacy_icem_per_replan_model_steps: usize,
     current_horizon: usize,
     legacy_icem_horizon: usize,
     current_control_stride: usize,
@@ -2331,6 +2355,8 @@ struct PlannerBudgetSummary {
     legacy_icem_iterations: usize,
     per_replan_eval_ratio_vs_legacy_icem: f64,
     per_replan_eval_reduction_pct_vs_legacy_icem: f64,
+    per_replan_model_step_ratio_vs_legacy_icem: f64,
+    per_replan_model_step_reduction_pct_vs_legacy_icem: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -2339,8 +2365,12 @@ struct LoopPlannerBenchmark {
     legacy_icem_expected_replans: usize,
     current_budget_total_evals: usize,
     legacy_icem_budget_total_evals: usize,
+    current_budget_total_model_steps: usize,
+    legacy_icem_budget_total_model_steps: usize,
     budget_eval_ratio_vs_legacy_icem: f64,
     budget_eval_reduction_pct_vs_legacy_icem: f64,
+    budget_model_step_ratio_vs_legacy_icem: f64,
+    budget_model_step_reduction_pct_vs_legacy_icem: f64,
     actual_total_planner_elapsed_sec: f64,
     actual_total_planner_evals: usize,
     actual_planner_evals_per_sec: f64,
