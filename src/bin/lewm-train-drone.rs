@@ -56,6 +56,10 @@ struct Args {
     #[arg(long)]
     max_steps: Option<usize>,
 
+    /// Train on every valid sliding window in the imported dataset.
+    #[arg(long)]
+    train_all_data: bool,
+
     #[arg(long, default_value_t = 256)]
     batch_size: usize,
 
@@ -131,7 +135,12 @@ fn main() -> anyhow::Result<()> {
         normalize_targets: !args.no_target_normalize,
     };
     let dataset = DroneRacingDataset::open(&dataset_dir, batch_cfg)?;
-    let train_rows = dataset.train_rows();
+    let train_rows = training_rows(&dataset, args.train_all_data);
+    let row_source = if args.train_all_data {
+        "all_valid_rows"
+    } else {
+        "metadata_train_episodes"
+    };
     let batches_per_epoch = train_rows.len() / args.batch_size;
     ensure!(
         batches_per_epoch > 0,
@@ -203,11 +212,11 @@ fn main() -> anyhow::Result<()> {
     let mut metrics = BufWriter::new(metrics_file);
 
     println!(
-        "dataset={} rows={} train_rows={} eval_episodes={} batches_per_epoch={} sequence_steps={}",
+        "dataset={} rows={} train_windows={} row_source={} batches_per_epoch={} sequence_steps={}",
         dataset.root().display(),
         dataset.metadata().rows,
         train_rows.len(),
-        dataset.metadata().eval_episodes.len(),
+        row_source,
         batches_per_epoch,
         sequence_steps,
     );
@@ -409,6 +418,14 @@ fn load_or_default_config(
     Ok(cfg)
 }
 
+fn training_rows(dataset: &DroneRacingDataset, train_all_data: bool) -> Vec<usize> {
+    if train_all_data {
+        dataset.valid_rows().to_vec()
+    } else {
+        dataset.train_rows()
+    }
+}
+
 fn loss_weights(args: &Args) -> VectorLossWeights {
     VectorLossWeights {
         state_prediction: args.state_prediction_weight,
@@ -537,6 +554,11 @@ fn ensure_resume_compatible(current: &RunSettings, saved: &RunSettings) -> anyho
     ensure_eq("dtype", &current.dtype, &saved.dtype)?;
     ensure_eq("batch_size", &current.batch_size, &saved.batch_size)?;
     ensure_eq(
+        "train_all_data",
+        &current.train_all_data,
+        &saved.train_all_data,
+    )?;
+    ensure_eq(
         "history_steps",
         &current.history_steps,
         &saved.history_steps,
@@ -589,6 +611,8 @@ struct RunSettings {
     dtype: String,
     epochs: usize,
     max_steps: Option<usize>,
+    #[serde(default)]
+    train_all_data: bool,
     batch_size: usize,
     history_steps: usize,
     horizon_steps: usize,
@@ -618,6 +642,7 @@ impl RunSettings {
             dtype: args.dtype.to_string(),
             epochs: args.epochs,
             max_steps: args.max_steps,
+            train_all_data: args.train_all_data,
             batch_size: args.batch_size,
             history_steps: args.history_steps,
             horizon_steps: args.horizon_steps,

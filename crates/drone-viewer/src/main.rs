@@ -22,7 +22,6 @@ fn main() -> anyhow::Result<()> {
             frame: 0,
             playing: true,
             speed: 1.0,
-            follow_predicted: false,
             accumulator: 0.0,
         })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -78,7 +77,7 @@ fn default_replay() -> PathBuf {
         .join(".stable_worldmodel")
         .join("le-wm-nv-reports")
         .join("drone-state-lewm-autonomous-100hz")
-        .join("replay.json")
+        .join("gate-plan.json")
 }
 
 #[derive(Resource)]
@@ -87,7 +86,6 @@ struct ReplayState {
     frame: usize,
     playing: bool,
     speed: f32,
-    follow_predicted: bool,
     accumulator: f32,
 }
 
@@ -196,11 +194,8 @@ fn playback_controls(
     if keys.just_pressed(KeyCode::Space) {
         state.playing = !state.playing;
     }
-    if keys.just_pressed(KeyCode::Tab) {
-        state.follow_predicted = !state.follow_predicted;
-    }
     if keys.just_pressed(KeyCode::ArrowRight) {
-        state.frame = (state.frame + 1).min(state.replay.actual.len().saturating_sub(1));
+        state.frame = (state.frame + 1).min(state.replay.frames.len().saturating_sub(1));
     }
     if keys.just_pressed(KeyCode::ArrowLeft) {
         state.frame = state.frame.saturating_sub(1);
@@ -216,7 +211,7 @@ fn playback_controls(
         let frame_dt = 1.0 / state.replay.sample_rate_hz as f32;
         while state.accumulator >= frame_dt {
             state.accumulator -= frame_dt;
-            state.frame = (state.frame + 1) % state.replay.actual.len().max(1);
+            state.frame = (state.frame + 1) % state.replay.frames.len().max(1);
         }
     }
 }
@@ -292,12 +287,7 @@ fn snap_up(value: f32, step: f32) -> f32 {
 }
 
 fn update_drone(state: Res<ReplayState>, mut query: Query<(&DronePart, &mut Transform)>) {
-    let frames = if state.follow_predicted {
-        &state.replay.predicted
-    } else {
-        &state.replay.actual
-    };
-    let Some(frame) = frames.get(state.frame) else {
+    let Some(frame) = state.replay.frames.get(state.frame) else {
         return;
     };
     let base = transform_from_frame(frame);
@@ -311,42 +301,20 @@ fn update_drone(state: Res<ReplayState>, mut query: Query<(&DronePart, &mut Tran
 }
 
 fn draw_paths(mut gizmos: Gizmos, state: Res<ReplayState>) {
-    if state.replay.mode.as_deref() == Some("gate_loop") {
-        draw_line_strip(
-            &mut gizmos,
-            &state.replay.predicted,
-            Color::srgb(0.95, 0.85, 0.15),
-        );
-    } else {
-        draw_line_strip(
-            &mut gizmos,
-            &state.replay.actual,
-            Color::srgb(0.15, 0.8, 0.25),
-        );
-        draw_line_strip(
-            &mut gizmos,
-            &state.replay.predicted,
-            Color::srgb(0.95, 0.85, 0.15),
-        );
-        draw_line_strip(
-            &mut gizmos,
-            &state.replay.baseline,
-            Color::srgb(0.55, 0.55, 0.65),
-        );
-    }
-    if let Some(frame) = state.replay.actual.get(state.frame) {
+    draw_line_strip(
+        &mut gizmos,
+        &state.replay.frames,
+        Color::srgb(0.95, 0.85, 0.15),
+    );
+    if let Some(frame) = state.replay.frames.get(state.frame) {
         let pos = view_vec3(frame.pos_world);
         gizmos.sphere(pos, 0.12, Color::srgb(0.15, 1.0, 0.35));
-    }
-    if let Some(frame) = state.replay.predicted.get(state.frame) {
-        let pos = view_vec3(frame.pos_world);
-        gizmos.sphere(pos, 0.1, Color::srgb(1.0, 0.9, 0.1));
     }
 }
 
 fn draw_analysis_overlays(mut gizmos: Gizmos, state: Res<ReplayState>) {
     let replay = &state.replay;
-    let frames = selected_frames(&state);
+    let frames = &state.replay.frames;
     let Some(frame) = frames.get(state.frame) else {
         return;
     };
@@ -482,6 +450,16 @@ fn draw_current_state_overlay(
         draw_cross(gizmos, target, 0.65, Color::srgb(1.0, 0.15, 0.85));
     }
 
+    if let Some(replan) = active_replan {
+        let anchor = view_vec3(replan.path_anchor);
+        let carrot = view_vec3(replan.carrot);
+        gizmos.line(anchor, carrot, Color::srgb(1.0, 0.55, 0.05));
+        gizmos.sphere(anchor, 0.08, Color::srgb(1.0, 0.55, 0.05));
+        gizmos.sphere(carrot, 0.22, Color::srgb(1.0, 0.55, 0.05));
+        draw_cross(gizmos, carrot, 0.38, Color::srgb(1.0, 0.55, 0.05));
+        gizmos.arrow(current_pos, carrot, Color::srgb(1.0, 0.55, 0.05));
+    }
+
     if let Some(action) = action_at_frame(replay, frame_index.saturating_sub(1)) {
         draw_action_bars(gizmos, current_pos, action);
     }
@@ -489,11 +467,11 @@ fn draw_current_state_overlay(
     let replan_text = active_replan
         .map(|replan| {
             format!(
-                "gate={} score={:.2} mean={:.2} cand/s={:.0}",
+                "gate={} score={:.2} mean={:.2} grad/s={:.0}",
                 replan.gate_name,
                 replan.score_summary.best,
                 replan.score_summary.mean,
-                replan.candidate_sequences_per_sec
+                replan.grad_evals_per_sec
             )
         })
         .unwrap_or_else(|| "no replan metadata".to_string());
@@ -505,14 +483,24 @@ fn draw_current_state_overlay(
             )
         })
         .unwrap_or_else(|| "a=[n/a]".to_string());
+    let carrot_text = active_replan
+        .map(|replan| {
+            let carrot = replan.carrot;
+            format!(
+                " carrot=[{:.1} {:.1} {:.1}]",
+                carrot[0], carrot[1], carrot[2]
+            )
+        })
+        .unwrap_or_default();
     let text = format!(
-        "f={} step={} row={} z={:.2} vbat={:.1} {}\n{}",
+        "f={} step={} row={} z={:.2} vbat={:.1} {}{}\n{}",
         frame_index,
         frame.step_idx,
         frame.row,
         frame.pos_world[2],
         frame.vbat,
         action_text,
+        carrot_text,
         replan_text
     );
     gizmos.text(
@@ -542,14 +530,6 @@ fn draw_action_bars(gizmos: &mut Gizmos, current_pos: Vec3, action: &[f32; 4]) {
         };
         gizmos.line(base, base + Vec3::Y * height, color);
         gizmos.sphere(base + Vec3::Y * height, 0.035, color);
-    }
-}
-
-fn selected_frames(state: &ReplayState) -> &[DroneFrame] {
-    if state.follow_predicted {
-        &state.replay.predicted
-    } else {
-        &state.replay.actual
     }
 }
 
@@ -650,54 +630,40 @@ impl SceneBounds {
 
 fn replay_bounds(replay: &ReplayReport) -> SceneBounds {
     let mut bounds = SceneBounds::empty();
-    for frame in &replay.actual {
-        bounds.include(view_vec3(frame.pos_world));
-    }
-    for frame in &replay.predicted {
-        bounds.include(view_vec3(frame.pos_world));
-    }
-    for frame in &replay.baseline {
+    for frame in &replay.frames {
         bounds.include(view_vec3(frame.pos_world));
     }
     for gate in &replay.gate_loop {
         bounds.include(view_vec3(gate.center));
+    }
+    for replan in &replay.replans {
+        bounds.include(view_vec3(replan.path_anchor));
+        bounds.include(view_vec3(replan.carrot));
     }
     bounds
 }
 
 #[derive(Debug, Deserialize)]
 struct ReplayReport {
-    #[serde(default)]
-    mode: Option<String>,
     sample_rate_hz: usize,
-    actual: Vec<DroneFrame>,
-    predicted: Vec<DroneFrame>,
-    baseline: Vec<DroneFrame>,
-    #[serde(default)]
     gate_loop: Vec<GateSpec>,
-    #[serde(default)]
+    frames: Vec<DroneFrame>,
     actions: Vec<[f32; 4]>,
-    #[serde(default)]
     replans: Vec<ReplanStep>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct DroneFrame {
-    #[serde(default)]
     row: usize,
-    #[serde(default)]
     step_idx: i64,
     pos_world: [f32; 3],
     rotmat_world_from_body: [f32; 9],
-    #[serde(default)]
     lin_vel_body: [f32; 3],
-    #[serde(default)]
     vbat: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct GateSpec {
-    #[serde(default)]
     name: String,
     center: [f32; 3],
     normal: [f32; 3],
@@ -711,8 +677,10 @@ struct ReplanStep {
     gate_index: usize,
     gate_name: String,
     passed_gate: bool,
+    path_anchor: [f32; 3],
+    carrot: [f32; 3],
     score_summary: ScoreSummary,
-    candidate_sequences_per_sec: f32,
+    grad_evals_per_sec: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
