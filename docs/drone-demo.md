@@ -159,6 +159,13 @@ The first quantitative dynamics report for the all-data checkpoint is:
 docs/drone-eval-all-data-final-20260614.md
 ```
 
+The checkpoint learning curve, action controllability probe, and closed-loop
+local-control benchmark are documented in:
+
+```text
+docs/drone-control-evals-20260614.md
+```
+
 Summary:
 
 - Mean normalized state-prediction loss on metadata eval rows: `0.25623435`

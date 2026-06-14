@@ -78,6 +78,9 @@ Repo-native extensions live around that core instead of replacing it:
 - Drone state LeWM: `lewm-train-drone`, `lewm-probe-drone-actions`, and
   `lewm-plan-drone-gates` exercise the vector observation path on imported
   drone racing data, keeping planning rollouts and scoring on CUDA.
+- Drone evaluation: `lewm-eval-drone-checkpoints` measures learning curves
+  across saved checkpoints, while `lewm-bench-drone-closed-loop` runs
+  short-horizon local-control probes without gate-specific geometry.
 
 The current drone demo, training run, planner result, replay viewer, and
 interactive LeWM simulator are summarized in

@@ -75,6 +75,14 @@ name = "lewm-eval-drone"
 path = "src/bin/lewm-eval-drone.rs"
 
 [[bin]]
+name = "lewm-eval-drone-checkpoints"
+path = "src/bin/lewm-eval-drone-checkpoints.rs"
+
+[[bin]]
+name = "lewm-bench-drone-closed-loop"
+path = "src/bin/lewm-bench-drone-closed-loop.rs"
+
+[[bin]]
 name = "lewm-plan-drone-gates"
 path = "src/bin/lewm-plan-drone-gates.rs"
 
