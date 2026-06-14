@@ -70,6 +70,10 @@ Repo-native extensions live around that core instead of replacing it:
   `lewm-plan-drone-gates` exercise the vector observation path on imported
   drone racing data, keeping planning rollouts and scoring on CUDA.
 
+The current drone demo, training run, planner result, replay viewer, and
+interactive LeWM simulator are summarized in
+[docs/drone-demo.md](docs/drone-demo.md).
+
 Architecture-preserving performance work is allowed and should be documented
 here when landed. It may cache non-learned tensors, reduce tensor assembly,
 reuse fixed-shape workspaces, add focused CUDA kernels, or use CUDA graph
