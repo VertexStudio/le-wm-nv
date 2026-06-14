@@ -19,7 +19,6 @@ pub struct DroneBatchConfig {
     pub sequence_steps: usize,
     pub normalize_observations: bool,
     pub normalize_actions: bool,
-    pub normalize_targets: bool,
 }
 
 impl DroneBatchConfig {
@@ -120,7 +119,6 @@ impl RunningStats {
 pub struct DroneBatch {
     pub observations: Tensor,
     pub actions: Tensor,
-    pub target_deltas: Tensor,
     pub meta: DroneBatchMeta,
 }
 
@@ -273,7 +271,6 @@ impl DroneRacingDataset {
         let time = self.config.sequence_steps;
         let mut observations = vec![0f32; batch * time * DRONE_OBSERVATION_DIM];
         let mut actions = vec![0f32; batch * time * DRONE_ACTION_DIM];
-        let mut targets = vec![0f32; batch * time * DRONE_STATE_DELTA_DIM];
         let mut episode_idx = Vec::with_capacity(batch);
         let mut step_idx = Vec::with_capacity(batch);
 
@@ -285,7 +282,6 @@ impl DroneRacingDataset {
                 let src = row + t;
                 self.write_observation(&mut observations, batch_idx, t, src)?;
                 self.write_action(&mut actions, batch_idx, t, src);
-                self.write_target_delta(&mut targets, batch_idx, t, src)?;
             }
         }
 
@@ -294,13 +290,9 @@ impl DroneRacingDataset {
                 .to_dtype(dtype)?;
         let actions =
             Tensor::from_vec(actions, (batch, time, DRONE_ACTION_DIM), device)?.to_dtype(dtype)?;
-        let target_deltas =
-            Tensor::from_vec(targets, (batch, time, DRONE_STATE_DELTA_DIM), device)?
-                .to_dtype(dtype)?;
         Ok(DroneBatch {
             observations,
             actions,
-            target_deltas,
             meta: DroneBatchMeta {
                 rows: rows.to_vec(),
                 episode_idx,
@@ -396,42 +388,6 @@ impl DroneRacingDataset {
                 &self.metadata.normalization.action,
             );
         }
-    }
-
-    fn write_target_delta(
-        &self,
-        output: &mut [f32],
-        batch_idx: usize,
-        time_idx: usize,
-        row: usize,
-    ) -> anyhow::Result<()> {
-        let base = (batch_idx * self.config.sequence_steps + time_idx) * DRONE_STATE_DELTA_DIM;
-        let next =
-            if row + 1 < self.metadata.rows && self.episode_idx[row + 1] == self.episode_idx[row] {
-                row + 1
-            } else {
-                row
-            };
-        let pos = vec3_at(&self.pos_world, row);
-        let next_pos = vec3_at(&self.pos_world, next);
-        let rot = mat9_at(&self.rotmat_world_from_body, row);
-        let next_rot = mat9_at(&self.rotmat_world_from_body, next);
-        let delta_world = sub3(next_pos, pos);
-        let delta_body = mat3_t_mul_vec3(rot, delta_world);
-        let rel_rot = mat3_mul(mat3_transpose(rot), next_rot);
-        let delta_rot = rotvec_from_mat3(rel_rot);
-        output[base..base + 3].copy_from_slice(&delta_body);
-        output[base + 3..base + 6].copy_from_slice(&delta_rot);
-        output[base + 6..base + 9].copy_from_slice(&self.lin_vel_body[next * 3..next * 3 + 3]);
-        output[base + 9..base + 12].copy_from_slice(&self.ang_vel_body[next * 3..next * 3 + 3]);
-        output[base + 12] = self.vbat[next] - self.vbat[row];
-        if self.config.normalize_targets {
-            normalize_in_place(
-                &mut output[base..base + DRONE_STATE_DELTA_DIM],
-                &self.metadata.normalization.target_delta,
-            )?;
-        }
-        Ok(())
     }
 }
 

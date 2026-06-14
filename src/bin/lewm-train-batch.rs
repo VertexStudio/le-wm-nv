@@ -5,7 +5,7 @@ use candle::{DType, Tensor};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use clap::Parser;
 use le_wm_nv::{
-    models::lewm::{LeWm, LeWmConfig, LeWmLossWeights, batch_loss},
+    models::lewm::{LeWm, LeWmConfig, batch_loss},
     runtime::{DTypeSpec, DeviceSpec},
 };
 
@@ -44,27 +44,6 @@ struct Args {
 
     #[arg(long, default_value_t = 0.01)]
     weight_decay: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    prediction_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    temporal_alignment_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    std_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    std_t_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    covariance_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    covariance_t_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    temporal_straightening_weight: f64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -139,15 +118,13 @@ fn main() -> anyhow::Result<()> {
         ..ParamsAdamW::default()
     };
     let mut optimizer = AdamW::new(varmap.all_vars(), params)?;
-    let weights = loss_weights(&args);
-
-    let initial = batch_loss(&model, &pixels, &actions, weights)?;
+    let initial = batch_loss(&model, &pixels, &actions)?;
     let mut last_loss = initial.total_loss.to_scalar::<f32>()?;
     ensure_finite_loss(0, last_loss)?;
     print_loss(0, &initial)?;
 
     for step in 1..=args.steps {
-        let loss = batch_loss(&model, &pixels, &actions, weights)?;
+        let loss = batch_loss(&model, &pixels, &actions)?;
         let total = loss.total_loss.to_scalar::<f32>()?;
         ensure_finite_loss(step, total)?;
         optimizer.backward_step(&loss.total_loss)?;
@@ -157,7 +134,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let final_loss = batch_loss(&model, &pixels, &actions, weights)?;
+    let final_loss = batch_loss(&model, &pixels, &actions)?;
     let final_total = final_loss.total_loss.to_scalar::<f32>()?;
     ensure_finite_loss(args.steps, final_total)?;
     if let Some(parent) = args.output.parent() {
@@ -174,18 +151,6 @@ fn main() -> anyhow::Result<()> {
         final_total
     );
     Ok(())
-}
-
-fn loss_weights(args: &Args) -> LeWmLossWeights {
-    LeWmLossWeights {
-        prediction: args.prediction_weight,
-        temporal_alignment: args.temporal_alignment_weight,
-        std: args.std_weight,
-        std_t: args.std_t_weight,
-        covariance: args.covariance_weight,
-        covariance_t: args.covariance_t_weight,
-        temporal_straightening: args.temporal_straightening_weight,
-    }
 }
 
 fn load_config(path: &PathBuf) -> anyhow::Result<LeWmConfig> {
@@ -212,16 +177,11 @@ fn ensure_finite_loss(step: usize, value: f32) -> anyhow::Result<()> {
 
 fn print_loss(step: usize, loss: &le_wm_nv::models::lewm::LeWmBatchLoss) -> anyhow::Result<()> {
     println!(
-        "step={} total={:.8e} prediction={:.8e} temp_align={:.8e} std={:.8e} std_t={:.8e} cov={:.8e} cov_t={:.8e} temporal_straightening={:.8e}",
+        "step={} total={:.8e} prediction={:.8e} sigreg={:.8e}",
         step,
         loss.total_loss.to_scalar::<f32>()?,
         loss.prediction_loss.to_scalar::<f32>()?,
-        loss.temporal_alignment_loss.to_scalar::<f32>()?,
-        loss.std_loss.to_scalar::<f32>()?,
-        loss.std_t_loss.to_scalar::<f32>()?,
-        loss.covariance_loss.to_scalar::<f32>()?,
-        loss.covariance_t_loss.to_scalar::<f32>()?,
-        loss.temporal_straightening_loss.to_scalar::<f32>()?,
+        loss.sigreg_loss.to_scalar::<f32>()?,
     );
     Ok(())
 }

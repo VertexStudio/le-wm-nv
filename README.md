@@ -39,24 +39,22 @@ plausible: collect logs, train, run fixed validation probes, and load the model
 before the vehicle starts the real task. This is a world-model claim, not a
 claim about vision, navigation, or full autonomy.
 
-Validation claims must stay inside the logged data distribution. For the drone
-work, the strongest evidence is recorded-action one-step and autoregressive
-prediction on fixed dataset strata. Action sweeps, gate loops, local body-axis
-targets, and the interactive simulator are useful diagnostics or demos unless
-the start states and requested behavior are represented in the logs.
+Validation claims must stay inside the logged data distribution. Current
+trainers produce LeWM checkpoints; task-specific evaluators should be added as
+first-class current code before making control or dynamics-quality claims.
 
 ## Capabilities
 
 - LeWM model runtime: ViT-Tiny image encoder, vector MLP observation encoder,
   projector, action encoder, predictor, latent rollout, goal embedding, goal
-  cost, optional state-delta head, and session caching.
+  cost, and session caching.
 - LeWM planning: CEM, MPPI, and iCEM over Candle CUDA tensors.
 - NVIDIA image/video ingest: nvJPEG decode into CUDA tensors, packed RGB/BGR
   CUDA preprocessing, NV12 CUDA preprocessing, and NVDECODE capability/parser
   plumbing.
-- LeWM training surface: PLDM, VCReg, temporal-straightening losses,
+- LeWM training surface: upstream-style predicted embedding loss plus SIGReg,
   batch-loss API, AdamW training CLIs, PushT HDF5 dataset streaming, drone
-  vector-state dataset training, and safetensors save/reload.
+  vector-observation dataset training, and safetensors save/reload.
 - Python bootstrap tooling: official `stable-worldmodel[train]` package via
   `uv`, checkpoint conversion, PushT batch export, Python parity fixture export,
   and Python-vs-Rust image-planning benchmark scripts.
@@ -78,21 +76,10 @@ Repo-native extensions live around that core instead of replacing it:
 - Modular observation encoders: image observations use the upstream-compatible
   ViT path; vector/state observations use a `VectorMlp` encoder with the same
   LeWM action encoder, predictor, and autoregressive rollout pattern.
-- Optional state-delta head: vector models can predict normalized state deltas
-  from predicted latent embeddings for dynamics tasks where the cost is defined
-  over state geometry instead of image-goal embedding distance.
-- Drone state LeWM: `lewm-train-drone`, `lewm-eval-drone`,
-  `lewm-eval-drone-checkpoints`, and `lewm-find-drone-rows` train and evaluate
-  vector-state dynamics on imported drone racing data. The supported evidence
-  path is recorded-action prediction over fixed dataset rows/strata.
-- Drone diagnostics and demos: `lewm-probe-drone-actions`,
-  `lewm-bench-drone-closed-loop`, and `lewm-plan-drone-gates` exercise the
-  learned model and planner, keeping rollouts/scoring on CUDA. These are not
-  proof of behavior outside the logged flight distribution.
-
-The current drone demo, training run, planner result, replay viewer, and
-interactive LeWM simulator are summarized in
-[docs/drone-demo.md](docs/drone-demo.md).
+- Drone vector LeWM: `lewm-drone-import` imports vector/state logs and
+  `lewm-train-drone` trains the modular vector-observation model with the same
+  LeWM objective used by the image trainers. No supervised decoder head is part
+  of the model.
 
 Architecture-preserving performance work is allowed and should be documented
 here when landed. It may cache non-learned tensors, reduce tensor assembly,
@@ -101,112 +88,7 @@ capture. It must not change learned layer shapes, checkpoint tensor layout,
 positional-embedding semantics, history semantics, predictor depth/heads, action
 encoder math, rollout horizon, planner sample budget, controller cadence, or
 silently introduce CPU planning/scoring paths. Runtime optimization benchmarks
-must hold planner settings fixed.
-
-Current profiler finding for drone planning: the custom CUDA gate scorer and
-CUDA top-k are negligible; the bottleneck is the official-style autoregressive
-LeWM rollout loop, which repeatedly builds sliding history tensors and runs the
-predictor for each rollout step. The fixed-shape Candle rollout path now caches
-non-learned attention tensors and projects only the last autoregressive token
-for state-delta scoring; further speed work should keep the same model
-semantics and continue benchmarking against these reports.
-
-The fixed-shape drone rollout benchmark isolates that hot path:
-
-```bash
-cargo run --release --locked --bin lewm-bench-drone-rollout -- \
-  --device cuda \
-  --dataset-dir "$HOME/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz" \
-  --weights "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors" \
-  --config "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/model-config.json" \
-  --row 40847 \
-  --samples 528 \
-  --horizon 40 \
-  --warmup 2 \
-  --iterations 10 \
-  --output target/bench/drone-rollout-h40-s528.json
-```
-
-Baseline on 2026-06-13 for the all-data drone checkpoint, CUDA F32,
-`samples=528`, `horizon=40`: total mean `0.207182s`, rollout mean
-`0.203848s`, state-head mean `0.003058s`, denorm/slice mean `0.000055s`.
-That is `2548.5` candidate rollouts/s or `101939.5` predicted state steps/s.
-After caching the causal attention mask and `-inf` masking tensor per attention
-layer, the same benchmark measured total mean `0.201853s`, rollout mean
-`0.199148s`, state-head mean `0.002468s`, and `2615.8` candidate rollouts/s.
-After the Candle-only rollout specialization that projects only the last
-autoregressive token and runs the drone state head only on future embeddings,
-the same benchmark with 4 warmups and 30 measured iterations reached total mean
-`0.194838s`, rollout mean `0.191593s`, state-head mean `0.003001s`, and
-`2709.9` candidate rollouts/s. The checksum remained `40992.58`.
-
-## Drone Planner Budget Experiments
-
-Planner budget changes are controller changes, not LeWM runtime optimizations.
-Changing horizon, samples, iterations, elite count, or control stride can change
-the selected action sequence and the resulting flight behavior. These reports
-are useful for planning tradeoff analysis, but their speedups must not be mixed
-with behavior-preserving LeWM/Candle runtime gains.
-
-Drone loop planning reports also write budget and timing comparison fields:
-`planner_budget` compares the active settings to the old heavy iCEM defaults
-(`horizon=50`, `samples=512`, `keep_elites=16`, `iterations=4`,
-`control_stride=5`), and `planner_benchmark` records actual planner throughput,
-planner milliseconds per executed model step, model-step budget, and per-replan
-timing summaries.
-
-On 2026-06-13, same all-data checkpoint, row `40847`, `loop_steps=800`, CUDA
-F32, the current default iCEM budget (`horizon=40`, `samples=512`,
-`keep_elites=16`, `iterations=4`, `control_stride=5`) completed a full 7-gate
-lap in 645 executed model steps. It ran 129 replans / 270,384 planner evals
-with `96.947329s` total planner time, `2789.0` evals/s, and `150.31ms`
-planner time per executed model step. Compared with the old heavy
-`horizon=50` budget, the eval count is unchanged but the candidate model-step
-budget is `20%` lower.
-
-An aggressive profiling budget (`horizon=25`, `samples=256`, `keep_elites=8`,
-`iterations=2`, `control_stride=8`) cut the planned eval budget by `84.49%` and
-measured `17.47ms` planner time per executed model step over 1,200 steps, but
-it only passed `gate1` and remained on `gate2`; it is not the default. A
-half-sample budget (`horizon=40`, `samples=256`, `iterations=4`,
-`control_stride=5`) passed through `gate5` but did not complete the lap within
-800 steps.
-
-The current all-gates loop benchmark command is:
-
-```bash
-cargo run --release --locked --bin lewm-plan-drone-gates -- \
-  --device cuda \
-  --dataset-dir "$HOME/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz" \
-  --weights "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors" \
-  --config "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/model-config.json" \
-  --row 40847 \
-  --loop-steps 800 \
-  --laps 1 \
-  --output target/drone-plans/defaults-full-lap-passcheck.json
-```
-
-## Interactive Drone Simulator
-
-`lewm-drone-sim` is an interactive Bevy viewer that drives the learned drone
-world model directly. The simulation step uses the trained LeWM model on CUDA:
-current vector observation history and live RC-channel input are encoded,
-rolled forward one model step, decoded through the state-delta head, and then
-the tiny predicted state is copied back for Bevy rendering.
-
-```bash
-cargo run --release --locked -p lewm-drone-viewer --bin lewm-drone-sim -- \
-  --dataset-dir "$HOME/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz" \
-  --weights "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors" \
-  --config "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/model-config.json" \
-  --row 40847
-```
-
-Controls: `W/S` pitch, `A/D` roll, `Q/E` yaw, `R/F` throttle, `Z` zero
-roll/pitch/yaw, `X` return throttle to trim, `P` pause, and Backspace reset.
-The camera is a spring follow camera so WASD is reserved for piloting. Use
-`[`/`]` for follow distance, `3`/`4` for camera height, and `1`/`2` for spring
-strength.
+must hold model and planner settings fixed.
 
 ## Prerequisites
 
@@ -333,31 +215,15 @@ cargo run --release --locked --features hub --bin lewm-plan-images -- \
 
 ## Training
 
-Compare Rust/Candle LeWM losses against official Python CUDA losses:
+All active trainers use the strict LeWM objective:
 
-```bash
-uv run --locked --no-dev \
-  python tools/export_lewm_training_loss_fixture.py \
-  --device cuda \
-  --output target/lewm-training-loss-python-cuda.npz
-
-cargo run --release --locked --bin lewm-compare-training-loss -- \
-  --device cuda \
-  --fixture target/lewm-training-loss-python-cuda.npz \
-  --tolerance 1e-5
+```text
+loss = mse(predicted_next_embedding, stopgrad(target_next_embedding))
+     + 0.09 * SIGReg(online_embeddings)
 ```
 
-Validation snapshot on 2026-06-03, RTX 4090:
-
-| Loss | Max Abs |
-| --- | ---: |
-| `idm_loss` | `0` |
-| `temp_align_loss` | `1.192093e-7` |
-| `std_loss` | `0` |
-| `std_t_loss` | `0` |
-| `cov_loss` | `2.980232e-8` |
-| `cov_t_loss` | `0` |
-| `temporal_straightening_loss` | `0` |
+SIGReg uses the upstream default `17` knots and `1024` random projections. The
+trainer CLIs do not expose alternate auxiliary loss weights.
 
 Export a PushT image/action batch and run a Rust/Candle CUDA training step:
 

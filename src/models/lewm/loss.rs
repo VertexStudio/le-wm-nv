@@ -1,137 +1,118 @@
-use candle::{D, IndexOp, Result, Tensor};
+use candle::{D, Result, Tensor};
 
-const VC_REG_EPS: f64 = 1e-4;
-const COSINE_EPS: f64 = 1e-8;
+const SIGREG_EPS: f64 = 1e-8;
 
-#[derive(Debug)]
-pub struct VcRegOutput {
-    pub std_loss: Tensor,
-    pub std_t_loss: Tensor,
-    pub cov_loss: Tensor,
-    pub cov_t_loss: Tensor,
+pub const LEWM_SIGREG_WEIGHT: f64 = 0.09;
+pub const LEWM_SIGREG_KNOTS: usize = 17;
+pub const LEWM_SIGREG_NUM_PROJ: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SigRegConfig {
+    pub weight: f64,
+    pub knots: usize,
+    pub num_proj: usize,
 }
 
-#[derive(Debug)]
-pub struct PldmLossOutput {
-    pub idm_loss: Option<Tensor>,
-    pub temp_align_loss: Tensor,
-    pub std_loss: Tensor,
-    pub std_t_loss: Tensor,
-    pub cov_loss: Tensor,
-    pub cov_t_loss: Tensor,
+impl Default for SigRegConfig {
+    fn default() -> Self {
+        Self {
+            weight: LEWM_SIGREG_WEIGHT,
+            knots: LEWM_SIGREG_KNOTS,
+            num_proj: LEWM_SIGREG_NUM_PROJ,
+        }
+    }
 }
 
-pub fn pldm_loss(
-    z: &Tensor,
-    a_pred: Option<&Tensor>,
-    a_target: Option<&Tensor>,
-) -> Result<PldmLossOutput> {
-    let (_, time, _) = z.dims3()?;
-    if time < 2 {
-        candle::bail!("PLDM loss requires at least two latent frames");
+impl SigRegConfig {
+    pub(crate) fn validate(self) -> Result<()> {
+        if !self.weight.is_finite() || self.weight < 0.0 {
+            candle::bail!("SIGReg weight must be finite and non-negative");
+        }
+        if self.knots < 2 {
+            candle::bail!("SIGReg requires at least two knots");
+        }
+        if self.num_proj == 0 {
+            candle::bail!("SIGReg requires at least one random projection");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn sigreg_loss(proj: &Tensor, cfg: SigRegConfig) -> Result<Tensor> {
+    cfg.validate()?;
+    let dims = proj.dims();
+    if dims.len() != 3 {
+        candle::bail!(
+            "SIGReg expects [time, batch, dim] embeddings, got {:?}",
+            proj.shape()
+        );
+    }
+    let (time, batch, dim) = (dims[0], dims[1], dims[2]);
+    if batch == 0 || dim == 0 {
+        candle::bail!("SIGReg requires non-empty batch and embedding dimensions");
     }
 
-    let idm_loss = match (a_pred, a_target) {
-        (Some(a_pred), Some(a_target)) => Some(mse_loss(a_pred, a_target)?),
-        _ => None,
-    };
-    let prev = z.i((.., 0..(time - 1), ..))?;
-    let next = z.i((.., 1..time, ..))?;
-    let temp_align_loss = mse_loss(&prev, &next)?;
-    let vc = vc_reg(z)?;
+    let dtype = proj.dtype();
+    let device = proj.device();
+    let projections = Tensor::randn(0f32, 1f32, (dim, cfg.num_proj), device)?.to_dtype(dtype)?;
+    let projection_norm = (projections.sqr()?.sum_keepdim(0)? + SIGREG_EPS)?.sqrt()?;
+    let projections = projections.broadcast_div(&projection_norm)?;
+    let projected = proj
+        .reshape((time * batch, dim))?
+        .matmul(&projections)?
+        .reshape((time, batch, cfg.num_proj))?;
 
-    Ok(PldmLossOutput {
-        idm_loss,
-        temp_align_loss,
-        std_loss: vc.std_loss,
-        std_t_loss: vc.std_t_loss,
-        cov_loss: vc.cov_loss,
-        cov_t_loss: vc.cov_t_loss,
-    })
+    let t_values = (0..cfg.knots)
+        .map(|idx| 3.0f32 * idx as f32 / (cfg.knots - 1) as f32)
+        .collect::<Vec<_>>();
+    let weights = trapezoid_weights(&t_values);
+    let t = Tensor::from_vec(t_values, (cfg.knots,), device)?.to_dtype(dtype)?;
+    let weights = Tensor::from_vec(weights, (cfg.knots,), device)?.to_dtype(dtype)?;
+
+    let t4 = t.reshape((1, 1, 1, cfg.knots))?;
+    let phi = ((t.sqr()?.neg()? / 2.0)?.exp()?).reshape((1, 1, cfg.knots))?;
+    let x_t = projected.unsqueeze(3)?.broadcast_mul(&t4)?;
+    let cos_mean = x_t.cos()?.mean(1)?;
+    let sin_mean = x_t.sin()?.mean(1)?;
+    let err = (cos_mean.broadcast_sub(&phi)?.sqr()? + sin_mean.sqr()?)?;
+    let weighted = err.broadcast_mul(&weights.reshape((1, 1, cfg.knots))?)?;
+    (weighted.sum(D::Minus1)? * batch as f64)?.mean_all()
 }
 
-pub fn vc_reg(z: &Tensor) -> Result<VcRegOutput> {
-    let (batch, time, dim) = z.dims3()?;
-    if batch < 2 || time < 2 || dim < 2 {
-        candle::bail!("VCReg requires batch, time, and latent dimensions of at least two");
+fn trapezoid_weights(values: &[f32]) -> Vec<f32> {
+    let mut weights = vec![0f32; values.len()];
+    for idx in 0..values.len() - 1 {
+        let dt = values[idx + 1] - values[idx];
+        weights[idx] += dt;
+        weights[idx + 1] += dt;
     }
-
-    let mean = z.mean_keepdim(0)?;
-    let centered = z.broadcast_sub(&mean)?;
-    let centered_t = centered.transpose(0, 1)?;
-
-    Ok(VcRegOutput {
-        std_loss: std_loss_by_time(&centered)?.mean_all()?,
-        std_t_loss: std_loss_by_time(&centered_t)?.mean_all()?,
-        cov_loss: cov_loss_by_time(&centered)?.mean_all()?,
-        cov_t_loss: cov_loss_by_time(&centered_t)?.mean_all()?,
-    })
-}
-
-pub fn temporal_straightening_loss(x: &Tensor) -> Result<Tensor> {
-    let (_, time, _) = x.dims3()?;
-    if time < 3 {
-        candle::bail!("temporal straightening loss requires at least three frames");
-    }
-
-    let prev = x.i((.., 0..(time - 1), ..))?;
-    let next = x.i((.., 1..time, ..))?;
-    let velocities = (next - prev)?;
-    let lhs = velocities.i((.., 0..(time - 2), ..))?;
-    let rhs = velocities.i((.., 1..(time - 1), ..))?;
-    cosine_similarity(&lhs, &rhs)?.mean_all()?.neg()
-}
-
-fn mse_loss(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
-    (lhs - rhs)?.sqr()?.mean_all()
-}
-
-fn std_loss_by_time(z: &Tensor) -> Result<Tensor> {
-    let z = z.transpose(0, 1)?;
-    let std = (z.var(1)? + VC_REG_EPS)?.sqrt()?;
-    let one = Tensor::new(1f32, std.device())?.broadcast_as(std.shape())?;
-    one.broadcast_sub(&std)?.relu()?.mean(D::Minus1)
-}
-
-fn cov_loss_by_time(z: &Tensor) -> Result<Tensor> {
-    let (batch, _, dim) = z.dims3()?;
-    let z = z.transpose(0, 1)?.contiguous()?;
-    let cov = (z.t()?.contiguous()?.matmul(&z)? / (batch - 1) as f64)?;
-    let cov_sq = cov.sqr()?;
-    let total = cov_sq.sum(D::Minus1)?.sum(D::Minus1)?;
-    let eye = Tensor::eye(dim, cov.dtype(), cov.device())?
-        .unsqueeze(0)?
-        .broadcast_as(cov.shape())?;
-    let diag = cov_sq.broadcast_mul(&eye)?.sum(D::Minus1)?.sum(D::Minus1)?;
-    (total - diag)? / (dim * dim - dim) as f64
-}
-
-fn cosine_similarity(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
-    let dot = lhs.broadcast_mul(rhs)?.sum(D::Minus1)?;
-    let lhs_norm = norm_last_dim(lhs)?;
-    let rhs_norm = norm_last_dim(rhs)?;
-    dot.broadcast_div(&lhs_norm.broadcast_mul(&rhs_norm)?)
-}
-
-fn norm_last_dim(x: &Tensor) -> Result<Tensor> {
-    (x.sqr()?.sum(D::Minus1)? + COSINE_EPS)?.sqrt()
+    weights
 }
 
 #[cfg(test)]
 mod tests {
-    use candle::{DType, Device, Result, Var};
+    use candle::{Device, Result, Tensor, Var};
 
     use super::*;
 
     #[test]
-    fn temporal_straightening_backward_is_finite_for_zero_motion() -> Result<()> {
+    fn sigreg_backward_is_finite() -> Result<()> {
         let device = Device::Cpu;
-        let x = Var::zeros((2, 3, 4), DType::F32, &device)?;
-        let loss = temporal_straightening_loss(x.as_tensor())?;
+        let x = Var::from_tensor(&Tensor::randn(0f32, 1f32, (3, 4, 8), &device)?)?;
+        let loss = sigreg_loss(
+            x.as_tensor(),
+            SigRegConfig {
+                weight: 0.09,
+                knots: 5,
+                num_proj: 16,
+            },
+        )?;
+        let value = loss.to_scalar::<f32>()?;
+        assert!(value.is_finite());
         let grads = loss.backward()?;
         let grad = grads
             .get(x.as_tensor())
-            .expect("zero-motion input should receive a gradient");
+            .expect("SIGReg input should receive a gradient");
         let values = grad.flatten_all()?.to_vec1::<f32>()?;
         assert!(
             values.iter().all(|value| value.is_finite()),

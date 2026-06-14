@@ -37,14 +37,13 @@ fn config_round_trips_through_json() {
 
 #[test]
 fn vector_world_model_config_round_trips_through_json() {
-    let cfg = WorldModelConfig::vector_drone_default(20, 4, 13);
+    let cfg = WorldModelConfig::vector_drone_default(20, 4);
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: WorldModelConfig = serde_json::from_str(&json).unwrap();
 
     assert_eq!(decoded.history_size, cfg.history_size);
     assert_eq!(decoded.action_encoder.input_dim, 4);
     assert_eq!(decoded.observation_encoder.output_dim(), 192);
-    assert_eq!(decoded.state_head.unwrap().output_dim(), 13);
 }
 
 #[test]

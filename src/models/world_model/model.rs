@@ -15,7 +15,6 @@ pub struct WorldModel {
     predictor: Predictor,
     action_encoder: ActionEmbedder,
     pred_proj: Mlp,
-    state_head: Option<Mlp>,
 }
 
 impl WorldModel {
@@ -27,18 +26,12 @@ impl WorldModel {
         let predictor = Predictor::new(&cfg.predictor, vb.pp("predictor"))?;
         let action_encoder = ActionEmbedder::new(&cfg.action_encoder, vb.pp("action_encoder"))?;
         let pred_proj = Mlp::new(&cfg.pred_proj, vb.pp("pred_proj"))?;
-        let state_head = cfg
-            .state_head
-            .as_ref()
-            .map(|head| Mlp::new(&head.as_mlp_config(), vb.pp("state_head")))
-            .transpose()?;
         Ok(Self {
             cfg,
             observation_encoder,
             predictor,
             action_encoder,
             pred_proj,
-            state_head,
         })
     }
 
@@ -86,22 +79,6 @@ impl WorldModel {
     pub fn predict(&self, emb: &Tensor, actions: &Tensor) -> Result<Tensor> {
         let act_emb = self.encode_actions(actions)?;
         self.predict_from_action_embeddings(emb, &act_emb)
-    }
-
-    pub fn predict_state_deltas_from_embeddings(&self, predicted_emb: &Tensor) -> Result<Tensor> {
-        let Some(head) = &self.state_head else {
-            candle::bail!("WorldModel config does not include a state_head");
-        };
-        let dims = predicted_emb.dims();
-        if dims.len() != 3 {
-            candle::bail!(
-                "state head expects [batch, time, dim], got {:?}",
-                predicted_emb.shape()
-            );
-        }
-        let (b, t, _) = (dims[0], dims[1], dims[2]);
-        let flat = predicted_emb.reshape((b * t, ()))?;
-        head.forward(&flat)?.reshape((b, t, ()))
     }
 
     pub fn rollout_embeddings_with_history(

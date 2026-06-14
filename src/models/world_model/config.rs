@@ -45,56 +45,16 @@ impl VectorMlpConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StateHeadConfig {
-    VectorDelta {
-        input_dim: usize,
-        hidden_dim: usize,
-        output_dim: usize,
-        norm: NormKind,
-    },
-}
-
-impl StateHeadConfig {
-    pub fn output_dim(&self) -> usize {
-        match self {
-            Self::VectorDelta { output_dim, .. } => *output_dim,
-        }
-    }
-
-    pub fn as_mlp_config(&self) -> MlpConfig {
-        match self {
-            Self::VectorDelta {
-                input_dim,
-                hidden_dim,
-                output_dim,
-                norm,
-            } => MlpConfig {
-                input_dim: *input_dim,
-                hidden_dim: *hidden_dim,
-                output_dim: *output_dim,
-                norm: *norm,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldModelConfig {
     pub history_size: usize,
     pub observation_encoder: ObservationEncoderConfig,
     pub action_encoder: ActionEmbedderConfig,
     pub predictor: PredictorConfig,
     pub pred_proj: MlpConfig,
-    pub state_head: Option<StateHeadConfig>,
 }
 
 impl WorldModelConfig {
-    pub fn vector_drone_default(
-        observation_dim: usize,
-        action_dim: usize,
-        state_delta_dim: usize,
-    ) -> Self {
+    pub fn vector_drone_default(observation_dim: usize, action_dim: usize) -> Self {
         let embed_dim = 192;
         let history_size = 8;
         Self {
@@ -128,12 +88,6 @@ impl WorldModelConfig {
                 output_dim: embed_dim,
                 norm: NormKind::LayerNorm,
             },
-            state_head: Some(StateHeadConfig::VectorDelta {
-                input_dim: embed_dim,
-                hidden_dim: 512,
-                output_dim: state_delta_dim,
-                norm: NormKind::LayerNorm,
-            }),
         }
     }
 
@@ -171,14 +125,6 @@ impl WorldModelConfig {
             self.predictor.num_frames,
             self.history_size
         );
-        if let Some(head) = &self.state_head {
-            let head_cfg = head.as_mlp_config();
-            anyhow::ensure!(
-                head_cfg.input_dim == obs_dim,
-                "state head input_dim {} must match embedding dim {obs_dim}",
-                head_cfg.input_dim
-            );
-        }
         Ok(())
     }
 }

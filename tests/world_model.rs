@@ -11,8 +11,8 @@ use le_wm_nv::{
     models::{
         lewm::{ActionEmbedderConfig, MlpConfig, NormKind, PredictorConfig},
         world_model::{
-            ObservationEncoderConfig, StateHeadConfig, VectorLossWeights, VectorMlpConfig,
-            WorldModel, WorldModelConfig, vector_batch_loss,
+            ObservationEncoderConfig, VectorMlpConfig, WorldModel, WorldModelConfig,
+            vector_batch_loss,
         },
     },
     optim::StatefulAdamW,
@@ -28,7 +28,6 @@ fn vector_world_model_training_step_updates_and_reloads_cuda_weights() -> candle
 
     let observations = Tensor::randn(0f32, 1f32, (2, cfg.predictor.num_frames, 6), &device)?;
     let actions = Tensor::randn(0f32, 1f32, (2, cfg.predictor.num_frames, 4), &device)?;
-    let targets = Tensor::randn(0f32, 1f32, (2, cfg.predictor.num_frames, 5), &device)?;
     let vars = varmap.all_vars();
     assert!(!vars.is_empty());
     let before = vars
@@ -44,13 +43,7 @@ fn vector_world_model_training_step_updates_and_reloads_cuda_weights() -> candle
         },
     )?;
 
-    let loss = vector_batch_loss(
-        &model,
-        &observations,
-        &actions,
-        &targets,
-        VectorLossWeights::default(),
-    )?;
+    let loss = vector_batch_loss(&model, &observations, &actions)?;
     let loss_before = loss.total_loss.to_scalar::<f32>()?;
     assert!(loss_before.is_finite());
     opt.backward_step(&loss.total_loss)?;
@@ -68,32 +61,22 @@ fn vector_world_model_training_step_updates_and_reloads_cuda_weights() -> candle
         "AdamW step did not update any world-model variable"
     );
 
-    let loss_after = vector_batch_loss(
-        &model,
-        &observations,
-        &actions,
-        &targets,
-        VectorLossWeights::default(),
-    )?
-    .total_loss
-    .to_scalar::<f32>()?;
-    assert!(loss_after.is_finite());
+    let loss_after = vector_batch_loss(&model, &observations, &actions)?;
+    let total_after = loss_after.total_loss.to_scalar::<f32>()?;
+    let prediction_after = loss_after.prediction_loss.to_scalar::<f32>()?;
+    assert!(total_after.is_finite());
+    assert!(prediction_after.is_finite());
 
     let weights_path = temp_safetensors_path();
     varmap.save(&weights_path)?;
     let reloaded_vb = checkpoint::var_builder_from_path(&weights_path, DType::F32, &device)?;
     let reloaded = WorldModel::new(cfg, reloaded_vb)?;
-    let reload_loss = vector_batch_loss(
-        &reloaded,
-        &observations,
-        &actions,
-        &targets,
-        VectorLossWeights::default(),
-    )?
-    .total_loss
-    .to_scalar::<f32>()?;
-    assert!(reload_loss.is_finite());
-    assert!((reload_loss - loss_after).abs() < 1e-4);
+    let reload_loss = vector_batch_loss(&reloaded, &observations, &actions)?;
+    let reload_total = reload_loss.total_loss.to_scalar::<f32>()?;
+    let reload_prediction = reload_loss.prediction_loss.to_scalar::<f32>()?;
+    assert!(reload_total.is_finite());
+    assert!(reload_prediction.is_finite());
+    assert!((reload_prediction - prediction_after).abs() < 1e-4);
     fs::remove_file(weights_path)?;
     Ok(())
 }
@@ -132,12 +115,6 @@ fn tiny_vector_config() -> WorldModelConfig {
             output_dim: embed_dim,
             norm: NormKind::LayerNorm,
         },
-        state_head: Some(StateHeadConfig::VectorDelta {
-            input_dim: embed_dim,
-            hidden_dim: 32,
-            output_dim: 5,
-            norm: NormKind::LayerNorm,
-        }),
     }
 }
 

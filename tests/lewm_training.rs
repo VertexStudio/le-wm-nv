@@ -9,8 +9,8 @@ use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use le_wm_nv::{
     checkpoint,
     models::lewm::{
-        ActionEmbedderConfig, LeWm, LeWmConfig, LeWmLossWeights, MlpConfig, NormKind,
-        PredictorConfig, VitEncoderConfig, batch_loss,
+        ActionEmbedderConfig, LeWm, LeWmConfig, MlpConfig, NormKind, PredictorConfig,
+        VitEncoderConfig, batch_loss,
     },
 };
 
@@ -56,7 +56,7 @@ fn lewm_training_step_updates_and_reloads_cuda_weights() -> candle::Result<()> {
         },
     )?;
 
-    let loss = batch_loss(&model, &pixels, &actions, LeWmLossWeights::default())?;
+    let loss = batch_loss(&model, &pixels, &actions)?;
     let loss_before = loss.total_loss.to_scalar::<f32>()?;
     assert!(loss_before.is_finite());
     opt.backward_step(&loss.total_loss)?;
@@ -71,20 +71,22 @@ fn lewm_training_step_updates_and_reloads_cuda_weights() -> candle::Result<()> {
         .count();
     assert!(changed > 0, "AdamW step did not update any LeWM variable");
 
-    let loss_after = batch_loss(&model, &pixels, &actions, LeWmLossWeights::default())?
-        .total_loss
-        .to_scalar::<f32>()?;
-    assert!(loss_after.is_finite());
+    let loss_after = batch_loss(&model, &pixels, &actions)?;
+    let total_after = loss_after.total_loss.to_scalar::<f32>()?;
+    let prediction_after = loss_after.prediction_loss.to_scalar::<f32>()?;
+    assert!(total_after.is_finite());
+    assert!(prediction_after.is_finite());
 
     let weights_path = temp_safetensors_path();
     varmap.save(&weights_path)?;
     let reloaded_vb = checkpoint::var_builder_from_path(&weights_path, DType::F32, &device)?;
     let reloaded = LeWm::new(cfg, reloaded_vb)?;
-    let reload_loss = batch_loss(&reloaded, &pixels, &actions, LeWmLossWeights::default())?
-        .total_loss
-        .to_scalar::<f32>()?;
-    assert!(reload_loss.is_finite());
-    assert!((reload_loss - loss_after).abs() < 1e-4);
+    let reload_loss = batch_loss(&reloaded, &pixels, &actions)?;
+    let reload_total = reload_loss.total_loss.to_scalar::<f32>()?;
+    let reload_prediction = reload_loss.prediction_loss.to_scalar::<f32>()?;
+    assert!(reload_total.is_finite());
+    assert!(reload_prediction.is_finite());
+    assert!((reload_prediction - prediction_after).abs() < 1e-4);
     fs::remove_file(weights_path)?;
 
     Ok(())

@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Bevy replay viewer for le-wm-nv drone world-model reports."
+autobins = false
+
+[[bin]]
+name = "lewm-drone-viewer"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"

@@ -11,12 +11,11 @@ use candle_nn::{ParamsAdamW, VarBuilder, VarMap};
 use clap::Parser;
 use le_wm_nv::{
     data::drone_racing::{
-        DRONE_ACTION_DIM, DRONE_OBSERVATION_DIM, DRONE_STATE_DELTA_DIM, DroneBatchConfig,
-        DroneRacingDataset, DroneRacingMetadata, epoch_seed,
+        DRONE_ACTION_DIM, DRONE_OBSERVATION_DIM, DroneBatchConfig, DroneRacingDataset,
+        DroneRacingMetadata, epoch_seed,
     },
-    models::world_model::{
-        VectorLossScalars, VectorLossWeights, WorldModel, WorldModelConfig, vector_batch_loss,
-    },
+    models::lewm::{LEWM_SIGREG_KNOTS, LEWM_SIGREG_NUM_PROJ, LEWM_SIGREG_WEIGHT},
+    models::world_model::{VectorLossScalars, WorldModel, WorldModelConfig, vector_batch_loss},
     optim::StatefulAdamW,
     runtime::{DTypeSpec, DeviceSpec},
 };
@@ -78,9 +77,6 @@ struct Args {
     #[arg(long)]
     no_action_normalize: bool,
 
-    #[arg(long)]
-    no_target_normalize: bool,
-
     #[arg(long, default_value_t = 1e-4)]
     lr: f64,
 
@@ -92,27 +88,6 @@ struct Args {
 
     #[arg(long, default_value_t = 1000)]
     save_every: usize,
-
-    #[arg(long, default_value_t = 1.0)]
-    state_prediction_weight: f64,
-
-    #[arg(long, default_value_t = 0.1)]
-    temporal_alignment_weight: f64,
-
-    #[arg(long, default_value_t = 0.1)]
-    std_weight: f64,
-
-    #[arg(long, default_value_t = 0.1)]
-    std_t_weight: f64,
-
-    #[arg(long, default_value_t = 0.1)]
-    covariance_weight: f64,
-
-    #[arg(long, default_value_t = 0.1)]
-    covariance_t_weight: f64,
-
-    #[arg(long, default_value_t = 0.1)]
-    temporal_straightening_weight: f64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -132,7 +107,6 @@ fn main() -> anyhow::Result<()> {
         sequence_steps,
         normalize_observations: !args.no_observation_normalize,
         normalize_actions: !args.no_action_normalize,
-        normalize_targets: !args.no_target_normalize,
     };
     let dataset = DroneRacingDataset::open(&dataset_dir, batch_cfg)?;
     let train_rows = training_rows(&dataset, args.train_all_data);
@@ -205,7 +179,6 @@ fn main() -> anyhow::Result<()> {
     } else {
         0
     };
-    let loss_weights = loss_weights(&args);
     let metrics_path = output_dir.join("metrics.jsonl");
     let metrics_file = File::create(&metrics_path)
         .with_context(|| format!("failed to create {}", metrics_path.display()))?;
@@ -258,13 +231,7 @@ fn main() -> anyhow::Result<()> {
         let row_start = batch_index * args.batch_size;
         let row_end = row_start + args.batch_size;
         let batch = dataset.batch(&cached_rows[row_start..row_end], dtype, &device)?;
-        let loss = vector_batch_loss(
-            &model,
-            &batch.observations,
-            &batch.actions,
-            &batch.target_deltas,
-            loss_weights,
-        )?;
+        let loss = vector_batch_loss(&model, &batch.observations, &batch.actions)?;
         let scalars = VectorLossScalars::from_loss(&loss)?;
         ensure_finite_loss(step_index + 1, scalars.total)?;
         optimizer.backward_step(&loss.total_loss)?;
@@ -407,11 +374,7 @@ fn load_or_default_config(
                 .with_context(|| format!("failed to read {}", path.display()))?,
         )
         .with_context(|| format!("failed to parse {}", path.display()))?,
-        None => WorldModelConfig::vector_drone_default(
-            DRONE_OBSERVATION_DIM,
-            DRONE_ACTION_DIM,
-            DRONE_STATE_DELTA_DIM,
-        ),
+        None => WorldModelConfig::vector_drone_default(DRONE_OBSERVATION_DIM, DRONE_ACTION_DIM),
     };
     cfg.history_size = history_steps;
     cfg.predictor.num_frames = sequence_steps;
@@ -426,18 +389,6 @@ fn training_rows(dataset: &DroneRacingDataset, train_all_data: bool) -> Vec<usiz
     }
 }
 
-fn loss_weights(args: &Args) -> VectorLossWeights {
-    VectorLossWeights {
-        state_prediction: args.state_prediction_weight,
-        temporal_alignment: args.temporal_alignment_weight,
-        std: args.std_weight,
-        std_t: args.std_t_weight,
-        covariance: args.covariance_weight,
-        covariance_t: args.covariance_t_weight,
-        temporal_straightening: args.temporal_straightening_weight,
-    }
-}
-
 fn ensure_finite_loss(step: usize, value: f32) -> anyhow::Result<()> {
     if value.is_finite() {
         Ok(())
@@ -448,18 +399,8 @@ fn ensure_finite_loss(step: usize, value: f32) -> anyhow::Result<()> {
 
 fn print_loss(step: usize, epoch: usize, batch_index: usize, loss: &VectorLossScalars) {
     println!(
-        "step={} epoch={} batch={} total={:.8e} state_prediction={:.8e} temp_align={:.8e} std={:.8e} std_t={:.8e} cov={:.8e} cov_t={:.8e} temporal_straightening={:.8e}",
-        step,
-        epoch,
-        batch_index,
-        loss.total,
-        loss.state_prediction,
-        loss.temporal_alignment,
-        loss.std,
-        loss.std_t,
-        loss.covariance,
-        loss.covariance_t,
-        loss.temporal_straightening,
+        "step={} epoch={} batch={} total={:.8e} prediction={:.8e} sigreg={:.8e}",
+        step, epoch, batch_index, loss.total, loss.prediction, loss.sigreg,
     );
 }
 
@@ -581,6 +522,7 @@ fn ensure_resume_compatible(current: &RunSettings, saved: &RunSettings) -> anyho
     )?;
     ensure_eq("lr", &current.lr, &saved.lr)?;
     ensure_eq("weight_decay", &current.weight_decay, &saved.weight_decay)?;
+    ensure_eq("loss", &current.loss, &saved.loss)?;
     Ok(())
 }
 
@@ -623,7 +565,7 @@ struct RunSettings {
     weight_decay: f64,
     log_every: usize,
     save_every: usize,
-    loss_weights: SerializableLossWeights,
+    loss: SerializableLeWmLoss,
 }
 
 impl RunSettings {
@@ -651,21 +593,12 @@ impl RunSettings {
             normalization: NormalizationFlags {
                 observations: !args.no_observation_normalize,
                 actions: !args.no_action_normalize,
-                targets: !args.no_target_normalize,
             },
             lr: args.lr,
             weight_decay: args.weight_decay,
             log_every: args.log_every,
             save_every: args.save_every,
-            loss_weights: SerializableLossWeights {
-                state_prediction: args.state_prediction_weight,
-                temporal_alignment: args.temporal_alignment_weight,
-                std: args.std_weight,
-                std_t: args.std_t_weight,
-                covariance: args.covariance_weight,
-                covariance_t: args.covariance_t_weight,
-                temporal_straightening: args.temporal_straightening_weight,
-            },
+            loss: SerializableLeWmLoss::default(),
         }
     }
 }
@@ -674,18 +607,25 @@ impl RunSettings {
 struct NormalizationFlags {
     observations: bool,
     actions: bool,
-    targets: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SerializableLossWeights {
-    state_prediction: f64,
-    temporal_alignment: f64,
-    std: f64,
-    std_t: f64,
-    covariance: f64,
-    covariance_t: f64,
-    temporal_straightening: f64,
+struct SerializableLeWmLoss {
+    objective: String,
+    sigreg_weight: f64,
+    sigreg_knots: usize,
+    sigreg_num_proj: usize,
+}
+
+impl Default for SerializableLeWmLoss {
+    fn default() -> Self {
+        Self {
+            objective: "prediction_plus_sigreg".to_string(),
+            sigreg_weight: LEWM_SIGREG_WEIGHT,
+            sigreg_knots: LEWM_SIGREG_KNOTS,
+            sigreg_num_proj: LEWM_SIGREG_NUM_PROJ,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "NVIDIA/CUDA-first LeWM training and inference runtime."
+autobins = false
 
 [workspace]
 members = ["crates/drone-viewer"]
@@ -51,10 +52,6 @@ name = "lewm-plan-images"
 path = "src/bin/lewm-plan-images.rs"
 
 [[bin]]
-name = "lewm-compare-training-loss"
-path = "src/bin/lewm-compare-training-loss.rs"
-
-[[bin]]
 name = "lewm-train-batch"
 path = "src/bin/lewm-train-batch.rs"
 
@@ -69,27 +66,3 @@ path = "src/bin/lewm-drone-import.rs"
 [[bin]]
 name = "lewm-train-drone"
 path = "src/bin/lewm-train-drone.rs"
-
-[[bin]]
-name = "lewm-eval-drone"
-path = "src/bin/lewm-eval-drone.rs"
-
-[[bin]]
-name = "lewm-eval-drone-checkpoints"
-path = "src/bin/lewm-eval-drone-checkpoints.rs"
-
-[[bin]]
-name = "lewm-bench-drone-closed-loop"
-path = "src/bin/lewm-bench-drone-closed-loop.rs"
-
-[[bin]]
-name = "lewm-find-drone-rows"
-path = "src/bin/lewm-find-drone-rows.rs"
-
-[[bin]]
-name = "lewm-plan-drone-gates"
-path = "src/bin/lewm-plan-drone-gates.rs"
-
-[[bin]]
-name = "lewm-bench-drone-rollout"
-path = "src/bin/lewm-bench-drone-rollout.rs"

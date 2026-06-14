@@ -12,7 +12,10 @@ use clap::Parser;
 use hdf5::filters::blosc_set_nthreads;
 use le_wm_nv::{
     data::pusht::{PushTBatchConfig, PushTDataset, PushTDatasetSummary},
-    models::lewm::{LeWm, LeWmBatchLoss, LeWmConfig, LeWmLossWeights, batch_loss},
+    models::lewm::{
+        LEWM_SIGREG_KNOTS, LEWM_SIGREG_NUM_PROJ, LEWM_SIGREG_WEIGHT, LeWm, LeWmBatchLoss,
+        LeWmConfig, batch_loss,
+    },
     optim::StatefulAdamW,
     runtime::{DTypeSpec, DeviceSpec},
 };
@@ -87,27 +90,6 @@ struct Args {
     /// Save checkpoint-step-*.safetensors every N optimizer steps. Zero disables periodic saves.
     #[arg(long, default_value_t = 1000)]
     save_every: usize,
-
-    #[arg(long, default_value_t = 1.0)]
-    prediction_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    temporal_alignment_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    std_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    std_t_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    covariance_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    covariance_t_weight: f64,
-
-    #[arg(long, default_value_t = 1.0)]
-    temporal_straightening_weight: f64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -208,7 +190,6 @@ fn main() -> anyhow::Result<()> {
     } else {
         0
     };
-    let loss_weights = loss_weights(&args);
     let metrics_path = args.output_dir.join("metrics.jsonl");
     let metrics_file = File::create(&metrics_path)
         .with_context(|| format!("failed to create {}", metrics_path.display()))?;
@@ -271,7 +252,7 @@ fn main() -> anyhow::Result<()> {
         let row_start = batch_index * args.batch_size;
         let row_end = row_start + args.batch_size;
         let data = dataset.batch(&cached_rows[row_start..row_end], dtype, &device)?;
-        let loss = batch_loss(&model, &data.pixels, &data.actions, loss_weights)?;
+        let loss = batch_loss(&model, &data.pixels, &data.actions)?;
         let scalars = loss_scalars(&loss)?;
         ensure_finite_loss(step_index + 1, scalars.total)?;
         optimizer.backward_step(&loss.total_loss)?;
@@ -392,26 +373,6 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         args.weight_decay.is_finite() && args.weight_decay >= 0.0,
         "--weight-decay must be finite and non-negative"
     );
-    for (name, value) in [
-        ("--prediction-weight", args.prediction_weight),
-        (
-            "--temporal-alignment-weight",
-            args.temporal_alignment_weight,
-        ),
-        ("--std-weight", args.std_weight),
-        ("--std-t-weight", args.std_t_weight),
-        ("--covariance-weight", args.covariance_weight),
-        ("--covariance-t-weight", args.covariance_t_weight),
-        (
-            "--temporal-straightening-weight",
-            args.temporal_straightening_weight,
-        ),
-    ] {
-        ensure!(
-            value.is_finite() && value >= 0.0,
-            "{name} must be finite and non-negative"
-        );
-    }
     Ok(())
 }
 
@@ -451,7 +412,7 @@ fn ensure_resume_compatible(current: &RunSettings, saved: &RunSettings) -> anyho
     )?;
     ensure_eq("lr", &current.lr, &saved.lr)?;
     ensure_eq("weight_decay", &current.weight_decay, &saved.weight_decay)?;
-    ensure_eq("loss_weights", &current.loss_weights, &saved.loss_weights)?;
+    ensure_eq("loss", &current.loss, &saved.loss)?;
     Ok(())
 }
 
@@ -516,28 +477,11 @@ fn validate_model_config(cfg: &LeWmConfig, dataset: &PushTDataset) -> anyhow::Re
     Ok(())
 }
 
-fn loss_weights(args: &Args) -> LeWmLossWeights {
-    LeWmLossWeights {
-        prediction: args.prediction_weight,
-        temporal_alignment: args.temporal_alignment_weight,
-        std: args.std_weight,
-        std_t: args.std_t_weight,
-        covariance: args.covariance_weight,
-        covariance_t: args.covariance_t_weight,
-        temporal_straightening: args.temporal_straightening_weight,
-    }
-}
-
 fn loss_scalars(loss: &LeWmBatchLoss) -> anyhow::Result<LossScalars> {
     Ok(LossScalars {
         total: scalar(&loss.total_loss)?,
         prediction: scalar(&loss.prediction_loss)?,
-        temporal_alignment: scalar(&loss.temporal_alignment_loss)?,
-        std: scalar(&loss.std_loss)?,
-        std_t: scalar(&loss.std_t_loss)?,
-        covariance: scalar(&loss.covariance_loss)?,
-        covariance_t: scalar(&loss.covariance_t_loss)?,
-        temporal_straightening: scalar(&loss.temporal_straightening_loss)?,
+        sigreg: scalar(&loss.sigreg_loss)?,
     })
 }
 
@@ -555,18 +499,8 @@ fn ensure_finite_loss(step: usize, value: f32) -> anyhow::Result<()> {
 
 fn print_loss(step: usize, epoch: usize, batch_index: usize, loss: &LossScalars) {
     println!(
-        "step={} epoch={} batch={} total={:.8e} prediction={:.8e} temp_align={:.8e} std={:.8e} std_t={:.8e} cov={:.8e} cov_t={:.8e} temporal_straightening={:.8e}",
-        step,
-        epoch,
-        batch_index,
-        loss.total,
-        loss.prediction,
-        loss.temporal_alignment,
-        loss.std,
-        loss.std_t,
-        loss.covariance,
-        loss.covariance_t,
-        loss.temporal_straightening,
+        "step={} epoch={} batch={} total={:.8e} prediction={:.8e} sigreg={:.8e}",
+        step, epoch, batch_index, loss.total, loss.prediction, loss.sigreg,
     );
 }
 
@@ -614,12 +548,7 @@ fn unix_seconds() -> u64 {
 struct LossScalars {
     total: f32,
     prediction: f32,
-    temporal_alignment: f32,
-    std: f32,
-    std_t: f32,
-    covariance: f32,
-    covariance_t: f32,
-    temporal_straightening: f32,
+    sigreg: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -663,7 +592,7 @@ struct RunSettings {
     weight_decay: f64,
     log_every: usize,
     save_every: usize,
-    loss_weights: SerializableLossWeights,
+    loss: SerializableLeWmLoss,
 }
 
 impl RunSettings {
@@ -687,28 +616,28 @@ impl RunSettings {
             weight_decay: args.weight_decay,
             log_every: args.log_every,
             save_every: args.save_every,
-            loss_weights: SerializableLossWeights {
-                prediction: args.prediction_weight,
-                temporal_alignment: args.temporal_alignment_weight,
-                std: args.std_weight,
-                std_t: args.std_t_weight,
-                covariance: args.covariance_weight,
-                covariance_t: args.covariance_t_weight,
-                temporal_straightening: args.temporal_straightening_weight,
-            },
+            loss: SerializableLeWmLoss::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SerializableLossWeights {
-    prediction: f64,
-    temporal_alignment: f64,
-    std: f64,
-    std_t: f64,
-    covariance: f64,
-    covariance_t: f64,
-    temporal_straightening: f64,
+struct SerializableLeWmLoss {
+    objective: String,
+    sigreg_weight: f64,
+    sigreg_knots: usize,
+    sigreg_num_proj: usize,
+}
+
+impl Default for SerializableLeWmLoss {
+    fn default() -> Self {
+        Self {
+            objective: "prediction_plus_sigreg".to_string(),
+            sigreg_weight: LEWM_SIGREG_WEIGHT,
+            sigreg_knots: LEWM_SIGREG_KNOTS,
+            sigreg_num_proj: LEWM_SIGREG_NUM_PROJ,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

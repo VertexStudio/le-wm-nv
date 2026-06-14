@@ -5,7 +5,6 @@ compile_error!("le-wm-nv is Linux/NVIDIA CUDA only.");
 
 pub mod checkpoint;
 pub mod data;
-pub mod drone_eval;
 
 #[cfg(feature = "hub")]
 pub mod hub;
