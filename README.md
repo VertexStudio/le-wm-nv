@@ -39,6 +39,12 @@ plausible: collect logs, train, run fixed validation probes, and load the model
 before the vehicle starts the real task. This is a world-model claim, not a
 claim about vision, navigation, or full autonomy.
 
+Validation claims must stay inside the logged data distribution. For the drone
+work, the strongest evidence is recorded-action one-step and autoregressive
+prediction on fixed dataset strata. Action sweeps, gate loops, local body-axis
+targets, and the interactive simulator are useful diagnostics or demos unless
+the start states and requested behavior are represented in the logs.
+
 ## Capabilities
 
 - LeWM model runtime: ViT-Tiny image encoder, vector MLP observation encoder,
@@ -75,12 +81,14 @@ Repo-native extensions live around that core instead of replacing it:
 - Optional state-delta head: vector models can predict normalized state deltas
   from predicted latent embeddings for dynamics tasks where the cost is defined
   over state geometry instead of image-goal embedding distance.
-- Drone state LeWM: `lewm-train-drone`, `lewm-probe-drone-actions`, and
-  `lewm-plan-drone-gates` exercise the vector observation path on imported
-  drone racing data, keeping planning rollouts and scoring on CUDA.
-- Drone evaluation: `lewm-eval-drone-checkpoints` measures learning curves
-  across saved checkpoints, while `lewm-bench-drone-closed-loop` runs
-  short-horizon local-control probes without gate-specific geometry.
+- Drone state LeWM: `lewm-train-drone`, `lewm-eval-drone`,
+  `lewm-eval-drone-checkpoints`, and `lewm-find-drone-rows` train and evaluate
+  vector-state dynamics on imported drone racing data. The supported evidence
+  path is recorded-action prediction over fixed dataset rows/strata.
+- Drone diagnostics and demos: `lewm-probe-drone-actions`,
+  `lewm-bench-drone-closed-loop`, and `lewm-plan-drone-gates` exercise the
+  learned model and planner, keeping rollouts/scoring on CUDA. These are not
+  proof of behavior outside the logged flight distribution.
 
 The current drone demo, training run, planner result, replay viewer, and
 interactive LeWM simulator are summarized in

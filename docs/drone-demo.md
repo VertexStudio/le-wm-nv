@@ -18,6 +18,12 @@ state-delta head.
 The gate loop is one evaluation task for the model. It is not the only goal of
 the project.
 
+The evidence boundary is the logged flight distribution. The model can be
+evaluated honestly by replaying recorded actions from fixed rows/episodes and
+measuring one-step or autoregressive prediction error. Planner demos can show
+how the learned model behaves when used for control, but they are not evidence
+for behaviors absent from the logs.
+
 ## Why This Matters
 
 The core result is fast learned dynamics. A platform can provide recent
@@ -86,6 +92,31 @@ Target delta schema:
 - `delta_vbat`
 
 `vbat` is intentionally kept in the model input/target schema.
+
+## Dataset Row Audit
+
+The imported racing logs contain useful regimes, but not clean isolated
+single-axis system-identification maneuvers. Use the dataset-only row audit to
+build fixed eval strata without conditioning row choice on model performance:
+
+```bash
+cargo run --release --locked --bin lewm-find-drone-rows -- \
+  --dataset-dir "$HOME/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz" \
+  --output target/drone-eval/row-candidates-h40-dataset-only.json \
+  --row-source all \
+  --history-steps 8 \
+  --horizon-steps 40 \
+  --top-k 12
+```
+
+Current audit result:
+
+- Hover-like and clean-cruise rows exist and are appropriate fixed strata for
+  in-distribution prediction checks.
+- Strong body-Y, body-Z, and yaw rows exist, but they occur during coupled,
+  high-speed flight. They are useful stress strata, not isolated-axis proof.
+- No model weights are loaded by `lewm-find-drone-rows`; it only inspects the
+  dataset.
 
 ## Model
 
@@ -159,8 +190,8 @@ The first quantitative dynamics report for the all-data checkpoint is:
 docs/drone-eval-all-data-final-20260614.md
 ```
 
-The checkpoint learning curve, action controllability probe, and closed-loop
-local-control benchmark are documented in:
+The checkpoint learning curve and diagnostic planner/control probes are
+documented in:
 
 ```text
 docs/drone-control-evals-20260614.md
@@ -177,6 +208,12 @@ Summary:
 Because the checkpoint was trained with `--train-all-data`, the metadata eval
 rows were not held out. Treat this as an in-distribution dynamics-quality
 measurement and compare future checkpoints with the same command.
+
+For claims, prefer recorded-action prediction metrics over isolated local
+control targets. The action-sweep, gate-loop, and interactive simulator paths
+are useful for finding failure modes and demonstrating the planner stack, but
+they should not be used as evidence for behaviors that are not represented in
+the dataset.
 
 ## Behavior-Preserving Runtime Optimization
 
@@ -335,8 +372,12 @@ The simulator uses a spring follow camera so WASD stays reserved for piloting.
 - The model is a learned dynamics model, not a physics engine.
 - Good behavior should be expected mainly near the action/state distribution
   present in the dataset.
+- The racing logs are mostly coupled motion. They do not provide clean
+  independent roll/pitch/yaw/throttle validation regimes.
 - Gate-loop success is one task-specific probe, not proof of full drone
   controllability.
+- Isolated body-axis targets are diagnostics unless backed by corresponding
+  logged behavior.
 - Planner budget changes can change behavior and must be reported separately
   from runtime optimizations.
 - The interactive simulator is a qualitative closed-loop probe. It is meant to
@@ -346,8 +387,8 @@ The simulator uses a spring follow camera so WASD stays reserved for piloting.
 ## Useful Next Comparisons
 
 - Run `lewm-drone-sim` before and after any continued training checkpoint.
-- Compare the all-gates planner artifact at fixed planner settings.
+- Compare recorded-action replay metrics on the same fixed dataset strata.
 - Add per-dimension one-step and autoregressive state-delta error summaries.
-- Track simulator step time and closed-loop drift for fixed scripted controls.
+- Track simulator step time and closed-loop drift only as diagnostics.
 - If training continues for 200 more epochs, document it as a new run instead
   of overwriting this baseline.

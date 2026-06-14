@@ -8,15 +8,20 @@ Checkpoint:
 ~/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors
 ```
 
-These evaluations strengthen the fast learned-dynamics claim without relying on
-gate-specific behavior. They measure:
+These evaluations are split into evidence and diagnostics. The evidence for the
+fast learned-dynamics claim is recorded-action prediction on fixed dataset
+rows/strata. The planner/control runs are diagnostics for how the learned model
+behaves when used inside a controller; they are not proof of behavior outside
+the logged flight distribution.
 
-- checkpoint quality versus training time
-- action controllability under direct action sweeps
-- closed-loop short-horizon local control with replanning
+This report includes:
+
+- checkpoint quality versus training time using recorded dataset actions
+- action-sensitivity diagnostics under direct action sweeps
+- closed-loop short-horizon local-control diagnostics with replanning
 
 The checkpoint was trained with `--train-all-data`, so these are
-in-distribution dynamics/control diagnostics, not held-out generalization.
+in-distribution diagnostics, not held-out generalization.
 
 ## 1. Checkpoint Quality Curve
 
@@ -82,7 +87,7 @@ Interpretation:
 - The high-motion stress row `55981` is harder: final 0.4s RMS was `1.447m`
   and final 1.0s RMS was `4.714m`.
 
-## 2. Action Controllability
+## 2. Action Sensitivity Diagnostic
 
 Tool:
 
@@ -92,7 +97,7 @@ cargo run --release --locked --bin lewm-probe-drone-actions -- \
   --dataset-dir "$HOME/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz" \
   --weights "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors" \
   --config "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/model-config.json" \
-  --output target/drone-eval/action-controllability-h40.json \
+  --output target/drone-eval/action-sensitivity-h40.json \
   --row 40847 \
   --history-steps 8 \
   --horizon 40 \
@@ -114,10 +119,11 @@ Interpretation:
   different predicted state response over the same `0.4s` horizon.
 - Pitch and throttle have large positional effects. Yaw strongly changes
   predicted speed. Roll produces a smaller but still visible positional span.
-- This test is a controllability probe, not a controller. It answers whether
-  the model reacts to actions at all.
+- This is not proof of isolated-axis controllability. It changes one channel at
+  a time from a selected row, which may not match clean logged maneuvers. Use it
+  to detect whether the model reacts to actions, not to claim task competence.
 
-## 3. Closed-Loop Local Control
+## 3. Closed-Loop Local-Control Diagnostic
 
 Tool:
 
@@ -141,11 +147,15 @@ cargo run --release --locked --bin lewm-bench-drone-closed-loop -- \
   --target-yaw-rad 0.35
 ```
 
-This benchmark runs a short-horizon iCEM planner over simple body-frame targets.
-It replans every simulated model step. The expensive path stays on CUDA through
-Candle: candidate sampling, LeWM rollout, state-head decoding, and candidate
-scoring. The CPU side only receives the selected action and tiny predicted
-state for the next replan/report.
+This diagnostic runs a short-horizon iCEM planner over simple body-frame
+targets. It replans every simulated model step. The expensive path stays on
+CUDA through Candle: candidate sampling, LeWM rollout, state-head decoding, and
+candidate scoring. The CPU side only receives the selected action and tiny
+predicted state for the next replan/report.
+
+The task targets here are synthetic. The racing dataset contains mostly coupled
+flight, so this section should not be read as evidence for isolated body-axis
+control unless the start/target regime is backed by logged behavior.
 
 The improved local scorer includes:
 
@@ -178,7 +188,7 @@ budget:
 
 Interpretation:
 
-- The body-X task remains the cleanest local-control success: expected
+- The body-X diagnostic remains the cleanest local-control response: expected
   `0.563m`, achieved `0.746m`, with `0.210m` cross-track error.
 - Body-Z now reaches the requested vertical progress, but still has substantial
   body-X coupling.
@@ -187,28 +197,27 @@ Interpretation:
   the requested yaw over this 30-step run.
 - Hold is improved but not solved; it still drifts in a row with nonzero
   existing motion.
-- This is still useful: it separates "the model reacts to controls" from "the
-  current short-horizon controller can shape all desired local behaviors."
+- This is still useful for debugging the planner/model interface, but it is not
+  a headline result for the dynamics model.
 
 ## Current Claim After These Tests
 
 The evidence now supports this narrower statement:
 
 > LeWM can learn a compact action-conditioned drone dynamics model from logged
-> state/action data in minutes on one GPU. The learned model is responsive to
-> RC-channel actions and supports short-horizon MPC-style local control probes,
-> with strongest current behavior on body-X and body-Z progress, emerging
-> right-sign body-Y and yaw behavior, and remaining coupling/drift that still
-> needs controller and data-quality work.
+> state/action data in minutes on one GPU. On fixed in-distribution recorded
+> action replays, prediction quality improves quickly with training and remains
+> measurable over short horizons. Planner/action-sweep runs are useful
+> diagnostics for action conditioning and CUDA control-loop plumbing, but they
+> do not prove behavior outside the logged flight regimes.
 
-The next improvement should focus on local-control quality, not long open-loop
-episode matching. Useful next probes:
+The next improvement should focus on stronger in-distribution evidence. Useful
+next probes:
 
-- run the closed-loop benchmark after additional training
-- evaluate the same local-control probes across multiple rows and flight
-  regimes
-- tune the body-frame local scorer while keeping planner budget fixed
-- add a separate hover/brake task from low-motion rows instead of demanding
-  hover recovery from a moving row
-- add scripted viewer playback for these local tasks
-- compare LeWM against simple linear/MLP baselines on the same three reports
+- freeze a small set of dataset-only eval strata: hover-like, clean cruise,
+  high-speed forward, coupled lateral/vertical, yaw-heavy, and stress motion
+- report one-step and autoregressive prediction error for each fixed stratum
+- compare LeWM against simple linear, MLP, and recurrent baselines on the same
+  recorded-action rows
+- keep local-control and gate-loop runs as diagnostics unless the task is backed
+  by logged behavior

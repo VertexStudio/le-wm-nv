@@ -83,6 +83,10 @@ name = "lewm-bench-drone-closed-loop"
 path = "src/bin/lewm-bench-drone-closed-loop.rs"
 
 [[bin]]
+name = "lewm-find-drone-rows"
+path = "src/bin/lewm-find-drone-rows.rs"
+
+[[bin]]
 name = "lewm-plan-drone-gates"
 path = "src/bin/lewm-plan-drone-gates.rs"
 
