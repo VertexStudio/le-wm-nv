@@ -151,6 +151,26 @@ Resume note: `lewm-train-drone --resume-dir ... --epochs N` treats `N` as the
 total target epoch count, not additional epochs. To train 200 more epochs after
 the 100-epoch run, use `--epochs 300`.
 
+## Dynamics Evaluation
+
+The first quantitative dynamics report for the all-data checkpoint is:
+
+```text
+docs/drone-eval-all-data-final-20260614.md
+```
+
+Summary:
+
+- Mean normalized state-prediction loss on metadata eval rows: `0.25623435`
+- Current planner horizon: `40` steps at `100 Hz`, or `0.4 s`
+- `0.4 s` open-loop replay position error: mean `0.277 m`, RMS `0.360 m`,
+  max `0.601 m`
+- `0.4 s` open-loop replay attitude error: mean `0.113 rad`, max `0.217 rad`
+
+Because the checkpoint was trained with `--train-all-data`, the metadata eval
+rows were not held out. Treat this as an in-distribution dynamics-quality
+measurement and compare future checkpoints with the same command.
+
 ## Behavior-Preserving Runtime Optimization
 
 Runtime optimization metrics must hold planner settings fixed. Do not mix these
