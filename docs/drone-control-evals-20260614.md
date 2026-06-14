@@ -127,7 +127,7 @@ cargo run --release --locked --bin lewm-bench-drone-closed-loop -- \
   --dataset-dir "$HOME/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz" \
   --weights "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/final.safetensors" \
   --config "$HOME/.stable_worldmodel/le-wm-nv-runs/drone-state-lewm-all-data-20260612-235255/model-config.json" \
-  --output target/drone-eval/closed-loop-local-h40-s128-i2.json \
+  --output target/drone-eval/closed-loop-local-h40-s128-i2-v7.json \
   --row 40847 \
   --history-steps 8 \
   --horizon 40 \
@@ -135,6 +135,7 @@ cargo run --release --locked --bin lewm-bench-drone-closed-loop -- \
   --elites 32 \
   --keep-elites 8 \
   --iterations 2 \
+  --init-std 0.35 \
   --loop-steps 30 \
   --target-distance-m 0.75 \
   --target-yaw-rad 0.35
@@ -146,23 +147,46 @@ Candle: candidate sampling, LeWM rollout, state-head decoding, and candidate
 scoring. The CPU side only receives the selected action and tiny predicted
 state for the next replan/report.
 
+The improved local scorer includes:
+
+- body-frame position and rotation tracking
+- target linear velocity and target angular velocity
+- axis-progress scoring for the lateral `body_y` diagnostic
+- yaw-specific rotation/angular-velocity weighting
+- action effort and action smoothness regularization
+
 Result:
 
-| Task | Expected Body Delta | Actual Body Delta | Progress | Cross Track | Planner |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| hold | `(0.000, 0.000, 0.000)` | `(0.443, -0.417, -0.227)` | `0.000m` | `0.650m` | `189.5ms` |
-| body_x | `(0.563, 0.000, 0.000)` | `(0.624, 0.001, 0.172)` | `0.624m` | `0.172m` | `184.0ms` |
-| body_y | `(0.000, 0.563, 0.000)` | `(0.931, -0.121, -0.347)` | `-0.121m` | `0.994m` | `181.3ms` |
-| body_z | `(0.000, 0.000, 0.563)` | `(0.876, -0.396, 0.364)` | `0.364m` | `0.961m` | `184.8ms` |
-| yaw_z | `(0.000, 0.000, 0.000)` | `(0.647, -0.040, -0.005)` | `0.000m` | `0.648m` | `184.3ms` |
+| Task | Expected Body Delta | Actual Body Delta | Progress | Cross Track | Yaw/Rot Progress | Planner |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hold | `(0.000, 0.000, 0.000)` | `(0.124, -0.207, -0.415)` | `0.000m` | `0.480m` | `0.000rad` | `193.4ms` |
+| body_x | `(0.563, 0.000, 0.000)` | `(0.746, -0.129, -0.165)` | `0.746m` | `0.210m` | `0.000rad` | `188.4ms` |
+| body_y | `(0.000, 0.563, 0.000)` | `(0.847, 0.255, 0.032)` | `0.255m` | `0.848m` | `0.000rad` | `190.3ms` |
+| body_z | `(0.000, 0.000, 0.563)` | `(0.832, -0.098, 0.591)` | `0.591m` | `0.837m` | `0.000rad` | `188.3ms` |
+| yaw_z | `(0.000, 0.000, 0.000)` | `(0.400, -0.163, -0.345)` | `0.000m` | `0.553m` | `0.112rad` | `188.8ms` |
+
+Compared with the first closed-loop report at the same model and planner
+budget:
+
+- hold drift dropped from `0.650m` to `0.480m`
+- body-X progress increased from `0.624m` to `0.746m`
+- body-Y changed from wrong-sign progress `-0.121m` to right-sign progress
+  `0.255m`
+- body-Z progress increased from `0.364m` to `0.591m`
+- yaw progress is now explicitly measured: `0.112rad` of the expected
+  `0.263rad`, with cross-track drift reduced from `0.648m` to `0.553m`
 
 Interpretation:
 
-- The body-X task is the cleanest local-control success: expected `0.563m`,
-  achieved `0.624m`, with `0.172m` cross-track error.
-- Body-Z shows partial progress but strong coupling into body X/Y.
-- Body-Y, yaw, and hold reveal that the current model/planner pair is not yet
-  a clean decoupled local controller.
+- The body-X task remains the cleanest local-control success: expected
+  `0.563m`, achieved `0.746m`, with `0.210m` cross-track error.
+- Body-Z now reaches the requested vertical progress, but still has substantial
+  body-X coupling.
+- Body-Y now has the correct sign, but still has strong body-X coupling.
+- Yaw now rotates in the requested direction, but only reaches about `43%` of
+  the requested yaw over this 30-step run.
+- Hold is improved but not solved; it still drifts in a row with nonzero
+  existing motion.
 - This is still useful: it separates "the model reacts to controls" from "the
   current short-horizon controller can shape all desired local behaviors."
 
@@ -173,13 +197,18 @@ The evidence now supports this narrower statement:
 > LeWM can learn a compact action-conditioned drone dynamics model from logged
 > state/action data in minutes on one GPU. The learned model is responsive to
 > RC-channel actions and supports short-horizon MPC-style local control probes,
-> with strongest current behavior on forward/body-X motion and weaker behavior
-> on decoupled lateral, vertical, yaw, and hold tasks.
+> with strongest current behavior on body-X and body-Z progress, emerging
+> right-sign body-Y and yaw behavior, and remaining coupling/drift that still
+> needs controller and data-quality work.
 
 The next improvement should focus on local-control quality, not long open-loop
 episode matching. Useful next probes:
 
 - run the closed-loop benchmark after additional training
+- evaluate the same local-control probes across multiple rows and flight
+  regimes
 - tune the body-frame local scorer while keeping planner budget fixed
+- add a separate hover/brake task from low-motion rows instead of demanding
+  hover recovery from a moving row
 - add scripted viewer playback for these local tasks
 - compare LeWM against simple linear/MLP baselines on the same three reports

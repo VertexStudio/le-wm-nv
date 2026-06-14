@@ -11,7 +11,8 @@ use le_wm_nv::{
     checkpoint,
     data::drone_racing::{
         DRONE_ACTION_DIM, DRONE_STATE_DELTA_DIM, DroneBatchConfig, DroneFrame, DroneRacingDataset,
-        RunningStats, dot3, mat3_t_mul_vec3, norm3, scale3, sub3,
+        RunningStats, dot3, mat3_mul, mat3_t_mul_vec3, mat3_transpose, norm3, rotvec_from_mat3,
+        scale3, sub3,
     },
     drone_eval::{baseline_action, drone_action_bounds, history_action_prefix, rollout_one_step},
     models::world_model::{WorldModel, WorldModelConfig},
@@ -65,6 +66,10 @@ struct Args {
 
     #[arg(long, default_value_t = 2)]
     iterations: usize,
+
+    /// Initial iCEM action standard deviation.
+    #[arg(long, default_value_t = 0.35)]
+    init_std: f32,
 
     #[arg(long, default_value_t = 40)]
     loop_steps: usize,
@@ -173,6 +178,7 @@ fn main() -> anyhow::Result<()> {
         elites: args.elites,
         keep_elites: args.keep_elites,
         iterations: args.iterations,
+        init_std: args.init_std,
         loop_steps: args.loop_steps,
         sample_rate_hz: dataset.metadata().sample_rate_hz,
         benchmark_elapsed_sec: started.elapsed().as_secs_f64(),
@@ -201,6 +207,10 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         "--iterations must be greater than zero"
     );
     ensure!(
+        args.init_std.is_finite() && args.init_std > 0.0,
+        "--init-std must be finite and greater than zero"
+    );
+    ensure!(
         args.loop_steps > 0,
         "--loop-steps must be greater than zero"
     );
@@ -222,7 +232,7 @@ fn run_task(
     cfg.keep_elites = args.keep_elites;
     cfg.iterations = args.iterations;
     cfg.action_bounds = drone_action_bounds();
-    cfg.init_std = 0.35;
+    cfg.init_std = args.init_std;
     cfg.min_std = 0.02;
     cfg.seed = Some(args.seed + task_idx as u64 * 1_003);
     let mut planner = IcemPlanner::new(cfg);
@@ -250,6 +260,9 @@ fn run_task(
             context.action_prefix.clone(),
             task.target_pos_body,
             task.target_rot_body,
+            task.position_mode,
+            args.horizon,
+            dataset.metadata().sample_rate_hz,
             dataset.metadata().normalization.action.clone(),
             dataset.metadata().normalization.target_delta.clone(),
             !args.no_action_normalize,
@@ -308,9 +321,23 @@ fn run_task(
         task.target_pos_body,
         args.loop_steps as f32 / args.horizon as f32,
     );
+    let desired_rot_body = scale3(
+        task.target_rot_body,
+        args.loop_steps as f32 / args.horizon as f32,
+    );
     let desired_norm = norm3(desired_body);
+    let desired_rot_norm = norm3(desired_rot_body);
+    let net_rot_body = rotvec_from_mat3(mat3_mul(
+        mat3_transpose(initial.rotmat_world_from_body),
+        final_frame.rotmat_world_from_body,
+    ));
     let progress_along_target_m = if desired_norm > 1e-6 {
         dot3(displacement_body, desired_body) / desired_norm
+    } else {
+        0.0
+    };
+    let rotation_progress_rad = if desired_rot_norm > 1e-6 {
+        dot3(net_rot_body, desired_rot_body) / desired_rot_norm
     } else {
         0.0
     };
@@ -334,12 +361,16 @@ fn run_task(
         name: task.name.to_string(),
         target_pos_body_per_horizon: task.target_pos_body,
         target_rot_body_per_horizon: task.target_rot_body,
+        position_mode: task.position_mode,
         expected_body_displacement: desired_body,
+        expected_body_rotation: desired_rot_body,
         initial,
         final_frame,
         net_displacement_world: displacement_world,
         net_displacement_body: displacement_body,
+        net_rotation_body: net_rot_body,
         progress_along_target_m,
+        rotation_progress_rad,
         cross_track_m,
         path_length_m,
         mean_planner_ms: (total_planner_sec * 1000.0 / args.loop_steps as f64) as f32,
@@ -378,6 +409,11 @@ struct ShortHorizonScorer<'a> {
     action_prefix: Tensor,
     target_pos: Tensor,
     target_rot: Tensor,
+    target_vel: Tensor,
+    target_ang_vel: Tensor,
+    target_pos_unit: Tensor,
+    target_pos_norm: f32,
+    position_mode: PositionMode,
     action_mean: Tensor,
     action_std: Tensor,
     target_mean: Tensor,
@@ -387,8 +423,11 @@ struct ShortHorizonScorer<'a> {
     dtype: DType,
     device: candle::Device,
     position_weight: f64,
+    progress_weight: f64,
+    cross_track_weight: f64,
     rotation_weight: f64,
     velocity_weight: f64,
+    angular_velocity_weight: f64,
     terminal_weight: f64,
     action_weight: f64,
     smoothness_weight: f64,
@@ -401,6 +440,9 @@ impl<'a> ShortHorizonScorer<'a> {
         action_prefix: Tensor,
         target_pos_body: [f32; 3],
         target_rot_body: [f32; 3],
+        position_mode: PositionMode,
+        horizon: usize,
+        sample_rate_hz: usize,
         action_stats: RunningStats,
         target_stats: RunningStats,
         action_normalized: bool,
@@ -434,6 +476,28 @@ impl<'a> ShortHorizonScorer<'a> {
             &device,
         )?
         .to_dtype(dtype)?;
+        let horizon_sec = horizon as f32 / sample_rate_hz.max(1) as f32;
+        let target_vel_body = [
+            target_pos_body[0] / horizon_sec,
+            target_pos_body[1] / horizon_sec,
+            target_pos_body[2] / horizon_sec,
+        ];
+        let target_ang_vel_body = [
+            target_rot_body[0] / horizon_sec,
+            target_rot_body[1] / horizon_sec,
+            target_rot_body[2] / horizon_sec,
+        ];
+        let target_pos_norm = norm3(target_pos_body);
+        let target_rot_norm = norm3(target_rot_body);
+        let target_pos_unit = if target_pos_norm > 1e-6 {
+            [
+                target_pos_body[0] / target_pos_norm,
+                target_pos_body[1] / target_pos_norm,
+                target_pos_body[2] / target_pos_norm,
+            ]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
         Ok(Self {
             model,
             emb,
@@ -442,6 +506,14 @@ impl<'a> ShortHorizonScorer<'a> {
                 .to_dtype(dtype)?,
             target_rot: Tensor::from_vec(target_rot_body.to_vec(), (1, 3), &device)?
                 .to_dtype(dtype)?,
+            target_vel: Tensor::from_vec(target_vel_body.to_vec(), (1, 3), &device)?
+                .to_dtype(dtype)?,
+            target_ang_vel: Tensor::from_vec(target_ang_vel_body.to_vec(), (1, 3), &device)?
+                .to_dtype(dtype)?,
+            target_pos_unit: Tensor::from_vec(target_pos_unit.to_vec(), (1, 3), &device)?
+                .to_dtype(dtype)?,
+            target_pos_norm,
+            position_mode,
             action_mean,
             action_std,
             target_mean,
@@ -450,9 +522,12 @@ impl<'a> ShortHorizonScorer<'a> {
             target_normalized,
             dtype,
             device,
-            position_weight: 1.0,
-            rotation_weight: 0.35,
-            velocity_weight: 0.015,
+            position_weight: if target_rot_norm > 1e-6 { 0.75 } else { 1.0 },
+            progress_weight: 2.5,
+            cross_track_weight: 0.65,
+            rotation_weight: if target_rot_norm > 1e-6 { 2.0 } else { 0.35 },
+            velocity_weight: 0.08,
+            angular_velocity_weight: if target_rot_norm > 1e-6 { 0.18 } else { 0.04 },
             terminal_weight: 1.5,
             action_weight: 2e-3,
             smoothness_weight: 4e-3,
@@ -536,17 +611,37 @@ impl CandidateScorer for ShortHorizonScorer<'_> {
             let dp = delta.i((.., 0..3))?;
             let dr = delta.i((.., 3..6))?;
             let lv = delta.i((.., 6..9))?;
+            let av = delta.i((.., 9..12))?;
             pos = (&pos + &dp)?;
             rot = (&rot + &dr)?;
             let frac = (step + 1) as f64 / horizon as f64;
             let target_pos = (&self.target_pos * frac)?;
             let target_rot = (&self.target_rot * frac)?;
-            let pos_err = pos.broadcast_sub(&target_pos)?.sqr()?.sum(D::Minus1)?;
+            let pos_err = if self.position_mode == PositionMode::AxisProgress
+                && self.target_pos_norm > 1e-6
+            {
+                let progress = pos.broadcast_mul(&self.target_pos_unit)?.sum(D::Minus1)?;
+                let target_progress = self.target_pos_norm as f64 * frac;
+                let progress_err = (&progress - target_progress)?.sqr()?;
+                let projected = progress
+                    .reshape((samples, 1))?
+                    .broadcast_mul(&self.target_pos_unit)?;
+                let cross_track = (&pos - &projected)?.sqr()?.sum(D::Minus1)?;
+                (&progress_err * self.progress_weight)?
+                    .broadcast_add(&(cross_track * self.cross_track_weight)?)?
+            } else {
+                pos.broadcast_sub(&target_pos)?.sqr()?.sum(D::Minus1)?
+            };
             let rot_err = rot.broadcast_sub(&target_rot)?.sqr()?.sum(D::Minus1)?;
-            let vel_err = lv.sqr()?.sum(D::Minus1)?;
+            let vel_err = lv.broadcast_sub(&self.target_vel)?.sqr()?.sum(D::Minus1)?;
+            let ang_vel_err = av
+                .broadcast_sub(&self.target_ang_vel)?
+                .sqr()?
+                .sum(D::Minus1)?;
             let step_cost = (&pos_err * self.position_weight)?;
             let step_cost = (&step_cost + &(rot_err.clone() * self.rotation_weight)?)?;
             let step_cost = (&step_cost + &(vel_err * self.velocity_weight)?)?;
+            let step_cost = (&step_cost + &(ang_vel_err * self.angular_velocity_weight)?)?;
             let weight = 1.0 / (1.0 + step as f64 * 0.03);
             total = (&total + &(step_cost * weight)?)?;
             terminal_pos_err = pos_err;
@@ -581,26 +676,31 @@ fn default_tasks(distance: f32, yaw: f32) -> Vec<TaskSpec> {
             name: "hold",
             target_pos_body: [0.0, 0.0, 0.0],
             target_rot_body: [0.0, 0.0, 0.0],
+            position_mode: PositionMode::Vector,
         },
         TaskSpec {
             name: "body_x",
             target_pos_body: [distance, 0.0, 0.0],
             target_rot_body: [0.0, 0.0, 0.0],
+            position_mode: PositionMode::Vector,
         },
         TaskSpec {
             name: "body_y",
             target_pos_body: [0.0, distance, 0.0],
             target_rot_body: [0.0, 0.0, 0.0],
+            position_mode: PositionMode::AxisProgress,
         },
         TaskSpec {
             name: "body_z",
             target_pos_body: [0.0, 0.0, distance],
             target_rot_body: [0.0, 0.0, 0.0],
+            position_mode: PositionMode::Vector,
         },
         TaskSpec {
             name: "yaw_z",
             target_pos_body: [0.0, 0.0, 0.0],
             target_rot_body: [0.0, 0.0, yaw],
+            position_mode: PositionMode::Vector,
         },
     ]
 }
@@ -658,6 +758,14 @@ struct TaskSpec {
     name: &'static str,
     target_pos_body: [f32; 3],
     target_rot_body: [f32; 3],
+    position_mode: PositionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PositionMode {
+    Vector,
+    AxisProgress,
 }
 
 #[derive(Debug, Serialize)]
@@ -673,6 +781,7 @@ struct ClosedLoopReport {
     elites: usize,
     keep_elites: usize,
     iterations: usize,
+    init_std: f32,
     loop_steps: usize,
     sample_rate_hz: usize,
     benchmark_elapsed_sec: f64,
@@ -684,12 +793,16 @@ struct TaskResult {
     name: String,
     target_pos_body_per_horizon: [f32; 3],
     target_rot_body_per_horizon: [f32; 3],
+    position_mode: PositionMode,
     expected_body_displacement: [f32; 3],
+    expected_body_rotation: [f32; 3],
     initial: DroneFrame,
     final_frame: DroneFrame,
     net_displacement_world: [f32; 3],
     net_displacement_body: [f32; 3],
+    net_rotation_body: [f32; 3],
     progress_along_target_m: f32,
+    rotation_progress_rad: f32,
     cross_track_m: f32,
     path_length_m: f32,
     mean_planner_ms: f32,
