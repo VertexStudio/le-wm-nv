@@ -18,6 +18,32 @@ state-delta head.
 The gate loop is one evaluation task for the model. It is not the only goal of
 the project.
 
+## Why This Matters
+
+The core result is fast learned dynamics. A platform can provide recent
+observation/action logs, train an action-conditioned LeWM world model in
+minutes on one GPU, and then use that model as the predictive substrate for
+MPC-style decision making:
+
+- predict likely future states under candidate controls
+- score those futures against task costs, constraints, or operator intent
+- choose control inputs using the learned model instead of a hand-written
+  dynamics equation
+- retrain quickly as vehicle configuration, payload, wear, battery state, or
+  local operating conditions change
+
+That makes the workflow useful as a pre-deployment or in-transit learning loop:
+collect logs, train a compact world model, run fixed validation probes, and load
+the resulting model into a planner before the vehicle starts the real task. The
+claim is not full autonomy, perception, or racing. The claim is that a usable
+world model for an unknown dynamics system can be learned quickly enough to fit
+inside practical mission-prep iteration.
+
+For safety-critical use, the learned model still needs validation, uncertainty
+checks, and controller guardrails. The important point for this repo is that the
+learned dynamics loop is fast enough to make those checks iterative instead of a
+multi-day offline process.
+
 ## Data
 
 Imported dataset:

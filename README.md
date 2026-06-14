@@ -30,6 +30,15 @@ When Candle lacks a needed NVIDIA primitive, the preferred direction is a
 focused Candle CUDA op, a direct NVIDIA library binding, or a CUDA-compatible
 crate that preserves device residency.
 
+The strategic use case is fast learned dynamics for control. Given recent
+observation/action logs from an unknown platform, the repo should be able to
+train a compact action-conditioned LeWM world model in minutes on one GPU, then
+use that model as the predictive core for MPC-style rollout, scoring, and
+control selection. That makes pre-deployment or in-transit model refresh
+plausible: collect logs, train, run fixed validation probes, and load the model
+before the vehicle starts the real task. This is a world-model claim, not a
+claim about vision, navigation, or full autonomy.
+
 ## Capabilities
 
 - LeWM model runtime: ViT-Tiny image encoder, vector MLP observation encoder,
