@@ -79,7 +79,10 @@ Repo-native extensions live around that core instead of replacing it:
 - Drone vector LeWM: `lewm-drone-import` imports vector/state logs and
   `lewm-train-drone` trains the modular vector-observation model with the same
   LeWM objective used by the image trainers. No supervised decoder head is part
-  of the model.
+  of the model. The drone trainer follows upstream LeWM history semantics:
+  each training sample contains `history_steps + num_preds` observations, the
+  predictor has `history_steps` positional frames, and longer horizons are
+  produced only by autoregressive rollout during planning/evaluation.
 
 Architecture-preserving performance work is allowed and should be documented
 here when landed. It may cache non-learned tensors, reduce tensor assembly,
@@ -215,15 +218,20 @@ cargo run --release --locked --features hub --bin lewm-plan-images -- \
 
 ## Training
 
-All active trainers use the strict LeWM objective:
+The drone vector trainer follows the upstream LeWM shifted-context objective:
 
 ```text
-loss = mse(predicted_next_embedding, stopgrad(target_next_embedding))
+ctx = embedding[:, :history_size]
+target = stopgrad(embedding[:, num_preds:])
+pred = predictor(ctx, action[:, :history_size])
+
+loss = mse(pred, target)
      + 0.09 * SIGReg(online_embeddings)
 ```
 
-SIGReg uses the upstream default `17` knots and `1024` random projections. The
-trainer CLIs do not expose alternate auxiliary loss weights.
+Shared SIGReg uses the upstream default `17` knots, `1024` random projections,
+and the upstream Gaussian-windowed integration weights. The trainer CLIs do not
+expose alternate auxiliary loss weights.
 
 Export a PushT image/action batch and run a Rust/Candle CUDA training step:
 

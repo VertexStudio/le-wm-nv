@@ -70,12 +70,14 @@ pub(crate) fn sigreg_loss(proj: &Tensor, cfg: SigRegConfig) -> Result<Tensor> {
     let weights = Tensor::from_vec(weights, (cfg.knots,), device)?.to_dtype(dtype)?;
 
     let t4 = t.reshape((1, 1, 1, cfg.knots))?;
-    let phi = ((t.sqr()?.neg()? / 2.0)?.exp()?).reshape((1, 1, cfg.knots))?;
+    let phi_values = (t.sqr()?.neg()? / 2.0)?.exp()?;
+    let phi = phi_values.reshape((1, 1, cfg.knots))?;
+    let windowed_weights = weights.broadcast_mul(&phi_values)?;
     let x_t = projected.unsqueeze(3)?.broadcast_mul(&t4)?;
     let cos_mean = x_t.cos()?.mean(1)?;
     let sin_mean = x_t.sin()?.mean(1)?;
     let err = (cos_mean.broadcast_sub(&phi)?.sqr()? + sin_mean.sqr()?)?;
-    let weighted = err.broadcast_mul(&weights.reshape((1, 1, cfg.knots))?)?;
+    let weighted = err.broadcast_mul(&windowed_weights.reshape((1, 1, cfg.knots))?)?;
     (weighted.sum(D::Minus1)? * batch as f64)?.mean_all()
 }
 

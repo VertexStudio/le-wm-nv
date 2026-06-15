@@ -26,8 +26,9 @@ fn vector_world_model_training_step_updates_and_reloads_cuda_weights() -> candle
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = WorldModel::new(cfg.clone(), vb)?;
 
-    let observations = Tensor::randn(0f32, 1f32, (2, cfg.predictor.num_frames, 6), &device)?;
-    let actions = Tensor::randn(0f32, 1f32, (2, cfg.predictor.num_frames, 4), &device)?;
+    let time = cfg.history_size + 1;
+    let observations = Tensor::randn(0f32, 1f32, (2, time, 6), &device)?;
+    let actions = Tensor::randn(0f32, 1f32, (2, time, 4), &device)?;
     let vars = varmap.all_vars();
     assert!(!vars.is_empty());
     let before = vars
@@ -83,9 +84,9 @@ fn vector_world_model_training_step_updates_and_reloads_cuda_weights() -> candle
 
 fn tiny_vector_config() -> WorldModelConfig {
     let embed_dim = 24;
-    let time = 5;
+    let history_size = 3;
     WorldModelConfig {
-        history_size: 3,
+        history_size,
         observation_encoder: ObservationEncoderConfig::VectorMlp(VectorMlpConfig {
             input_dim: 6,
             hidden_dim: 32,
@@ -100,7 +101,7 @@ fn tiny_vector_config() -> WorldModelConfig {
             mlp_scale: 2,
         },
         predictor: PredictorConfig {
-            num_frames: time,
+            num_frames: history_size,
             input_dim: embed_dim,
             hidden_dim: embed_dim,
             output_dim: embed_dim,

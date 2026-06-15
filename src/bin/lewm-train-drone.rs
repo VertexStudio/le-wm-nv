@@ -65,8 +65,8 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     history_steps: usize,
 
-    #[arg(long, default_value_t = 50)]
-    horizon_steps: usize,
+    #[arg(long, default_value_t = 1)]
+    num_preds: usize,
 
     #[arg(long, default_value_t = 7)]
     seed: u64,
@@ -99,9 +99,8 @@ fn main() -> anyhow::Result<()> {
     let output_dir = args.output_dir.clone().unwrap_or_else(default_output_dir);
     let sequence_steps = args
         .history_steps
-        .checked_add(args.horizon_steps)
-        .and_then(|v| v.checked_add(1))
-        .context("history_steps + horizon_steps + 1 overflowed")?;
+        .checked_add(args.num_preds)
+        .context("history_steps + num_preds overflowed")?;
     let batch_cfg = DroneBatchConfig {
         batch_size: args.batch_size,
         sequence_steps,
@@ -138,7 +137,7 @@ fn main() -> anyhow::Result<()> {
 
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
-    let cfg = load_or_default_config(args.config.as_ref(), args.history_steps, sequence_steps)?;
+    let cfg = load_or_default_config(args.config.as_ref(), args.history_steps)?;
     cfg.validate()?;
     write_pretty_json(&output_dir.join("dataset-summary.json"), dataset.metadata())?;
     write_pretty_json(&output_dir.join("model-config.json"), &cfg)?;
@@ -185,12 +184,14 @@ fn main() -> anyhow::Result<()> {
     let mut metrics = BufWriter::new(metrics_file);
 
     println!(
-        "dataset={} rows={} train_windows={} row_source={} batches_per_epoch={} sequence_steps={}",
+        "dataset={} rows={} train_windows={} row_source={} batches_per_epoch={} history_steps={} num_preds={} sequence_steps={}",
         dataset.root().display(),
         dataset.metadata().rows,
         train_rows.len(),
         row_source,
         batches_per_epoch,
+        args.history_steps,
+        args.num_preds,
         sequence_steps,
     );
     println!(
@@ -320,10 +321,7 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         args.history_steps > 0,
         "--history-steps must be greater than zero"
     );
-    ensure!(
-        args.horizon_steps > 0,
-        "--horizon-steps must be greater than zero"
-    );
+    ensure!(args.num_preds > 0, "--num-preds must be greater than zero");
     ensure!(args.log_every > 0, "--log-every must be greater than zero");
     if let Some(max_steps) = args.max_steps {
         ensure!(max_steps > 0, "--max-steps must be greater than zero");
@@ -366,7 +364,6 @@ fn home_dir() -> PathBuf {
 fn load_or_default_config(
     path: Option<&PathBuf>,
     history_steps: usize,
-    sequence_steps: usize,
 ) -> anyhow::Result<WorldModelConfig> {
     let mut cfg = match path {
         Some(path) => serde_json::from_str(
@@ -377,7 +374,7 @@ fn load_or_default_config(
         None => WorldModelConfig::vector_drone_default(DRONE_OBSERVATION_DIM, DRONE_ACTION_DIM),
     };
     cfg.history_size = history_steps;
-    cfg.predictor.num_frames = sequence_steps;
+    cfg.predictor.num_frames = history_steps;
     Ok(cfg)
 }
 
@@ -504,11 +501,7 @@ fn ensure_resume_compatible(current: &RunSettings, saved: &RunSettings) -> anyho
         &current.history_steps,
         &saved.history_steps,
     )?;
-    ensure_eq(
-        "horizon_steps",
-        &current.horizon_steps,
-        &saved.horizon_steps,
-    )?;
+    ensure_eq("num_preds", &current.num_preds, &saved.num_preds)?;
     ensure_eq(
         "sequence_steps",
         &current.sequence_steps,
@@ -557,7 +550,7 @@ struct RunSettings {
     train_all_data: bool,
     batch_size: usize,
     history_steps: usize,
-    horizon_steps: usize,
+    num_preds: usize,
     sequence_steps: usize,
     seed: u64,
     normalization: NormalizationFlags,
@@ -587,7 +580,7 @@ impl RunSettings {
             train_all_data: args.train_all_data,
             batch_size: args.batch_size,
             history_steps: args.history_steps,
-            horizon_steps: args.horizon_steps,
+            num_preds: args.num_preds,
             sequence_steps,
             seed: args.seed,
             normalization: NormalizationFlags {

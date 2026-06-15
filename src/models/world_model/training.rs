@@ -68,12 +68,22 @@ pub(crate) fn vector_batch_loss_with_sigreg(
         candle::bail!("vector batch loss requires at least two timesteps");
     }
 
+    let time = obs_dims[1];
+    let history_size = model.config().history_size;
+    if time <= history_size {
+        candle::bail!(
+            "LeWM vector training expects time > history_size, got time={} history_size={}",
+            time,
+            history_size
+        );
+    }
+    let num_preds = time - history_size;
     let emb = model.encode_vector(observations)?;
-    let pred = model.predict(&emb, actions)?;
-    let time = emb.dim(1)?;
-    let pred_next = pred.i((.., 0..(time - 1), ..))?;
-    let target_next = emb.detach().i((.., 1..time, ..))?;
-    let prediction_loss = mse_loss(&pred_next, &target_next)?;
+    let ctx_emb = emb.i((.., 0..history_size, ..))?;
+    let ctx_actions = actions.i((.., 0..history_size, ..))?;
+    let pred = model.predict(&ctx_emb, &ctx_actions)?;
+    let target_next = emb.detach().i((.., num_preds..time, ..))?;
+    let prediction_loss = mse_loss(&pred, &target_next)?;
     let sigreg_loss = sigreg_loss(&emb.transpose(0, 1)?, sigreg)?;
     let total_loss = (prediction_loss.clone() + (sigreg_loss.clone() * sigreg.weight)?)?;
 
