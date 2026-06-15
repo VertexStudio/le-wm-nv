@@ -11,6 +11,7 @@ pub struct DronePlantConfig {
     pub gravity: f32,
     pub hover_throttle: f32,
     pub max_thrust_weight: f32,
+    pub thrust_curve: f32,
     pub max_roll_rate: f32,
     pub max_pitch_rate: f32,
     pub max_yaw_rate: f32,
@@ -18,6 +19,8 @@ pub struct DronePlantConfig {
     pub rate_damping: f32,
     pub linear_drag: f32,
     pub quadratic_drag: f32,
+    pub body_linear_drag: [f32; 3],
+    pub body_quadratic_drag: [f32; 3],
     pub roll_rate_sign: f32,
     pub pitch_rate_sign: f32,
     pub yaw_rate_sign: f32,
@@ -31,6 +34,7 @@ impl Default for DronePlantConfig {
             gravity: 9.81,
             hover_throttle: 0.2,
             max_thrust_weight: 5.73,
+            thrust_curve: 0.0,
             max_roll_rate: 14.0,
             max_pitch_rate: 12.0,
             max_yaw_rate: 10.0,
@@ -38,6 +42,8 @@ impl Default for DronePlantConfig {
             rate_damping: 8.0,
             linear_drag: 0.05,
             quadratic_drag: 0.03,
+            body_linear_drag: [0.0; 3],
+            body_quadratic_drag: [0.0; 3],
             roll_rate_sign: 1.0,
             pitch_rate_sign: 1.0,
             yaw_rate_sign: -1.0,
@@ -111,15 +117,36 @@ impl DronePlantState {
         self.rotmat_world_from_body =
             orthonormalize(mat3_mul(self.rotmat_world_from_body, delta_rot));
 
-        let thrust_weight = (throttle / cfg.hover_throttle).clamp(0.0, cfg.max_thrust_weight);
+        let thrust_input = shaped_throttle(throttle, cfg.thrust_curve);
+        let hover_input = shaped_throttle(cfg.hover_throttle, cfg.thrust_curve).max(1e-4);
+        let thrust_weight = (thrust_input / hover_input).clamp(0.0, cfg.max_thrust_weight);
         let thrust = cfg.mass * cfg.gravity * thrust_weight;
         let body_up_world = mat3_mul_vec3(self.rotmat_world_from_body, [0.0, 0.0, 1.0]);
         let speed = norm3(self.vel_world);
-        let drag = [
+        let mut drag = [
             self.vel_world[0] * cfg.linear_drag + self.vel_world[0] * speed * cfg.quadratic_drag,
             self.vel_world[1] * cfg.linear_drag + self.vel_world[1] * speed * cfg.quadratic_drag,
             self.vel_world[2] * cfg.linear_drag + self.vel_world[2] * speed * cfg.quadratic_drag,
         ];
+        if cfg.body_linear_drag.iter().any(|v| *v != 0.0)
+            || cfg.body_quadratic_drag.iter().any(|v| *v != 0.0)
+        {
+            let vel_body = mat3_t_mul_vec3(self.rotmat_world_from_body, self.vel_world);
+            let body_drag = [
+                vel_body[0] * cfg.body_linear_drag[0]
+                    + vel_body[0] * vel_body[0].abs() * cfg.body_quadratic_drag[0],
+                vel_body[1] * cfg.body_linear_drag[1]
+                    + vel_body[1] * vel_body[1].abs() * cfg.body_quadratic_drag[1],
+                vel_body[2] * cfg.body_linear_drag[2]
+                    + vel_body[2] * vel_body[2].abs() * cfg.body_quadratic_drag[2],
+            ];
+            let body_drag_world = mat3_mul_vec3(self.rotmat_world_from_body, body_drag);
+            drag = [
+                drag[0] + body_drag_world[0],
+                drag[1] + body_drag_world[1],
+                drag[2] + body_drag_world[2],
+            ];
+        }
         let accel_world = [
             body_up_world[0] * (thrust / cfg.mass) - drag[0],
             body_up_world[1] * (thrust / cfg.mass) - drag[1],
@@ -149,9 +176,10 @@ impl DronePlantState {
 
 pub fn config_summary(cfg: &DronePlantConfig) -> String {
     format!(
-        "hover={:.5} thrust_w={:.3} rates=[{:.3},{:.3},{:.3}] signs=[{:+.0},{:+.0},{:+.0}] kp={:.3} damp={:.3} drag=[{:.4},{:.4}]",
+        "hover={:.5} thrust_w={:.3} thrust_curve={:.3} rates=[{:.3},{:.3},{:.3}] signs=[{:+.0},{:+.0},{:+.0}] kp={:.3} damp={:.3} drag=[{:.4},{:.4}] body_drag=[{:.3},{:.3},{:.3}] body_qdrag=[{:.3},{:.3},{:.3}]",
         cfg.hover_throttle,
         cfg.max_thrust_weight,
+        cfg.thrust_curve,
         cfg.max_roll_rate,
         cfg.max_pitch_rate,
         cfg.max_yaw_rate,
@@ -162,7 +190,19 @@ pub fn config_summary(cfg: &DronePlantConfig) -> String {
         cfg.rate_damping,
         cfg.linear_drag,
         cfg.quadratic_drag,
+        cfg.body_linear_drag[0],
+        cfg.body_linear_drag[1],
+        cfg.body_linear_drag[2],
+        cfg.body_quadratic_drag[0],
+        cfg.body_quadratic_drag[1],
+        cfg.body_quadratic_drag[2],
     )
+}
+
+fn shaped_throttle(throttle: f32, curve: f32) -> f32 {
+    let throttle = throttle.clamp(0.0, 1.0);
+    let curve = curve.clamp(-0.95, 0.95);
+    ((1.0 - curve) * throttle + curve * throttle * throttle).max(0.0)
 }
 
 pub fn rotmat_distance_rad(lhs: [f32; 9], rhs: [f32; 9]) -> f32 {

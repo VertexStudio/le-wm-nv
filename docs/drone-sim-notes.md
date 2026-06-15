@@ -2,12 +2,14 @@
 
 ## Plant fitting experiments
 
-The gate-segment oracle replay is the current plant-fidelity check:
+The gate-segment oracle replay is the current plant-fidelity check. It replays
+recorded expert actions through the Bevy plant and compares against the dataset
+trajectory. This isolates plant fidelity from LeWM planning quality.
 
 ```text
 start_row=1020
 gate_order=1,4,3,2
-oracle_replay_rows=300
+oracle_replay_rows=260
 gate_radius=0.85
 ```
 
@@ -15,16 +17,17 @@ Baseline analytic plant:
 
 ```text
 gates=2/4
-pos_rmse=8.434m
-final_pos_err=9.371m
+pos_rmse=7.587m
+final_pos_err=15.112m
 best_gate_dists=[1:0.84,2:0.85,3:2.69,4:inf]
 ```
 
-Replay-aligned scalar fit found:
+Replay-aligned aggressive plant fit found:
 
 ```text
 --hover-throttle 0.20000
 --max-thrust-weight 3.600
+--thrust-curve 0.000
 --max-roll-rate 8.0000
 --max-pitch-rate 12.0000
 --max-yaw-rate 10.0000
@@ -32,25 +35,30 @@ Replay-aligned scalar fit found:
 --rate-damping 8.000
 --linear-drag 0.3000
 --quadratic-drag 0.0300
+--body-linear-drag 0.0500,0.8000,0.0000
+--body-quadratic-drag 0.0300,0.1000,0.0000
 ```
 
 Oracle replay with those flags:
 
 ```text
-gates=3/4
-pos_rmse=2.964m
-final_pos_err=3.728m
-best_gate_dists=[1:0.84,2:0.85,3:0.85,4:1.07]
+gates=4/4
+finished=true
+pos_rmse=2.712m
+final_pos_err=1.247m
+best_gate_dists=[1:0.84,2:0.84,3:0.85,4:0.85]
 ```
 
-That is a real expert-action replay improvement, but it is not yet a better
-closed-loop LeWM planner setting. With the same planner budget, the default
-plant reached 2/4 gates while this fitted scalar plant reached 1/4 gates.
+This is a real plant-fidelity improvement: expert actions now complete the lap
+in the plant. It is not yet a closed-loop LeWM planner success. With the current
+pose12 model and `h6/s64/i1` planner, the fitted plant still reaches 2/4 gates.
+With a larger `h8/s256/i3` planner budget, default plant reached 3/4 while the
+fitted plant reached 2/4. That means plant fidelity improved, but current
+closed-loop behavior is still dominated by LeWM planner/model action selection.
 
-Tested and rejected: cubic stick curves and quadratic throttle curves. A sweep
-around the fitted scalar plant did not improve the oracle replay; the best
-setting stayed equivalent to the original linear channel mapping. Those curve
-knobs were intentionally not kept in the runtime plant.
+The runtime plant keeps the added terms with neutral defaults, so existing
+simulator behavior does not change unless these flags are passed. Sign flips
+remain opt-in in the fitter and are not part of the accepted plant.
 
 ## LeWM expert-action latent rollout
 

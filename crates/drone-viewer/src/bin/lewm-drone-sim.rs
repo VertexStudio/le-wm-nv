@@ -372,6 +372,7 @@ impl Args {
                 "--max-thrust-weight" => {
                     args.dynamics.max_thrust_weight = next_parse(&mut iter, &arg)?
                 }
+                "--thrust-curve" => args.dynamics.thrust_curve = next_parse(&mut iter, &arg)?,
                 "--max-roll-rate" => args.dynamics.max_roll_rate = next_parse(&mut iter, &arg)?,
                 "--max-pitch-rate" => args.dynamics.max_pitch_rate = next_parse(&mut iter, &arg)?,
                 "--max-yaw-rate" => args.dynamics.max_yaw_rate = next_parse(&mut iter, &arg)?,
@@ -379,6 +380,12 @@ impl Args {
                 "--rate-damping" => args.dynamics.rate_damping = next_parse(&mut iter, &arg)?,
                 "--linear-drag" => args.dynamics.linear_drag = next_parse(&mut iter, &arg)?,
                 "--quadratic-drag" => args.dynamics.quadratic_drag = next_parse(&mut iter, &arg)?,
+                "--body-linear-drag" => {
+                    args.dynamics.body_linear_drag = vec3_array(next_vec3(&mut iter, &arg)?)
+                }
+                "--body-quadratic-drag" => {
+                    args.dynamics.body_quadratic_drag = vec3_array(next_vec3(&mut iter, &arg)?)
+                }
                 "--max-trail" => args.max_trail = next_parse(&mut iter, &arg)?,
                 "--camera-distance" => args.camera.distance = next_parse(&mut iter, &arg)?,
                 "--camera-height" => args.camera.height = next_parse(&mut iter, &arg)?,
@@ -468,6 +475,11 @@ impl Args {
             "--max-thrust-weight must be at least 1.0"
         );
         ensure!(
+            self.dynamics.thrust_curve.is_finite()
+                && (-0.95..=0.95).contains(&self.dynamics.thrust_curve),
+            "--thrust-curve must be finite and in [-0.95, 0.95]"
+        );
+        ensure!(
             self.dynamics.max_roll_rate > 0.0,
             "--max-roll-rate must be positive"
         );
@@ -478,6 +490,20 @@ impl Args {
         ensure!(
             self.dynamics.max_yaw_rate > 0.0,
             "--max-yaw-rate must be positive"
+        );
+        ensure!(
+            self.dynamics
+                .body_linear_drag
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0),
+            "--body-linear-drag values must be finite and non-negative"
+        );
+        ensure!(
+            self.dynamics
+                .body_quadratic_drag
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0),
+            "--body-quadratic-drag values must be finite and non-negative"
         );
         ensure!(self.max_trail > 1, "--max-trail must be greater than 1");
         ensure!(
@@ -597,6 +623,7 @@ fn print_help() {
            --gravity <m/s^2>             default 9.81\n\
            --hover-throttle <0..1>       default 0.2\n\
            --max-thrust-weight <ratio>   default 5.73\n\
+           --thrust-curve <mix>           default 0, positive emphasizes high throttle\n\
            --max-roll-rate <rad/s>       default 14\n\
            --max-pitch-rate <rad/s>      default 12\n\
            --max-yaw-rate <rad/s>        default 10\n\
@@ -604,6 +631,8 @@ fn print_help() {
            --rate-damping <gain>         default 8\n\
            --linear-drag <gain>          default 0.05\n\
            --quadratic-drag <gain>       default 0.03\n\
+           --body-linear-drag <x,y,z>    default 0,0,0 body-frame drag\n\
+           --body-quadratic-drag <x,y,z> default 0,0,0 body-frame quadratic drag\n\
          \n\
          Camera options:\n\
            --camera-distance <meters>    default 7\n\
@@ -662,6 +691,7 @@ struct DynamicsConfig {
     gravity: f32,
     hover_throttle: f32,
     max_thrust_weight: f32,
+    thrust_curve: f32,
     max_roll_rate: f32,
     max_pitch_rate: f32,
     max_yaw_rate: f32,
@@ -669,6 +699,8 @@ struct DynamicsConfig {
     rate_damping: f32,
     linear_drag: f32,
     quadratic_drag: f32,
+    body_linear_drag: [f32; 3],
+    body_quadratic_drag: [f32; 3],
 }
 
 impl Default for DynamicsConfig {
@@ -681,6 +713,7 @@ impl Default for DynamicsConfig {
             gravity: 9.81,
             hover_throttle: 0.2,
             max_thrust_weight: 5.73,
+            thrust_curve: 0.0,
             max_roll_rate: 14.0,
             max_pitch_rate: 12.0,
             max_yaw_rate: 10.0,
@@ -688,6 +721,8 @@ impl Default for DynamicsConfig {
             rate_damping: 8.0,
             linear_drag: 0.05,
             quadratic_drag: 0.03,
+            body_linear_drag: [0.0; 3],
+            body_quadratic_drag: [0.0; 3],
         }
     }
 }
@@ -700,6 +735,7 @@ impl DynamicsConfig {
             gravity: self.gravity,
             hover_throttle: self.hover_throttle,
             max_thrust_weight: self.max_thrust_weight,
+            thrust_curve: self.thrust_curve,
             max_roll_rate: self.max_roll_rate,
             max_pitch_rate: self.max_pitch_rate,
             max_yaw_rate: self.max_yaw_rate,
@@ -707,6 +743,8 @@ impl DynamicsConfig {
             rate_damping: self.rate_damping,
             linear_drag: self.linear_drag,
             quadratic_drag: self.quadratic_drag,
+            body_linear_drag: self.body_linear_drag,
+            body_quadratic_drag: self.body_quadratic_drag,
             ..DronePlantConfig::default()
         }
     }

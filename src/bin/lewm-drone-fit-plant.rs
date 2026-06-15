@@ -8,6 +8,9 @@ use le_wm_nv::{
     drone_plant::{DronePlantConfig, DronePlantState, config_summary, rotmat_distance_rad},
 };
 
+const REPLAY_MISSED_GATE_COST: f32 = 1_000.0;
+const REPLAY_GATE_DISTANCE_COST: f32 = 5.0;
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     let dataset = DroneRacingDataset::open(
@@ -21,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     )?;
     let frames = load_frames(&dataset)?;
     let windows = collect_windows(&frames, args.window_steps, args.stride, args.max_windows)?;
-    let replay = load_replay_config(&args, &frames)?;
+    let replays = load_replay_configs(&args, &frames)?;
     ensure!(
         !windows.is_empty(),
         "no valid windows found for window_steps={} stride={}",
@@ -45,9 +48,9 @@ fn main() -> anyhow::Result<()> {
     };
     let default_score = score_config(&best, &frames, &windows, args.window_steps);
     print_named_score("default", &best, default_score);
-    if let Some(replay) = replay.as_ref() {
+    for replay in &replays {
         print_named_replay_score(
-            "default-replay",
+            &format!("default-replay-{}", replay.label),
             &best,
             score_replay_config(&best, &frames, replay),
         );
@@ -67,22 +70,16 @@ fn main() -> anyhow::Result<()> {
     };
     let regression_score = score_config(&regression, &frames, &windows, args.window_steps);
     print_named_score("single-step-regression", &regression, regression_score);
-    if let Some(replay) = replay.as_ref() {
+    for replay in &replays {
         print_named_replay_score(
-            "single-step-regression-replay",
+            &format!("single-step-regression-replay-{}", replay.label),
             &regression,
             score_replay_config(&regression, &frames, replay),
         );
     }
 
-    let mut best_total = fit_total(&best, &frames, &windows, args.window_steps, replay.as_ref());
-    let regression_total = fit_total(
-        &regression,
-        &frames,
-        &windows,
-        args.window_steps,
-        replay.as_ref(),
-    );
+    let mut best_total = fit_total(&best, &frames, &windows, args.window_steps, &replays);
+    let regression_total = fit_total(&regression, &frames, &windows, args.window_steps, &replays);
     if regression_total < best_total {
         best = regression;
         best_total = regression_total;
@@ -104,7 +101,7 @@ fn main() -> anyhow::Result<()> {
             cfg.roll_rate_sign = roll;
             cfg.pitch_rate_sign = pitch;
             cfg.yaw_rate_sign = yaw;
-            let total = fit_total(&cfg, &frames, &windows, args.window_steps, replay.as_ref());
+            let total = fit_total(&cfg, &frames, &windows, args.window_steps, &replays);
             if total < best_total {
                 println!(
                     "sign search improved total {:.6} -> {:.6}",
@@ -116,117 +113,51 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    for pass in 0..args.passes {
-        let before = best_total;
-        best_total = tune_scalar(
-            "hover_throttle",
-            best_total,
-            &mut best,
-            &[0.20, 0.22, 0.24, 0.2544, 0.28, 0.305, 0.33, 0.36],
-            |cfg, value| cfg.hover_throttle = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        best_total = tune_scalar(
-            "max_thrust_weight",
-            best_total,
-            &mut best,
-            &[1.4, 1.8, 2.2, 2.8, 3.6, 4.6, 5.73],
-            |cfg, value| cfg.max_thrust_weight = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        best_total = tune_scalar(
-            "max_roll_rate",
-            best_total,
-            &mut best,
-            &[4.0, 6.0, 8.0, 10.0, 12.2572, 14.0, 16.0],
-            |cfg, value| cfg.max_roll_rate = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        best_total = tune_scalar(
-            "max_pitch_rate",
-            best_total,
-            &mut best,
-            &[4.0, 6.0, 8.0, 9.9288, 12.0, 14.0, 16.0],
-            |cfg, value| cfg.max_pitch_rate = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        best_total = tune_scalar(
-            "max_yaw_rate",
-            best_total,
-            &mut best,
-            &[3.0, 5.0, 7.8290, 10.0, 12.0, 14.0, 16.0],
-            |cfg, value| cfg.max_yaw_rate = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        best_total = tune_scalar(
-            "rate_kp",
-            best_total,
-            &mut best,
-            &[6.0, 10.0, 16.0, 22.0, 32.0, 48.0, 64.0],
-            |cfg, value| cfg.rate_kp = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        best_total = tune_scalar(
-            "rate_damping",
-            best_total,
-            &mut best,
-            &[0.25, 0.75, 1.5, 2.5, 4.0, 6.0, 8.0],
-            |cfg, value| cfg.rate_damping = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        best_total = tune_scalar(
-            "linear_drag",
-            best_total,
-            &mut best,
-            &[0.0, 0.05, 0.10, 0.18, 0.30, 0.50, 0.80],
-            |cfg, value| cfg.linear_drag = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        best_total = tune_scalar(
-            "quadratic_drag",
-            best_total,
-            &mut best,
-            &[0.0, 0.01, 0.03, 0.06, 0.10, 0.20],
-            |cfg, value| cfg.quadratic_drag = value,
-            &frames,
-            &windows,
-            args.window_steps,
-            replay.as_ref(),
-        );
-        println!(
-            "pass={} total={:.6} delta={:+.6}",
-            pass + 1,
-            best_total,
-            best_total - before
-        );
-        if (before - best_total).abs() < 1e-5 {
-            break;
+    if replays.len() > 1 {
+        for replay in &replays {
+            let replay_slice = std::slice::from_ref(replay);
+            for (seed_name, seed) in [("default", best), ("single-step-regression", regression)] {
+                let seed_total =
+                    fit_total(&seed, &frames, &windows, args.window_steps, replay_slice);
+                let (candidate, replay_total) = coordinate_fit(
+                    seed_name,
+                    seed,
+                    seed_total,
+                    args.passes,
+                    &frames,
+                    &windows,
+                    args.window_steps,
+                    replay_slice,
+                );
+                let candidate_total =
+                    fit_total(&candidate, &frames, &windows, args.window_steps, &replays);
+                println!(
+                    "  replay{} seed {seed_name} replay_total={:.6} joint_total={:.6}",
+                    replay.label, replay_total, candidate_total
+                );
+                if candidate_total < best_total {
+                    println!(
+                        "  replay{} seed improved joint total {:.6} -> {:.6}",
+                        replay.label, best_total, candidate_total
+                    );
+                    best = candidate;
+                    best_total = candidate_total;
+                }
+            }
         }
     }
+    let (fit_best, fit_total_value) = coordinate_fit(
+        "joint",
+        best,
+        best_total,
+        args.passes,
+        &frames,
+        &windows,
+        args.window_steps,
+        &replays,
+    );
+    best = fit_best;
+    println!("coordinate-fit selected total={fit_total_value:.6}");
 
     println!();
     print_named_score(
@@ -234,9 +165,9 @@ fn main() -> anyhow::Result<()> {
         &best,
         score_config(&best, &frames, &windows, args.window_steps),
     );
-    if let Some(replay) = replay.as_ref() {
+    for replay in &replays {
         print_named_replay_score(
-            "best-replay",
+            &format!("best-replay-{}", replay.label),
             &best,
             score_replay_config(&best, &frames, replay),
         );
@@ -244,9 +175,10 @@ fn main() -> anyhow::Result<()> {
     println!();
     println!("simulator flags:");
     println!(
-        "  --hover-throttle {:.5} --max-thrust-weight {:.3} --max-roll-rate {:.4} --max-pitch-rate {:.4} --max-yaw-rate {:.4} --rate-kp {:.3} --rate-damping {:.3} --linear-drag {:.4} --quadratic-drag {:.4}",
+        "  --hover-throttle {:.5} --max-thrust-weight {:.3} --thrust-curve {:.3} --max-roll-rate {:.4} --max-pitch-rate {:.4} --max-yaw-rate {:.4} --rate-kp {:.3} --rate-damping {:.3} --linear-drag {:.4} --quadratic-drag {:.4} --body-linear-drag {:.4},{:.4},{:.4} --body-quadratic-drag {:.4},{:.4},{:.4}",
         best.hover_throttle,
         best.max_thrust_weight,
+        best.thrust_curve,
         best.max_roll_rate,
         best.max_pitch_rate,
         best.max_yaw_rate,
@@ -254,6 +186,12 @@ fn main() -> anyhow::Result<()> {
         best.rate_damping,
         best.linear_drag,
         best.quadratic_drag,
+        best.body_linear_drag[0],
+        best.body_linear_drag[1],
+        best.body_linear_drag[2],
+        best.body_quadratic_drag[0],
+        best.body_quadratic_drag[1],
+        best.body_quadratic_drag[2],
     );
     if best.roll_rate_sign != DronePlantConfig::default().roll_rate_sign
         || best.pitch_rate_sign != DronePlantConfig::default().pitch_rate_sign
@@ -277,6 +215,7 @@ struct Args {
     passes: usize,
     replay_start_row: Option<usize>,
     replay_rows: usize,
+    replay_segments: Vec<ReplaySpec>,
     gates: Option<PathBuf>,
     gate_episode: Option<i64>,
     gate_order: Option<Vec<usize>>,
@@ -295,6 +234,7 @@ impl Args {
             passes: 3,
             replay_start_row: None,
             replay_rows: 0,
+            replay_segments: Vec::new(),
             gates: None,
             gate_episode: None,
             gate_order: None,
@@ -315,6 +255,10 @@ impl Args {
                 "--passes" => args.passes = next_parse(&mut iter, &arg)?,
                 "--replay-start-row" => args.replay_start_row = Some(next_parse(&mut iter, &arg)?),
                 "--replay-rows" => args.replay_rows = next_parse(&mut iter, &arg)?,
+                "--replay-segment" => {
+                    args.replay_segments
+                        .push(parse_replay_segment(&mut iter, &arg)?);
+                }
                 "--gates" => {
                     args.gates = Some(PathBuf::from(
                         iter.next().context("missing value after --gates")?,
@@ -338,6 +282,10 @@ impl Args {
         ensure!(
             args.replay_rows > 0 || args.replay_start_row.is_none(),
             "--replay-start-row requires --replay-rows"
+        );
+        ensure!(
+            args.replay_start_row.is_none() || args.replay_segments.is_empty(),
+            "use either --replay-start-row/--replay-rows or --replay-segment, not both"
         );
         ensure!(args.gate_radius > 0.0, "--gate-radius must be positive");
         Ok(args)
@@ -389,6 +337,56 @@ fn parse_gate_order(
     Ok(order)
 }
 
+fn parse_replay_segment(
+    iter: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> anyhow::Result<ReplaySpec> {
+    let value = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing value after {flag}"))?;
+    let parts = value.split(':').collect::<Vec<_>>();
+    ensure!(
+        parts.len() == 2 || parts.len() == 3,
+        "{flag} expects start:rows or start:rows:gate-order, got `{value}`"
+    );
+    let start_row = parts[0]
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid start row in {flag}: `{value}`"))?;
+    let rows = parts[1]
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid row count in {flag}: `{value}`"))?;
+    ensure!(rows > 0, "{flag} row count must be positive");
+    let gate_order = if parts.len() == 3 {
+        Some(parse_gate_order_value(parts[2])?)
+    } else {
+        None
+    };
+    Ok(ReplaySpec {
+        start_row,
+        rows,
+        gate_order,
+    })
+}
+
+fn parse_gate_order_value(value: &str) -> anyhow::Result<Vec<usize>> {
+    let order = value
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid gate index in replay gate order: {part}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure!(!order.is_empty(), "replay gate order must not be empty");
+    ensure!(
+        order.iter().all(|idx| *idx > 0),
+        "replay gate order uses 1-based indexes"
+    );
+    Ok(order)
+}
+
 fn print_help() {
     println!(
         "Usage: lewm-drone-fit-plant [--dataset-dir <dir>] [--window-steps <n>] [--max-windows <n>] [--stride <n>] [--sim-hz <hz>] [--passes <n>]\n\
@@ -397,6 +395,8 @@ fn print_help() {
          from real initial poses and minimizing short-horizon pose trajectory error.\n\
          Add --replay-start-row and --replay-rows to rank candidates by one long\n\
          oracle replay segment instead of the sampled short-window score.\n\
+         Use repeated --replay-segment <start:rows:order> to fit multiple gate\n\
+         segments together, for example 1020:260:1,4,3,2 and 1081:160:4,3.\n\
          Optional gate scoring: --gates <path> --gate-episode <idx> --gate-order <1,4,3,2> --gate-radius <m>.\n\
          Sign flips are not searched unless --search-signs is passed.\n\
          This does not train or modify LeWM."
@@ -409,7 +409,15 @@ struct Window {
 }
 
 #[derive(Debug, Clone)]
+struct ReplaySpec {
+    start_row: usize,
+    rows: usize,
+    gate_order: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
 struct ReplayConfig {
+    label: String,
     start_row: usize,
     rows: usize,
     gate_centers: Vec<[f32; 3]>,
@@ -424,34 +432,62 @@ fn load_frames(dataset: &DroneRacingDataset) -> anyhow::Result<Vec<DroneFrame>> 
     Ok(frames)
 }
 
-fn load_replay_config(args: &Args, frames: &[DroneFrame]) -> anyhow::Result<Option<ReplayConfig>> {
-    let Some(start_row) = args.replay_start_row else {
-        return Ok(None);
+fn load_replay_configs(args: &Args, frames: &[DroneFrame]) -> anyhow::Result<Vec<ReplayConfig>> {
+    let specs = if args.replay_segments.is_empty() {
+        if let Some(start_row) = args.replay_start_row {
+            vec![ReplaySpec {
+                start_row,
+                rows: args.replay_rows,
+                gate_order: args.gate_order.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
+    } else {
+        args.replay_segments.clone()
     };
+    specs
+        .iter()
+        .enumerate()
+        .map(|(idx, spec)| load_replay_config(args, frames, idx, spec))
+        .collect()
+}
+
+fn load_replay_config(
+    args: &Args,
+    frames: &[DroneFrame],
+    idx: usize,
+    spec: &ReplaySpec,
+) -> anyhow::Result<ReplayConfig> {
     ensure!(
-        start_row + args.replay_rows < frames.len(),
+        spec.start_row + spec.rows < frames.len(),
         "replay rows {}..{} exceed dataset rows {}",
-        start_row,
-        start_row + args.replay_rows,
+        spec.start_row,
+        spec.start_row + spec.rows,
         frames.len()
     );
-    let gate_centers = load_gate_centers(args)?;
+    let gate_centers = load_gate_centers(args, spec.gate_order.as_ref())?;
     println!(
-        "replay start_row={} rows={} gates={} radius={:.3}",
-        start_row,
-        args.replay_rows,
+        "replay{} start_row={} rows={} gates={} radius={:.3}",
+        idx + 1,
+        spec.start_row,
+        spec.rows,
         gate_centers.len(),
         args.gate_radius
     );
-    Ok(Some(ReplayConfig {
-        start_row,
-        rows: args.replay_rows,
+    Ok(ReplayConfig {
+        label: format!("{}", idx + 1),
+        start_row: spec.start_row,
+        rows: spec.rows,
         gate_centers,
         gate_radius: args.gate_radius,
-    }))
+    })
 }
 
-fn load_gate_centers(args: &Args) -> anyhow::Result<Vec<[f32; 3]>> {
+fn load_gate_centers(
+    args: &Args,
+    order_override: Option<&Vec<usize>>,
+) -> anyhow::Result<Vec<[f32; 3]>> {
     let Some(path) = args.gates.as_ref() else {
         return Ok(Vec::new());
     };
@@ -477,7 +513,7 @@ fn load_gate_centers(args: &Args) -> anyhow::Result<Vec<[f32; 3]>> {
             .first()
             .with_context(|| format!("no flights in gates {}", path.display()))?
     };
-    let selected = if let Some(order) = args.gate_order.as_ref() {
+    let selected = if let Some(order) = order_override.or(args.gate_order.as_ref()) {
         order
             .iter()
             .map(|idx| {
@@ -574,12 +610,16 @@ fn fit_total(
     frames: &[DroneFrame],
     windows: &[Window],
     window_steps: usize,
-    replay: Option<&ReplayConfig>,
+    replays: &[ReplayConfig],
 ) -> f32 {
-    if let Some(replay) = replay {
-        score_replay_config(cfg, frames, replay).total
-    } else {
+    if replays.is_empty() {
         score_config(cfg, frames, windows, window_steps).total
+    } else {
+        replays
+            .iter()
+            .map(|replay| score_replay_config(cfg, frames, replay).total)
+            .sum::<f32>()
+            / replays.len() as f32
     }
 }
 
@@ -649,8 +689,8 @@ fn score_replay_config(
     let total = if replay.gate_centers.is_empty() {
         pos_rmse + 2.0 * final_pos_err + 0.35 * rot_rmse_rad
     } else {
-        100.0 * missed_gates as f32
-            + 5.0 * gate_distance_cost
+        REPLAY_MISSED_GATE_COST * missed_gates as f32
+            + REPLAY_GATE_DISTANCE_COST * gate_distance_cost
             + pos_rmse
             + 2.0 * final_pos_err
             + 0.35 * rot_rmse_rad
@@ -734,6 +774,166 @@ fn score_config(
     }
 }
 
+fn coordinate_fit(
+    label: &str,
+    mut best: DronePlantConfig,
+    mut best_total: f32,
+    passes: usize,
+    frames: &[DroneFrame],
+    windows: &[Window],
+    window_steps: usize,
+    replays: &[ReplayConfig],
+) -> (DronePlantConfig, f32) {
+    println!("coordinate-fit {label} start_total={best_total:.6}");
+    for pass in 0..passes {
+        let before = best_total;
+        best_total = tune_scalar(
+            "hover_throttle",
+            best_total,
+            &mut best,
+            &[0.20, 0.22, 0.24, 0.2544, 0.28, 0.305, 0.33, 0.36],
+            |cfg, value| cfg.hover_throttle = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "max_thrust_weight",
+            best_total,
+            &mut best,
+            &[1.4, 1.8, 2.2, 2.8, 3.6, 4.6, 5.73, 7.0, 8.5],
+            |cfg, value| cfg.max_thrust_weight = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "thrust_curve",
+            best_total,
+            &mut best,
+            &[-0.40, -0.20, 0.0, 0.25, 0.50, 0.75, 0.90],
+            |cfg, value| cfg.thrust_curve = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "max_roll_rate",
+            best_total,
+            &mut best,
+            &[4.0, 6.0, 8.0, 10.0, 12.2572, 14.0, 16.0, 18.0, 22.0],
+            |cfg, value| cfg.max_roll_rate = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "max_pitch_rate",
+            best_total,
+            &mut best,
+            &[4.0, 6.0, 8.0, 9.9288, 12.0, 14.0, 16.0, 18.0, 22.0],
+            |cfg, value| cfg.max_pitch_rate = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "max_yaw_rate",
+            best_total,
+            &mut best,
+            &[3.0, 5.0, 7.8290, 10.0, 12.0, 14.0, 16.0, 20.0],
+            |cfg, value| cfg.max_yaw_rate = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "rate_kp",
+            best_total,
+            &mut best,
+            &[6.0, 10.0, 16.0, 22.0, 32.0, 48.0, 64.0],
+            |cfg, value| cfg.rate_kp = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "rate_damping",
+            best_total,
+            &mut best,
+            &[0.25, 0.75, 1.5, 2.5, 4.0, 6.0, 8.0],
+            |cfg, value| cfg.rate_damping = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "linear_drag",
+            best_total,
+            &mut best,
+            &[0.0, 0.05, 0.10, 0.18, 0.30, 0.50, 0.80],
+            |cfg, value| cfg.linear_drag = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        best_total = tune_scalar(
+            "quadratic_drag",
+            best_total,
+            &mut best,
+            &[0.0, 0.01, 0.03, 0.06, 0.10, 0.20],
+            |cfg, value| cfg.quadratic_drag = value,
+            frames,
+            windows,
+            window_steps,
+            replays,
+        );
+        for axis in 0..3 {
+            best_total = tune_scalar(
+                &format!("body_linear_drag_{axis}"),
+                best_total,
+                &mut best,
+                &[0.0, 0.05, 0.10, 0.18, 0.30, 0.50, 0.80, 1.20],
+                |cfg, value| cfg.body_linear_drag[axis] = value,
+                frames,
+                windows,
+                window_steps,
+                replays,
+            );
+            best_total = tune_scalar(
+                &format!("body_quadratic_drag_{axis}"),
+                best_total,
+                &mut best,
+                &[0.0, 0.01, 0.03, 0.06, 0.10, 0.20, 0.35],
+                |cfg, value| cfg.body_quadratic_drag[axis] = value,
+                frames,
+                windows,
+                window_steps,
+                replays,
+            );
+        }
+        println!(
+            "  {label} pass={} total={:.6} delta={:+.6}",
+            pass + 1,
+            best_total,
+            best_total - before
+        );
+        if (before - best_total).abs() < 1e-5 {
+            break;
+        }
+    }
+    (best, best_total)
+}
+
 fn tune_scalar(
     name: &str,
     current_total: f32,
@@ -743,14 +943,14 @@ fn tune_scalar(
     frames: &[DroneFrame],
     windows: &[Window],
     window_steps: usize,
-    replay: Option<&ReplayConfig>,
+    replays: &[ReplayConfig],
 ) -> f32 {
     let mut best_cfg = *best;
     let mut best_total = current_total;
     for value in values {
         let mut cfg = *best;
         set(&mut cfg, *value);
-        let total = fit_total(&cfg, frames, windows, window_steps, replay);
+        let total = fit_total(&cfg, frames, windows, window_steps, replays);
         if total < best_total {
             best_total = total;
             best_cfg = cfg;
