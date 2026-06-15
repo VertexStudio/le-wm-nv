@@ -2,6 +2,7 @@ use std::{env, fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, ensure};
 use bevy::{input::mouse::MouseWheel, prelude::*};
+use bevy_camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState};
 use candle::{DType, Device as CandleDevice, Tensor};
 use le_wm_nv::{
     checkpoint,
@@ -26,6 +27,8 @@ const KEYBOARD_CLIMB_RATE_MPS: f32 = 2.0;
 const KEYBOARD_VERTICAL_VEL_KP: f32 = 0.05;
 const KEYBOARD_THROTTLE_SLEW: f32 = 1.5;
 const PLANNER_ACTION_STD_LIMIT: f32 = 3.0;
+const GATE_ENTRY_LEAD_STEPS: usize = 12;
+const GATE_REFERENCE_SEARCH_LIMIT_STEPS: usize = 450;
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
@@ -48,19 +51,23 @@ fn main() -> anyhow::Result<()> {
     app.insert_resource(args.camera)
         .insert_resource(SimControl::new(args.dynamics.hover_throttle))
         .insert_resource(sim_state)
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "le-wm-nv Drone Dynamics Sim".to_string(),
-                resolution: (1280, 800).into(),
+        .add_plugins((
+            DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "le-wm-nv Drone Dynamics Sim".to_string(),
+                    resolution: (1280, 800).into(),
+                    ..default()
+                }),
                 ..default()
             }),
-            ..default()
-        }))
+            FreeCameraPlugin,
+        ))
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
                 update_controls,
+                update_free_camera_state,
                 step_simulation,
                 update_drone_mesh,
                 update_follow_camera,
@@ -463,8 +470,9 @@ fn print_help() {
          Controls:\n\
            W/S forward/back tilt, A/D left/right tilt, Q/E yaw left/right, R/F climb/descent\n\
            L toggles LeWM control when loaded\n\
-           Z level roll/pitch/yaw, X hover throttle now, P pause, Backspace reset\n\
-           mouse wheel or [/] camera distance, 3/4 camera height, 1/2 camera spring"
+           Z level roll/pitch/yaw, X hover throttle now, P pause/free camera, Backspace reset\n\
+           running: mouse wheel or [/] camera distance, 3/4 camera height, 1/2 camera spring\n\
+           paused: Bevy FreeCamera controls, WASD/QE move, Shift fast, right mouse or M look"
     );
 }
 
@@ -981,26 +989,30 @@ impl GateLoop {
             "reference dataset has no rows for episode_idx={}",
             flight.episode_idx
         );
-        let loaded_gates = flight
-            .gates
-            .iter()
-            .map(|spec| GateTarget::from_spec(spec, &reference_dataset, &reference_rows))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let gates = if let Some(order) = cfg.order.as_ref() {
+        let gate_specs = if let Some(order) = cfg.order.as_ref() {
             order
                 .iter()
                 .map(|idx| {
-                    loaded_gates.get(idx - 1).cloned().with_context(|| {
+                    flight.gates.get(idx - 1).cloned().with_context(|| {
                         format!(
                             "--gate-order index {idx} is out of range for selected flight with {} gates",
-                            loaded_gates.len()
+                            flight.gates.len()
                         )
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?
         } else {
-            loaded_gates
+            flight.gates.clone()
         };
+        let start_row = start
+            .and_then(|start| start.row)
+            .unwrap_or_else(|| reference_rows[0]);
+        let gates = GateTarget::from_ordered_specs(
+            &gate_specs,
+            &reference_dataset,
+            &reference_rows,
+            start_row,
+        )?;
         ensure!(
             !gates.is_empty(),
             "selected flight {} has no gates",
@@ -1058,11 +1070,13 @@ impl GateLoop {
         }
     }
 
-    fn target_pose_for(&self, _pose: DronePose) -> TargetPose {
+    fn target_pose_for(&self, pose: DronePose) -> TargetPose {
         let gate = &self.gates[self.current_index];
-        TargetPose {
-            pos_world: gate.reference_pos_world,
-            rot_world_from_body: gate.reference_rot_world_from_body,
+        if (gate.entry_pos_world - pose.pos_world).length() > (self.pass_radius_m * 0.65).max(0.35)
+        {
+            gate.entry_pose()
+        } else {
+            gate.pass_pose()
         }
     }
 
@@ -1090,54 +1104,144 @@ impl GateLoop {
 struct GateTarget {
     name: String,
     center: Vec3,
-    normal: Vec3,
+    display_normal: Vec3,
     visual_radius_m: f32,
-    reference_row: usize,
-    reference_pos_world: Vec3,
-    reference_rot_world_from_body: Quat,
+    entry_row: usize,
+    pass_row: usize,
+    entry_pos_world: Vec3,
+    entry_rot_world_from_body: Quat,
+    pass_pos_world: Vec3,
+    pass_rot_world_from_body: Quat,
 }
 
 impl GateTarget {
-    fn from_spec(
+    fn from_ordered_specs(
+        specs: &[GateSpec],
+        dataset: &DroneRacingDataset,
+        reference_rows: &[usize],
+        start_row: usize,
+    ) -> anyhow::Result<Vec<Self>> {
+        let mut search_start = reference_rows
+            .iter()
+            .position(|row| *row >= start_row)
+            .unwrap_or(0);
+        let mut gates = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let gate = Self::from_spec_after(spec, dataset, reference_rows, search_start)?;
+            search_start = reference_rows
+                .iter()
+                .position(|row| *row > gate.pass_row)
+                .unwrap_or(reference_rows.len());
+            gates.push(gate);
+        }
+        Ok(gates)
+    }
+
+    fn from_spec_after(
         spec: &GateSpec,
         dataset: &DroneRacingDataset,
         reference_rows: &[usize],
+        search_start: usize,
     ) -> anyhow::Result<Self> {
         let center = Vec3::from_array(spec.center);
-        let (reference_row, reference_pose) =
-            closest_reference_pose(dataset, reference_rows, center)?;
+        let pass_idx =
+            closest_reference_index_after(dataset, reference_rows, center, search_start)?;
+        let pass_row = reference_rows[pass_idx];
+        let pass_pose = pose_at_row(dataset, pass_row)?;
+        let entry_idx = entry_reference_index(pass_idx, search_start);
+        let entry_row = reference_rows[entry_idx];
+        let entry_pose = pose_at_row(dataset, entry_row)?;
+        let display_normal = horizontal_unit(pass_pose.pos_world - entry_pose.pos_world)
+            .or_else(|| {
+                trajectory_direction(dataset, reference_rows, entry_idx, pass_idx)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or(Vec3::X);
         Ok(Self {
             name: spec.name.clone(),
             center,
-            normal: Vec3::from_array(spec.normal).normalize_or_zero(),
+            display_normal,
             visual_radius_m: spec.half_height.max(0.35),
-            reference_row,
-            reference_pos_world: reference_pose.pos_world,
-            reference_rot_world_from_body: reference_pose.rot_world_from_body,
+            entry_row,
+            pass_row,
+            entry_pos_world: entry_pose.pos_world,
+            entry_rot_world_from_body: entry_pose.rot_world_from_body,
+            pass_pos_world: pass_pose.pos_world,
+            pass_rot_world_from_body: pass_pose.rot_world_from_body,
         })
+    }
+
+    fn entry_pose(&self) -> TargetPose {
+        TargetPose {
+            pos_world: self.entry_pos_world,
+            rot_world_from_body: self.entry_rot_world_from_body,
+        }
+    }
+
+    fn pass_pose(&self) -> TargetPose {
+        TargetPose {
+            pos_world: self.pass_pos_world,
+            rot_world_from_body: self.pass_rot_world_from_body,
+        }
     }
 }
 
-fn closest_reference_pose(
+fn closest_reference_index_after(
     dataset: &DroneRacingDataset,
     rows: &[usize],
     center: Vec3,
-) -> anyhow::Result<(usize, DronePose)> {
+    search_start: usize,
+) -> anyhow::Result<usize> {
+    let start = search_start.min(rows.len().saturating_sub(1));
+    let end = (start + GATE_REFERENCE_SEARCH_LIMIT_STEPS).min(rows.len());
+    ensure!(start < end, "no reference rows left for gate pose");
     let mut best: Option<(usize, f32)> = None;
-    for &row in rows {
+    for (idx, &row) in rows[start..end].iter().enumerate() {
         let frame = dataset.frame(row)?;
         let pos = Vec3::from_array(frame.pos_world);
         let dist_sq = pos.distance_squared(center);
         if best.is_none_or(|(_, best_dist)| dist_sq < best_dist) {
-            best = Some((row, dist_sq));
+            best = Some((start + idx, dist_sq));
         }
     }
-    let (row, _) = best.context("no reference rows for gate pose")?;
+    let (idx, _) = best.context("no reference rows for gate pose")?;
+    Ok(idx)
+}
+
+fn entry_reference_index(pass_idx: usize, min_idx: usize) -> usize {
+    let min_idx = min_idx.min(pass_idx);
+    pass_idx.saturating_sub(GATE_ENTRY_LEAD_STEPS).max(min_idx)
+}
+
+fn pose_at_row(dataset: &DroneRacingDataset, row: usize) -> anyhow::Result<DronePose> {
     let frame = dataset.frame(row)?;
-    Ok((
-        row,
-        DronePose::from_plant(DronePlantState::from_frame(&frame)),
-    ))
+    Ok(DronePose::from_plant(DronePlantState::from_frame(&frame)))
+}
+
+fn trajectory_direction(
+    dataset: &DroneRacingDataset,
+    rows: &[usize],
+    start_idx: usize,
+    end_idx: usize,
+) -> anyhow::Result<Option<Vec3>> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let start_idx = start_idx.min(rows.len() - 1);
+    let end_idx = end_idx.min(rows.len() - 1);
+    if start_idx == end_idx {
+        return Ok(None);
+    }
+    let start = Vec3::from_array(dataset.frame(rows[start_idx])?.pos_world);
+    let end = Vec3::from_array(dataset.frame(rows[end_idx])?.pos_world);
+    Ok(horizontal_unit(end - start))
+}
+
+fn horizontal_unit(value: Vec3) -> Option<Vec3> {
+    let horizontal = Vec3::new(value.x, value.y, 0.0);
+    let len = horizontal.length();
+    (len > 1e-5).then_some(horizontal / len)
 }
 
 #[derive(Clone, Copy)]
@@ -1688,6 +1792,12 @@ fn setup(
     commands.spawn((
         Camera3d::default(),
         Transform::from_translation(pos).looking_at(focus, Vec3::Y),
+        FreeCamera {
+            walk_speed: 6.0,
+            run_speed: 24.0,
+            ..default()
+        },
+        disabled_free_camera_state(),
         FollowCamera,
     ));
 
@@ -1740,6 +1850,12 @@ fn setup(
     commands.spawn((Mesh3d(nose_mesh), MeshMaterial3d(nose_mat), DronePart::Nose));
 }
 
+fn disabled_free_camera_state() -> FreeCameraState {
+    let mut state = FreeCameraState::default();
+    state.enabled = false;
+    state
+}
+
 fn update_controls(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -1782,6 +1898,10 @@ fn update_controls(
     }
 
     let dt = time.delta_secs().max(1.0 / 240.0);
+    if control.paused {
+        return;
+    }
+
     let lewm_enabled = controller
         .as_ref()
         .is_some_and(|controller| controller.enabled);
@@ -1844,6 +1964,16 @@ fn update_controls(
     }
 }
 
+fn update_free_camera_state(
+    control: Res<SimControl>,
+    mut query: Query<&mut FreeCameraState, With<FollowCamera>>,
+) {
+    let Ok(mut state) = query.single_mut() else {
+        return;
+    };
+    state.enabled = control.paused;
+}
+
 fn step_simulation(
     time: Res<Time>,
     mut control: ResMut<SimControl>,
@@ -1901,11 +2031,14 @@ fn update_follow_camera(
     time: Res<Time>,
     state: Res<SimState>,
     camera_cfg: Res<FollowCameraConfig>,
-    mut query: Query<&mut Transform, With<FollowCamera>>,
+    mut query: Query<(&mut Transform, &FreeCameraState), With<FollowCamera>>,
 ) {
-    let Ok(mut transform) = query.single_mut() else {
+    let Ok((mut transform, free_camera)) = query.single_mut() else {
         return;
     };
+    if free_camera.enabled {
+        return;
+    }
     let drone_transform = transform_from_pose(&state.pose);
     let focus = drone_transform.translation + Vec3::Y * 0.35;
     let mut forward = drone_to_view_vec(state.pose.rot_world_from_body * Vec3::X);
@@ -2022,7 +2155,12 @@ fn draw_sim_overlays(
         .map(|gate_loop| {
             let active = gate_loop
                 .active_gate()
-                .map(|gate| format!("{}@row{}", gate.name, gate.reference_row))
+                .map(|gate| {
+                    format!(
+                        "{} entry={} pass={}",
+                        gate.name, gate.entry_row, gate.pass_row
+                    )
+                })
                 .unwrap_or_else(|| "done".to_string());
             format!(
                 " gate={} lap={}/{} passed={} flight={}",
@@ -2110,7 +2248,7 @@ fn draw_gate_cylinder(
     color: Color,
 ) {
     let center = view_vec3(gate.center);
-    let normal = drone_to_view_vec(gate.normal).normalize_or(Vec3::Z);
+    let normal = drone_to_view_vec(gate.display_normal).normalize_or(Vec3::Z);
     let radius = gate.visual_radius_m.max(pass_radius_m);
     let half_depth = if active { 0.18 } else { 0.10 };
     let front = center + normal * half_depth;
@@ -2131,9 +2269,13 @@ fn draw_gate_cylinder(
     if active {
         gizmos.arrow(center, center + normal * 0.75, color);
         draw_cross(gizmos, center, pass_radius_m * 0.35, color);
-        let reference_pos = view_vec3(gate.reference_pos_world);
-        gizmos.sphere(reference_pos, 0.08, Color::srgb(0.95, 0.95, 0.85));
-        draw_cross(gizmos, reference_pos, 0.20, Color::srgb(0.95, 0.95, 0.85));
+        let entry_pos = view_vec3(gate.entry_pos_world);
+        let pass_pos = view_vec3(gate.pass_pos_world);
+        gizmos.sphere(entry_pos, 0.08, Color::srgb(0.95, 0.95, 0.85));
+        draw_cross(gizmos, entry_pos, 0.20, Color::srgb(0.95, 0.95, 0.85));
+        gizmos.sphere(pass_pos, 0.08, Color::srgb(0.35, 1.0, 0.40));
+        draw_cross(gizmos, pass_pos, 0.20, Color::srgb(0.35, 1.0, 0.40));
+        gizmos.line(entry_pos, pass_pos, Color::srgb(0.35, 1.0, 0.40));
     }
 }
 
