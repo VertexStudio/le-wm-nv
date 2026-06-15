@@ -60,24 +60,18 @@ impl Args {
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--replay" => {
-                    replay = iter.next().map(PathBuf::from);
+                    replay =
+                        Some(PathBuf::from(iter.next().ok_or_else(|| {
+                            anyhow::anyhow!("missing value after --replay")
+                        })?));
                 }
                 other => anyhow::bail!("unknown argument `{other}`, expected --replay <path>"),
             }
         }
-        let replay = replay.unwrap_or_else(default_replay);
+        let replay = replay
+            .ok_or_else(|| anyhow::anyhow!("missing required --replay <path>; replay files must be generated explicitly from the current code"))?;
         Ok(Self { replay })
     }
-}
-
-fn default_replay() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".stable_worldmodel")
-        .join("le-wm-nv-reports")
-        .join("drone-state-lewm-autonomous-100hz")
-        .join("gate-plan.json")
 }
 
 #[derive(Resource)]
