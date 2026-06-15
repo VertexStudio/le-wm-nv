@@ -70,3 +70,7 @@ path = "src/bin/lewm-train-drone.rs"
 [[bin]]
 name = "lewm-drone-dynamics-stats"
 path = "src/bin/lewm-drone-dynamics-stats.rs"
+
+[[bin]]
+name = "lewm-drone-fit-plant"
+path = "src/bin/lewm-drone-fit-plant.rs"

@@ -6,6 +6,7 @@ use candle::{DType, Device as CandleDevice, Tensor};
 use le_wm_nv::{
     checkpoint,
     data::drone_racing::{DroneNormalization, RunningStats},
+    drone_plant::{DronePlantConfig, DronePlantState},
     models::world_model::{WorldModel, WorldModelConfig},
     planner::{ActionBounds, CandidateScorer, IcemConfig, IcemPlanner},
     runtime::{DTypeSpec, DeviceSpec},
@@ -302,14 +303,14 @@ fn print_help() {
            --max-frame-steps <n>         default 20\n\
            --mass <kg>                   default 1.3\n\
            --gravity <m/s^2>             default 9.81\n\
-           --hover-throttle <0..1>       default 0.305\n\
-           --max-thrust-weight <ratio>   default 2.2\n\
-           --max-roll-rate <rad/s>       default 8\n\
-           --max-pitch-rate <rad/s>      default 8\n\
-           --max-yaw-rate <rad/s>        default 5\n\
-           --rate-kp <rad/s^2>           default 22\n\
-           --rate-damping <gain>         default 2.5\n\
-           --linear-drag <gain>          default 0.18\n\
+           --hover-throttle <0..1>       default 0.2\n\
+           --max-thrust-weight <ratio>   default 5.73\n\
+           --max-roll-rate <rad/s>       default 14\n\
+           --max-pitch-rate <rad/s>      default 12\n\
+           --max-yaw-rate <rad/s>        default 10\n\
+           --rate-kp <rad/s^2>           default 32\n\
+           --rate-damping <gain>         default 8\n\
+           --linear-drag <gain>          default 0.05\n\
            --quadratic-drag <gain>       default 0.03\n\
          \n\
          Camera options:\n\
@@ -375,15 +376,35 @@ impl Default for DynamicsConfig {
             max_frame_steps: 20,
             mass: 1.3,
             gravity: 9.81,
-            hover_throttle: 0.305,
-            max_thrust_weight: 2.2,
-            max_roll_rate: 8.0,
-            max_pitch_rate: 8.0,
-            max_yaw_rate: 5.0,
-            rate_kp: 22.0,
-            rate_damping: 2.5,
-            linear_drag: 0.18,
+            hover_throttle: 0.2,
+            max_thrust_weight: 5.73,
+            max_roll_rate: 14.0,
+            max_pitch_rate: 12.0,
+            max_yaw_rate: 10.0,
+            rate_kp: 32.0,
+            rate_damping: 8.0,
+            linear_drag: 0.05,
             quadratic_drag: 0.03,
+        }
+    }
+}
+
+impl DynamicsConfig {
+    fn plant_config(&self) -> DronePlantConfig {
+        DronePlantConfig {
+            sim_hz: self.sim_hz,
+            mass: self.mass,
+            gravity: self.gravity,
+            hover_throttle: self.hover_throttle,
+            max_thrust_weight: self.max_thrust_weight,
+            max_roll_rate: self.max_roll_rate,
+            max_pitch_rate: self.max_pitch_rate,
+            max_yaw_rate: self.max_yaw_rate,
+            rate_kp: self.rate_kp,
+            rate_damping: self.rate_damping,
+            linear_drag: self.linear_drag,
+            quadratic_drag: self.quadratic_drag,
+            ..DronePlantConfig::default()
         }
     }
 }
@@ -614,7 +635,7 @@ impl SimState {
     fn obs16(&self) -> [f32; OBS_DIM] {
         let mut obs = [0.0; OBS_DIM];
         obs[0..3].copy_from_slice(&vec3_array(self.pose.pos_world));
-        obs[3..12].copy_from_slice(&rotmat_world_from_body_array(self.pose.rot_world_from_body));
+        obs[3..12].copy_from_slice(&rotmat_row_major_array(self.pose.rot_world_from_body));
         obs[12..16].copy_from_slice(&self.previous_action);
         obs
     }
@@ -630,56 +651,30 @@ struct DronePose {
 
 impl DronePose {
     fn initial() -> Self {
-        Self {
-            pos_world: Vec3::new(0.0, 0.0, 1.0),
-            vel_world: Vec3::ZERO,
-            rot_world_from_body: Quat::IDENTITY,
-            ang_vel_body: Vec3::ZERO,
-        }
+        Self::from_plant(DronePlantState::initial())
     }
 
     fn integrate(&mut self, action: [f32; ACTION_DIM], cfg: &DynamicsConfig, dt: f32) {
-        let roll = action[0].clamp(-1.0, 1.0);
-        let pitch = action[1].clamp(-1.0, 1.0);
-        let throttle = action[2].clamp(0.0, 1.0);
-        let yaw = action[3].clamp(-1.0, 1.0);
+        let mut state = self.to_plant();
+        state.integrate(action, &cfg.plant_config(), dt);
+        *self = Self::from_plant(state);
+    }
 
-        let desired_rates = Vec3::new(
-            -roll * cfg.max_roll_rate,
-            -pitch * cfg.max_pitch_rate,
-            yaw * cfg.max_yaw_rate,
-        );
-        let rate_error = desired_rates - self.ang_vel_body;
-        let angular_accel = rate_error * cfg.rate_kp - self.ang_vel_body * cfg.rate_damping;
-        self.ang_vel_body += angular_accel * dt;
-        self.ang_vel_body = self.ang_vel_body.clamp_length_max(
-            cfg.max_roll_rate
-                .max(cfg.max_pitch_rate)
-                .max(cfg.max_yaw_rate)
-                * 1.5,
-        );
+    fn to_plant(self) -> DronePlantState {
+        DronePlantState {
+            pos_world: vec3_array(self.pos_world),
+            vel_world: vec3_array(self.vel_world),
+            rotmat_world_from_body: rotmat_row_major_array(self.rot_world_from_body),
+            ang_vel_body: vec3_array(self.ang_vel_body),
+        }
+    }
 
-        let delta_rot = Quat::from_scaled_axis(self.ang_vel_body * dt);
-        self.rot_world_from_body = (self.rot_world_from_body * delta_rot).normalize();
-
-        let thrust_weight = (throttle / cfg.hover_throttle).clamp(0.0, cfg.max_thrust_weight);
-        let thrust = cfg.mass * cfg.gravity * thrust_weight;
-        let body_up_world = self.rot_world_from_body * Vec3::Z;
-        let speed = self.vel_world.length();
-        let drag = self.vel_world * cfg.linear_drag + self.vel_world * speed * cfg.quadratic_drag;
-        let accel_world =
-            body_up_world * (thrust / cfg.mass) + Vec3::new(0.0, 0.0, -cfg.gravity) - drag;
-
-        self.vel_world += accel_world * dt;
-        self.pos_world += self.vel_world * dt;
-
-        if self.pos_world.z < 0.04 {
-            self.pos_world.z = 0.04;
-            if self.vel_world.z < 0.0 {
-                self.vel_world.z = 0.0;
-            }
-            self.vel_world.x *= 0.985;
-            self.vel_world.y *= 0.985;
+    fn from_plant(state: DronePlantState) -> Self {
+        Self {
+            pos_world: vec3_from_array(state.pos_world),
+            vel_world: vec3_from_array(state.vel_world),
+            rot_world_from_body: quat_from_rotmat_world_from_body(state.rotmat_world_from_body),
+            ang_vel_body: vec3_from_array(state.ang_vel_body),
         }
     }
 }
@@ -1015,7 +1010,7 @@ fn encode_target_embedding(
 fn target_obs16(target: TargetPose, previous_action: [f32; ACTION_DIM]) -> [f32; OBS_DIM] {
     let mut obs = [0.0; OBS_DIM];
     obs[0..3].copy_from_slice(&vec3_array(target.pos_world));
-    obs[3..12].copy_from_slice(&rotmat_world_from_body_array(target.rot_world_from_body));
+    obs[3..12].copy_from_slice(&rotmat_row_major_array(target.rot_world_from_body));
     obs[12..16].copy_from_slice(&previous_action);
     obs
 }
@@ -1518,15 +1513,27 @@ fn view_rotation_from_drone_rotation(rot_world_from_body: Quat) -> Quat {
     ))
 }
 
-fn rotmat_world_from_body_array(rot: Quat) -> [f32; 9] {
+fn rotmat_row_major_array(rot: Quat) -> [f32; 9] {
     let x = rot * Vec3::X;
     let y = rot * Vec3::Y;
     let z = rot * Vec3::Z;
-    [x.x, x.y, x.z, y.x, y.y, y.z, z.x, z.y, z.z]
+    [x.x, y.x, z.x, x.y, y.y, z.y, x.z, y.z, z.z]
 }
 
 fn vec3_array(value: Vec3) -> [f32; 3] {
     [value.x, value.y, value.z]
+}
+
+fn vec3_from_array(value: [f32; 3]) -> Vec3 {
+    Vec3::new(value[0], value[1], value[2])
+}
+
+fn quat_from_rotmat_world_from_body(m: [f32; 9]) -> Quat {
+    Quat::from_mat3(&Mat3::from_cols(
+        Vec3::new(m[0], m[3], m[6]),
+        Vec3::new(m[1], m[4], m[7]),
+        Vec3::new(m[2], m[5], m[8]),
+    ))
 }
 
 fn view_vec3(value: Vec3) -> Vec3 {
