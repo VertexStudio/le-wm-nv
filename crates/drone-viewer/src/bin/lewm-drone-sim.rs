@@ -1,7 +1,11 @@
 use std::{env, fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, ensure};
-use bevy::{input::mouse::MouseWheel, prelude::*};
+use bevy::{
+    gizmos::config::{DefaultGizmoConfigGroup, GizmoConfigStore},
+    input::mouse::MouseWheel,
+    prelude::*,
+};
 use bevy_camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState};
 use candle::{DType, Device as CandleDevice, Tensor};
 use le_wm_nv::{
@@ -32,6 +36,9 @@ const GATE_REFERENCE_SEARCH_LIMIT_STEPS: usize = 450;
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
+    if args.inspect_gate_targets {
+        return inspect_gate_targets(args);
+    }
     if args.headless_steps > 0 {
         return run_headless(args);
     }
@@ -62,7 +69,7 @@ fn main() -> anyhow::Result<()> {
             }),
             FreeCameraPlugin,
         ))
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (configure_gizmos, setup).chain())
         .add_systems(
             Update,
             (
@@ -71,6 +78,7 @@ fn main() -> anyhow::Result<()> {
                 step_simulation,
                 update_drone_mesh,
                 update_follow_camera,
+                update_telemetry_ui,
                 draw_guides,
                 draw_sim_overlays,
             )
@@ -154,6 +162,44 @@ fn run_headless(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn inspect_gate_targets(args: Args) -> anyhow::Result<()> {
+    let mut state = initial_sim_state(&args)?;
+    let gate_cfg = args
+        .gate_loop
+        .as_ref()
+        .context("--inspect-gate-targets requires --gates")?;
+    let gate_loop = GateLoop::load(gate_cfg, args.start.as_ref(), &mut state)?;
+    println!("start {}", pose_summary(None, state.pose));
+    println!(
+        "flight={} gates={} order_target_lead_steps={}",
+        gate_loop.flight,
+        gate_loop.gates.len(),
+        GATE_ENTRY_LEAD_STEPS
+    );
+    for (idx, gate) in gate_loop.gates.iter().enumerate() {
+        println!(
+            "{} {} center=[{:.3} {:.3} {:.3}] display_normal=[{:.3} {:.3} {:.3}]",
+            idx + 1,
+            gate.name,
+            gate.center.x,
+            gate.center.y,
+            gate.center.z,
+            gate.display_normal.x,
+            gate.display_normal.y,
+            gate.display_normal.z,
+        );
+        println!(
+            "  entry {}",
+            target_pose_summary(Some(gate.entry_row), gate.entry_pose())
+        );
+        println!(
+            "  pass  {}",
+            target_pose_summary(Some(gate.pass_row), gate.pass_pose())
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct Args {
     dynamics: DynamicsConfig,
@@ -164,6 +210,7 @@ struct Args {
     lewm: Option<LeWmControlConfig>,
     max_trail: usize,
     headless_steps: usize,
+    inspect_gate_targets: bool,
 }
 
 impl Args {
@@ -184,6 +231,7 @@ impl Args {
             lewm: None,
             max_trail: 2400,
             headless_steps: 0,
+            inspect_gate_targets: false,
         };
         let mut iter = env::args().skip(1);
         while let Some(arg) = iter.next() {
@@ -249,6 +297,7 @@ impl Args {
                 }
                 "--seed" => args.lewm_mut().seed = Some(next_parse(&mut iter, &arg)?),
                 "--headless-steps" => args.headless_steps = next_parse(&mut iter, &arg)?,
+                "--inspect-gate-targets" => args.inspect_gate_targets = true,
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -466,6 +515,7 @@ fn print_help() {
            --target-lookahead <meters>    default 0.5\n\
            --seed <u64>                   deterministic CUDA candidate noise\n\
            --headless-steps <n>           run planner/sim smoke test without Bevy window\n\
+           --inspect-gate-targets         print ordered gate entry/pass poses and exit\n\
          \n\
          Controls:\n\
            W/S forward/back tilt, A/D left/right tilt, Q/E yaw left/right, R/F climb/descent\n\
@@ -1288,6 +1338,43 @@ struct TargetPose {
     rot_world_from_body: Quat,
 }
 
+fn pose_summary(row: Option<usize>, pose: DronePose) -> String {
+    attitude_summary(row, pose.pos_world, pose.rot_world_from_body)
+}
+
+fn target_pose_summary(row: Option<usize>, pose: TargetPose) -> String {
+    attitude_summary(row, pose.pos_world, pose.rot_world_from_body)
+}
+
+fn attitude_summary(row: Option<usize>, pos_world: Vec3, rot_world_from_body: Quat) -> String {
+    let body_forward = rot_world_from_body * Vec3::X;
+    let body_up = rot_world_from_body * Vec3::Z;
+    let body_forward_horizontal = Vec3::new(body_forward.x, body_forward.y, 0.0);
+    let pitch_deg = body_forward
+        .z
+        .atan2(body_forward_horizontal.length().max(1e-6))
+        .to_degrees();
+    let up_z = body_up.z;
+    let row_text = row
+        .map(|row| format!("row={row} "))
+        .unwrap_or_else(|| "".to_string());
+    format!(
+        "{}pos=[{:.3} {:.3} {:.3}] pitch={:+.1}deg up_z={:+.3} forward=[{:+.3} {:+.3} {:+.3}] up=[{:+.3} {:+.3} {:+.3}]",
+        row_text,
+        pos_world.x,
+        pos_world.y,
+        pos_world.z,
+        pitch_deg,
+        up_z,
+        body_forward.x,
+        body_forward.y,
+        body_forward.z,
+        body_up.x,
+        body_up.y,
+        body_up.z,
+    )
+}
+
 struct DroneLeWmController {
     model: WorldModel,
     device: CandleDevice,
@@ -1766,11 +1853,18 @@ enum DronePart {
 #[derive(Component)]
 struct FollowCamera;
 
+#[derive(Component)]
+struct TelemetryText;
+
 #[derive(Resource)]
 struct SceneGuide {
     grid_extent: f32,
     grid_step: f32,
     axis_len: f32,
+}
+
+fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {
+    store.config_mut::<DefaultGizmoConfigGroup>().0.line.width = 1.0;
 }
 
 fn setup(
@@ -1799,6 +1893,20 @@ fn setup(
         },
         disabled_free_camera_state(),
         FollowCamera,
+    ));
+
+    commands.spawn((
+        Text::new(""),
+        TextFont::from_font_size(13.0),
+        TextColor(Color::srgb(0.95, 0.95, 0.85)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(10),
+            left: px(10),
+            max_width: px(820),
+            ..default()
+        },
+        TelemetryText,
     ));
 
     commands.spawn((
@@ -2054,6 +2162,26 @@ fn update_follow_camera(
     transform.look_at(focus, Vec3::Y);
 }
 
+fn update_telemetry_ui(
+    state: Res<SimState>,
+    control: Res<SimControl>,
+    camera: Res<FollowCameraConfig>,
+    gate_loop: Option<Res<GateLoop>>,
+    controller: Option<NonSend<DroneLeWmController>>,
+    mut query: Query<&mut Text, With<TelemetryText>>,
+) {
+    let Ok(mut text) = query.single_mut() else {
+        return;
+    };
+    text.0 = telemetry_text(
+        &state,
+        &control,
+        &camera,
+        gate_loop.as_deref(),
+        controller.as_deref(),
+    );
+}
+
 fn draw_guides(mut gizmos: Gizmos, guide: Res<SceneGuide>) {
     let y = 0.0;
     let min = -guide.grid_extent;
@@ -2094,7 +2222,6 @@ fn draw_sim_overlays(
     mut gizmos: Gizmos,
     state: Res<SimState>,
     control: Res<SimControl>,
-    camera: Res<FollowCameraConfig>,
     gate_loop: Option<Res<GateLoop>>,
     controller: Option<NonSend<DroneLeWmController>>,
 ) {
@@ -2124,12 +2251,20 @@ fn draw_sim_overlays(
     if vel_view.length_squared() > 1e-6 {
         gizmos.arrow(pos, pos + vel_view * 0.25, Color::srgb(0.35, 0.8, 1.0));
     }
+}
 
+fn telemetry_text(
+    state: &SimState,
+    control: &SimControl,
+    camera: &FollowCameraConfig,
+    gate_loop: Option<&GateLoop>,
+    controller: Option<&DroneLeWmController>,
+) -> String {
+    let pose = state.pose;
     let obs = state.obs16();
     let target_dist = (state.target.pos_world - pose.pos_world).length();
     let status = if control.paused { "paused" } else { "running" };
     let lewm_text = controller
-        .as_ref()
         .map(|controller| {
             let mode = if controller.enabled {
                 "lewm:on"
@@ -2151,7 +2286,6 @@ fn draw_sim_overlays(
         })
         .unwrap_or_else(|| "lewm:not-loaded".to_string());
     let gate_text = gate_loop
-        .as_ref()
         .map(|gate_loop| {
             let active = gate_loop
                 .active_gate()
@@ -2172,7 +2306,7 @@ fn draw_sim_overlays(
             )
         })
         .unwrap_or_default();
-    let text = format!(
+    format!(
         "{} t={:.2}s step={} pos=[{:.2} {:.2} {:.2}] dist={:.2}\n\
          a roll={:.2} pitch={:.2} thr={:.2} yaw={:.2} vel=[{:.2} {:.2} {:.2}] rates=[{:.2} {:.2} {:.2}]\n\
          obs16 pos=[{:.2} {:.2} {:.2}] cam dist={:.1} height={:.1} spring={:.1} step_ms={:.4}\n\
@@ -2203,14 +2337,7 @@ fn draw_sim_overlays(
         state.avg_step_ms,
         lewm_text,
         gate_text,
-    );
-    gizmos.text(
-        Isometry3d::from_translation(pos + Vec3::Y * 1.35),
-        &text,
-        TELEMETRY_FONT_SIZE,
-        Vec2::new(-0.5, 0.0),
-        Color::srgb(0.95, 0.95, 0.85),
-    );
+    )
 }
 
 fn draw_target_pose(gizmos: &mut Gizmos, target: TargetPose) {
