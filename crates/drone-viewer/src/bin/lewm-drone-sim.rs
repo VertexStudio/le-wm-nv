@@ -19,7 +19,9 @@ const KEYBOARD_MAX_TILT_RAD: f32 = 0.42;
 const KEYBOARD_ATTITUDE_KP: f32 = 6.0;
 const KEYBOARD_YAW_LIMIT: f32 = 0.28;
 const KEYBOARD_RATE_SLEW: f32 = 4.0;
-const KEYBOARD_THROTTLE_SLEW: f32 = 0.55;
+const KEYBOARD_CLIMB_RATE_MPS: f32 = 2.0;
+const KEYBOARD_VERTICAL_VEL_KP: f32 = 0.05;
+const KEYBOARD_THROTTLE_SLEW: f32 = 1.5;
 const PLANNER_ACTION_STD_LIMIT: f32 = 3.0;
 
 fn main() -> anyhow::Result<()> {
@@ -349,9 +351,9 @@ fn print_help() {
            --headless-steps <n>           run planner/sim smoke test without Bevy window\n\
          \n\
          Controls:\n\
-           W/S forward/back tilt, A/D left/right tilt, Q/E yaw left/right, R/F throttle\n\
+           W/S forward/back tilt, A/D left/right tilt, Q/E yaw left/right, R/F climb/descent\n\
            L toggles LeWM control when loaded\n\
-           Z level roll/pitch/yaw, X hover throttle, P pause, Backspace reset\n\
+           Z level roll/pitch/yaw, X hover throttle now, P pause, Backspace reset\n\
            mouse wheel or [/] camera distance, 3/4 camera height, 1/2 camera spring"
     );
 }
@@ -560,7 +562,6 @@ impl LeWmControlConfig {
 struct SimControl {
     action: [f32; ACTION_DIM],
     hover_action: [f32; ACTION_DIM],
-    manual_throttle: f32,
     paused: bool,
     accumulator: f32,
 }
@@ -571,7 +572,6 @@ impl SimControl {
         Self {
             action: hover_action,
             hover_action,
-            manual_throttle: hover_throttle,
             paused: false,
             accumulator: 0.0,
         }
@@ -1271,7 +1271,6 @@ fn update_controls(
     }
     if keys.just_pressed(KeyCode::Backspace) {
         control.action = control.hover_action;
-        control.manual_throttle = control.hover_action[2];
         control.accumulator = 0.0;
         state.reset(control.hover_action);
         if let Some(controller) = controller.as_mut() {
@@ -1287,7 +1286,6 @@ fn update_controls(
         control.action[3] = 0.0;
     }
     if keys.just_pressed(KeyCode::KeyX) {
-        control.manual_throttle = control.hover_action[2];
         control.action[2] = control.hover_action[2];
     }
 
@@ -1297,12 +1295,12 @@ fn update_controls(
         .is_some_and(|controller| controller.enabled);
     if !lewm_enabled {
         let target_roll_angle =
-            axis(keys.pressed(KeyCode::KeyA), keys.pressed(KeyCode::KeyD)) * KEYBOARD_MAX_TILT_RAD;
+            axis(keys.pressed(KeyCode::KeyD), keys.pressed(KeyCode::KeyA)) * KEYBOARD_MAX_TILT_RAD;
         let target_pitch_angle =
             axis(keys.pressed(KeyCode::KeyS), keys.pressed(KeyCode::KeyW)) * KEYBOARD_MAX_TILT_RAD;
         let target_yaw =
-            axis(keys.pressed(KeyCode::KeyQ), keys.pressed(KeyCode::KeyE)) * KEYBOARD_YAW_LIMIT;
-        let (roll_angle, pitch_angle, body_up_z) = roll_pitch_from_pose(state.pose);
+            axis(keys.pressed(KeyCode::KeyE), keys.pressed(KeyCode::KeyQ)) * KEYBOARD_YAW_LIMIT;
+        let (roll_angle, pitch_angle, body_up_z) = heading_local_roll_pitch_from_pose(state.pose);
         let desired_roll_rate = (target_roll_angle - roll_angle) * KEYBOARD_ATTITUDE_KP;
         let desired_pitch_rate = (target_pitch_angle - pitch_angle) * KEYBOARD_ATTITUDE_KP;
         let target_roll = desired_roll_rate / state.dynamics.max_roll_rate;
@@ -1319,11 +1317,11 @@ fn update_controls(
         );
         control.action[3] = approach(control.action[3], target_yaw, KEYBOARD_RATE_SLEW * dt);
 
-        let throttle_delta = axis(keys.pressed(KeyCode::KeyF), keys.pressed(KeyCode::KeyR));
-        control.manual_throttle = (control.manual_throttle
-            + throttle_delta * KEYBOARD_THROTTLE_SLEW * dt)
-            .clamp(0.0, 1.0);
-        let compensated_throttle = control.manual_throttle / body_up_z.clamp(0.35, 1.0);
+        let target_climb_rate = axis(keys.pressed(KeyCode::KeyF), keys.pressed(KeyCode::KeyR))
+            * KEYBOARD_CLIMB_RATE_MPS;
+        let vertical_error = target_climb_rate - state.pose.vel_world.z;
+        let target_throttle = control.hover_action[2] + vertical_error * KEYBOARD_VERTICAL_VEL_KP;
+        let compensated_throttle = target_throttle / body_up_z.clamp(0.35, 1.0);
         control.action[2] = approach(
             control.action[2],
             compensated_throttle.clamp(0.0, 1.0),
@@ -1621,11 +1619,16 @@ fn approach(value: f32, target: f32, max_delta: f32) -> f32 {
     value + delta
 }
 
-fn roll_pitch_from_pose(pose: DronePose) -> (f32, f32, f32) {
-    let body_up = pose.rot_world_from_body * Vec3::Z;
+fn heading_local_roll_pitch_from_pose(pose: DronePose) -> (f32, f32, f32) {
+    let body_forward = pose.rot_world_from_body * Vec3::X;
+    let yaw = body_forward.y.atan2(body_forward.x);
+    let yaw_only = Quat::from_rotation_z(yaw);
+    let heading_local_rot = yaw_only.inverse() * pose.rot_world_from_body;
+    let body_up = heading_local_rot * Vec3::Z;
     let roll = (-body_up.y).atan2(body_up.z);
     let pitch = body_up.x.atan2(body_up.z);
-    (roll, pitch, body_up.z)
+    let world_body_up_z = (pose.rot_world_from_body * Vec3::Z).z;
+    (roll, pitch, world_body_up_z)
 }
 
 fn transform_from_pose(pose: &DronePose) -> Transform {
