@@ -5,7 +5,10 @@ use bevy::{input::mouse::MouseWheel, prelude::*};
 use candle::{DType, Device as CandleDevice, Tensor};
 use le_wm_nv::{
     checkpoint,
-    data::drone_racing::{DroneNormalization, RunningStats},
+    data::drone_racing::{
+        DroneBatchConfig, DroneNormalization, DroneRacingDataset, GateSequenceFile, GateSpec,
+        RunningStats,
+    },
     drone_plant::{DronePlantConfig, DronePlantState},
     models::world_model::{ObservationEncoderConfig, WorldModel, WorldModelConfig},
     planner::{ActionBounds, CandidateScorer, IcemConfig, IcemPlanner},
@@ -30,7 +33,12 @@ fn main() -> anyhow::Result<()> {
         return run_headless(args);
     }
 
-    let sim_state = SimState::new(args.dynamics.clone(), args.target.to_pose(), args.max_trail);
+    let mut sim_state = initial_sim_state(&args)?;
+    let gate_loop = args
+        .gate_loop
+        .as_ref()
+        .map(|cfg| GateLoop::load(cfg, args.start.as_ref(), &mut sim_state))
+        .transpose()?;
     let controller = args
         .lewm
         .as_ref()
@@ -64,13 +72,20 @@ fn main() -> anyhow::Result<()> {
     if let Some(controller) = controller {
         app.insert_non_send(controller);
     }
+    if let Some(gate_loop) = gate_loop {
+        app.insert_resource(gate_loop);
+    }
     app.run();
     Ok(())
 }
 
 fn run_headless(args: Args) -> anyhow::Result<()> {
-    let sim_state = SimState::new(args.dynamics.clone(), args.target.to_pose(), args.max_trail);
-    let mut state = sim_state;
+    let mut state = initial_sim_state(&args)?;
+    let mut gate_loop = args
+        .gate_loop
+        .as_ref()
+        .map(|cfg| GateLoop::load(cfg, args.start.as_ref(), &mut state))
+        .transpose()?;
     let mut control = SimControl::new(args.dynamics.hover_throttle);
     let lewm = args
         .lewm
@@ -84,13 +99,34 @@ fn run_headless(args: Args) -> anyhow::Result<()> {
 
     for _ in 0..args.headless_steps {
         state.step(control.action, dt);
+        if let Some(gate_loop) = gate_loop.as_mut() {
+            gate_loop.update_state_target(&mut state);
+            if gate_loop.finished {
+                break;
+            }
+        }
         if controller.observe_if_due(&state) && controller.should_plan_now() {
             control.action = controller.plan(&state)?;
         }
     }
     let end_dist = (state.target.pos_world - state.pose.pos_world).length();
+    let gate_text = gate_loop
+        .as_ref()
+        .map(|gate_loop| {
+            format!(
+                " gates={} lap={}/{} gate={}/{} finished={} best_gate_dists=[{}]",
+                gate_loop.pass_count,
+                gate_loop.laps_completed,
+                gate_loop.desired_laps,
+                gate_loop.current_index + 1,
+                gate_loop.gates.len(),
+                gate_loop.finished,
+                gate_loop.best_distance_text(),
+            )
+        })
+        .unwrap_or_default();
     println!(
-        "headless steps={} sim_time={:.3}s wall={:.3}s start_dist={:.3} end_dist={:.3} pos=[{:.3} {:.3} {:.3}] action=[{:.3} {:.3} {:.3} {:.3}] plans={} last_plan_ms={:.3} best={:.6}",
+        "headless steps={} sim_time={:.3}s wall={:.3}s start_dist={:.3} end_dist={:.3} pos=[{:.3} {:.3} {:.3}] action=[{:.3} {:.3} {:.3} {:.3}] plans={} last_plan_ms={:.3} best={:.6}{}",
         args.headless_steps,
         state.time,
         started.elapsed().as_secs_f32(),
@@ -106,6 +142,7 @@ fn run_headless(args: Args) -> anyhow::Result<()> {
         controller.plan_count,
         controller.last_plan_ms,
         controller.last_best_score,
+        gate_text,
     );
     Ok(())
 }
@@ -115,6 +152,8 @@ struct Args {
     dynamics: DynamicsConfig,
     camera: FollowCameraConfig,
     target: TargetConfig,
+    gate_loop: Option<GateLoopConfig>,
+    start: Option<StartConfig>,
     lewm: Option<LeWmControlConfig>,
     max_trail: usize,
     headless_steps: usize,
@@ -133,6 +172,8 @@ impl Args {
                 pos_world: Vec3::new(4.0, 0.0, 1.6),
                 yaw_rad: 0.0,
             },
+            gate_loop: None,
+            start: None,
             lewm: None,
             max_trail: 2400,
             headless_steps: 0,
@@ -162,6 +203,22 @@ impl Args {
                 "--camera-spring" => args.camera.spring = next_parse(&mut iter, &arg)?,
                 "--target-pos" => args.target.pos_world = next_vec3(&mut iter, &arg)?,
                 "--target-yaw" => args.target.yaw_rad = next_parse(&mut iter, &arg)?,
+                "--start-dataset" => args.start_mut().dataset_dir = next_path(&mut iter, &arg)?,
+                "--start-row" => args.start_mut().row = Some(next_parse(&mut iter, &arg)?),
+                "--gates" => args.gate_loop_mut().path = next_path(&mut iter, &arg)?,
+                "--gate-flight" => {
+                    args.gate_loop_mut().flight = Some(next_string(&mut iter, &arg)?)
+                }
+                "--gate-episode" => {
+                    args.gate_loop_mut().episode_idx = Some(next_parse(&mut iter, &arg)?)
+                }
+                "--gate-laps" => args.gate_loop_mut().desired_laps = next_parse(&mut iter, &arg)?,
+                "--gate-radius" => {
+                    args.gate_loop_mut().pass_radius_m = next_parse(&mut iter, &arg)?
+                }
+                "--gate-order" => {
+                    args.gate_loop_mut().order = Some(next_gate_order(&mut iter, &arg)?)
+                }
                 "--model-dir" => args.lewm_mut().model_dir = Some(next_path(&mut iter, &arg)?),
                 "--weights" => args.lewm_mut().weights = Some(next_path(&mut iter, &arg)?),
                 "--config" => args.lewm_mut().config = Some(next_path(&mut iter, &arg)?),
@@ -198,6 +255,14 @@ impl Args {
 
     fn lewm_mut(&mut self) -> &mut LeWmControlConfig {
         self.lewm.get_or_insert_with(LeWmControlConfig::default)
+    }
+
+    fn gate_loop_mut(&mut self) -> &mut GateLoopConfig {
+        self.gate_loop.get_or_insert_with(GateLoopConfig::default)
+    }
+
+    fn start_mut(&mut self) -> &mut StartConfig {
+        self.start.get_or_insert_with(StartConfig::default)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -253,6 +318,12 @@ impl Args {
         if let Some(lewm) = self.lewm.as_ref() {
             lewm.validate()?;
         }
+        if let Some(gate_loop) = self.gate_loop.as_ref() {
+            gate_loop.validate()?;
+        }
+        if let Some(start) = self.start.as_ref() {
+            start.validate()?;
+        }
         if self.headless_steps > 0 {
             ensure!(
                 self.lewm.is_some(),
@@ -282,11 +353,42 @@ fn next_path(iter: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Res
     })?))
 }
 
+fn next_string(iter: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
+    iter.next()
+        .ok_or_else(|| anyhow::anyhow!("missing value after {flag}"))
+}
+
 fn next_vec3(iter: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<Vec3> {
     let value = iter
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing value after {flag}"))?;
     parse_vec3(&value).with_context(|| format!("invalid value `{value}` for {flag}"))
+}
+
+fn next_gate_order(
+    iter: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> anyhow::Result<Vec<usize>> {
+    let value = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing value after {flag}"))?;
+    let order = value
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid gate index in {flag}: {part}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure!(
+        !order.is_empty(),
+        "{flag} must contain at least one gate index"
+    );
+    ensure!(
+        order.iter().all(|idx| *idx > 0),
+        "{flag} uses 1-based gate indexes"
+    );
+    Ok(order)
 }
 
 fn parse_vec3(value: &str) -> anyhow::Result<Vec3> {
@@ -330,6 +432,14 @@ fn print_help() {
          Target options:\n\
            --target-pos <x,y,z>           default 4,0,1.6\n\
            --target-yaw <rad>             default 0\n\
+           --start-dataset <dir>          imported drone dataset dir for --start-row\n\
+           --start-row <row>              initialize pose/velocity/action from dataset row\n\
+           --gates <path>                 load gate loop JSON from lewm-drone-import\n\
+           --gate-flight <name>           select flight name from gates JSON\n\
+           --gate-episode <idx>           select episode_idx from gates JSON\n\
+           --gate-laps <n>                default 1\n\
+           --gate-radius <meters>         default 0.85\n\
+           --gate-order <1,2,...>         explicit 1-based traversal order\n\
          \n\
          LeWM control options:\n\
            --model-dir <dir>              run dir containing final.safetensors, model-config.json, normalization.json\n\
@@ -437,6 +547,135 @@ impl TargetConfig {
             rot_world_from_body: Quat::from_rotation_z(self.yaw_rad),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct StartConfig {
+    dataset_dir: PathBuf,
+    row: Option<usize>,
+}
+
+impl Default for StartConfig {
+    fn default() -> Self {
+        Self {
+            dataset_dir: default_dataset_dir(),
+            row: None,
+        }
+    }
+}
+
+impl StartConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.row.is_some(),
+            "--start-row is required when using --start-dataset"
+        );
+        ensure!(
+            self.dataset_dir.is_dir(),
+            "--start-dataset does not exist or is not a directory: {}",
+            self.dataset_dir.display()
+        );
+        Ok(())
+    }
+}
+
+fn initial_sim_state(args: &Args) -> anyhow::Result<SimState> {
+    let target = args.target.to_pose();
+    let Some(start) = args.start.as_ref() else {
+        return Ok(SimState::new(args.dynamics.clone(), target, args.max_trail));
+    };
+    let dataset = DroneRacingDataset::open(
+        &start.dataset_dir,
+        DroneBatchConfig {
+            batch_size: 1,
+            sequence_steps: 2,
+            normalize_observations: false,
+            normalize_actions: false,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to open start dataset {}",
+            start.dataset_dir.display()
+        )
+    })?;
+    let row = start.row.context("--start-row is required")?;
+    let frame = dataset.frame(row)?;
+    let prev_action = if frame.step_idx > 0
+        && row > 0
+        && dataset.frame(row - 1)?.episode_idx == frame.episode_idx
+    {
+        dataset.frame(row - 1)?.channels_norm
+    } else {
+        frame.channels_norm
+    };
+    let pose = DronePose::from_plant(DronePlantState::from_frame(&frame));
+    Ok(SimState::from_start_frame(
+        args.dynamics.clone(),
+        target,
+        args.max_trail,
+        pose,
+        prev_action,
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct GateLoopConfig {
+    path: PathBuf,
+    flight: Option<String>,
+    episode_idx: Option<i64>,
+    order: Option<Vec<usize>>,
+    desired_laps: usize,
+    pass_radius_m: f32,
+}
+
+impl Default for GateLoopConfig {
+    fn default() -> Self {
+        Self {
+            path: default_gates_path(),
+            flight: None,
+            episode_idx: None,
+            order: None,
+            desired_laps: 1,
+            pass_radius_m: 0.85,
+        }
+    }
+}
+
+impl GateLoopConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(self.desired_laps > 0, "--gate-laps must be positive");
+        ensure!(
+            self.pass_radius_m.is_finite() && self.pass_radius_m > 0.0,
+            "--gate-radius must be positive and finite"
+        );
+        ensure!(
+            self.path.is_file(),
+            "--gates path does not exist or is not a file: {}",
+            self.path.display()
+        );
+        if let Some(order) = self.order.as_ref() {
+            ensure!(!order.is_empty(), "--gate-order cannot be empty");
+            ensure!(
+                order.iter().all(|idx| *idx > 0),
+                "--gate-order uses 1-based gate indexes"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_dataset_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".stable_worldmodel")
+        .join("le-wm-nv-data")
+        .join("drone-racing-autonomous-100hz-pose16")
+}
+
+fn default_gates_path() -> PathBuf {
+    default_dataset_dir().join("gates.json")
 }
 
 #[derive(Debug, Clone)]
@@ -582,7 +821,9 @@ impl SimControl {
 struct SimState {
     dynamics: DynamicsConfig,
     pose: DronePose,
+    initial_pose: DronePose,
     previous_action: [f32; ACTION_DIM],
+    initial_previous_action: [f32; ACTION_DIM],
     time: f32,
     step: usize,
     last_step_ms: f32,
@@ -599,7 +840,9 @@ impl SimState {
         Self {
             dynamics,
             pose,
+            initial_pose: pose,
             previous_action: hover_action,
+            initial_previous_action: hover_action,
             time: 0.0,
             step: 0,
             last_step_ms: 0.0,
@@ -610,9 +853,32 @@ impl SimState {
         }
     }
 
-    fn reset(&mut self, hover_action: [f32; ACTION_DIM]) {
-        self.pose = DronePose::initial();
-        self.previous_action = hover_action;
+    fn from_start_frame(
+        dynamics: DynamicsConfig,
+        target: TargetPose,
+        max_trail: usize,
+        pose: DronePose,
+        previous_action: [f32; ACTION_DIM],
+    ) -> Self {
+        Self {
+            dynamics,
+            pose,
+            initial_pose: pose,
+            previous_action,
+            initial_previous_action: previous_action,
+            time: 0.0,
+            step: 0,
+            last_step_ms: 0.0,
+            avg_step_ms: 0.0,
+            trail: vec![pose.pos_world],
+            max_trail,
+            target,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pose = self.initial_pose;
+        self.previous_action = self.initial_previous_action;
         self.time = 0.0;
         self.step = 0;
         self.last_step_ms = 0.0;
@@ -647,6 +913,231 @@ impl SimState {
         obs[12..16].copy_from_slice(&self.previous_action);
         obs
     }
+}
+
+#[derive(Resource)]
+struct GateLoop {
+    flight: String,
+    gates: Vec<GateTarget>,
+    current_index: usize,
+    desired_laps: usize,
+    laps_completed: usize,
+    pass_count: usize,
+    pass_radius_m: f32,
+    best_dist_m: Vec<f32>,
+    finished: bool,
+}
+
+impl GateLoop {
+    fn load(
+        cfg: &GateLoopConfig,
+        start: Option<&StartConfig>,
+        state: &mut SimState,
+    ) -> anyhow::Result<Self> {
+        let file: GateSequenceFile = serde_json::from_str(
+            &fs::read_to_string(&cfg.path)
+                .with_context(|| format!("failed to read {}", cfg.path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", cfg.path.display()))?;
+        let flight = file
+            .flights
+            .iter()
+            .find(|flight| {
+                cfg.flight
+                    .as_ref()
+                    .is_none_or(|wanted| flight.flight == *wanted)
+                    && cfg
+                        .episode_idx
+                        .is_none_or(|wanted| flight.episode_idx == wanted)
+                    && !flight.gates.is_empty()
+            })
+            .with_context(|| {
+                format!(
+                    "no matching non-empty gate flight in {}; use --gate-flight or --gate-episode",
+                    cfg.path.display()
+                )
+            })?;
+        let reference_dataset_dir = start
+            .map(|start| start.dataset_dir.clone())
+            .unwrap_or_else(default_dataset_dir);
+        let reference_dataset = DroneRacingDataset::open(
+            &reference_dataset_dir,
+            DroneBatchConfig {
+                batch_size: 1,
+                sequence_steps: 2,
+                normalize_observations: false,
+                normalize_actions: false,
+            },
+        )
+        .with_context(|| {
+            format!(
+                "failed to open gate reference dataset {}",
+                reference_dataset_dir.display()
+            )
+        })?;
+        let reference_rows = reference_dataset.replay_rows_for_episode(flight.episode_idx);
+        ensure!(
+            !reference_rows.is_empty(),
+            "reference dataset has no rows for episode_idx={}",
+            flight.episode_idx
+        );
+        let loaded_gates = flight
+            .gates
+            .iter()
+            .map(|spec| GateTarget::from_spec(spec, &reference_dataset, &reference_rows))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let gates = if let Some(order) = cfg.order.as_ref() {
+            order
+                .iter()
+                .map(|idx| {
+                    loaded_gates.get(idx - 1).cloned().with_context(|| {
+                        format!(
+                            "--gate-order index {idx} is out of range for selected flight with {} gates",
+                            loaded_gates.len()
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            loaded_gates
+        };
+        ensure!(
+            !gates.is_empty(),
+            "selected flight {} has no gates",
+            flight.flight
+        );
+        let gate_count = gates.len();
+        let mut loop_state = Self {
+            flight: flight.flight.clone(),
+            gates,
+            current_index: 0,
+            desired_laps: cfg.desired_laps,
+            laps_completed: 0,
+            pass_count: 0,
+            pass_radius_m: cfg.pass_radius_m,
+            best_dist_m: vec![f32::INFINITY; gate_count],
+            finished: false,
+        };
+        loop_state.update_state_target(state);
+        Ok(loop_state)
+    }
+
+    fn reset(&mut self, state: &mut SimState) {
+        self.current_index = 0;
+        self.laps_completed = 0;
+        self.pass_count = 0;
+        self.best_dist_m.fill(f32::INFINITY);
+        self.finished = false;
+        self.update_state_target(state);
+    }
+
+    fn update_state_target(&mut self, state: &mut SimState) {
+        if self.finished {
+            return;
+        }
+        let active = &self.gates[self.current_index];
+        let dist = (active.center - state.pose.pos_world).length();
+        self.best_dist_m[self.current_index] = self.best_dist_m[self.current_index].min(dist);
+        if dist <= self.pass_radius_m {
+            self.advance();
+        }
+        if !self.finished {
+            state.target = self.target_pose_for(state.pose);
+        }
+    }
+
+    fn advance(&mut self) {
+        self.pass_count += 1;
+        self.current_index += 1;
+        if self.current_index >= self.gates.len() {
+            self.current_index = 0;
+            self.laps_completed += 1;
+            if self.laps_completed >= self.desired_laps {
+                self.finished = true;
+            }
+        }
+    }
+
+    fn target_pose_for(&self, _pose: DronePose) -> TargetPose {
+        let gate = &self.gates[self.current_index];
+        TargetPose {
+            pos_world: gate.reference_pos_world,
+            rot_world_from_body: gate.reference_rot_world_from_body,
+        }
+    }
+
+    fn active_gate(&self) -> Option<&GateTarget> {
+        (!self.finished).then(|| &self.gates[self.current_index])
+    }
+
+    fn best_distance_text(&self) -> String {
+        self.best_dist_m
+            .iter()
+            .enumerate()
+            .map(|(idx, dist)| {
+                if dist.is_finite() {
+                    format!("{}:{:.2}", idx + 1, dist)
+                } else {
+                    format!("{}:inf", idx + 1)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[derive(Clone)]
+struct GateTarget {
+    name: String,
+    center: Vec3,
+    normal: Vec3,
+    visual_radius_m: f32,
+    reference_row: usize,
+    reference_pos_world: Vec3,
+    reference_rot_world_from_body: Quat,
+}
+
+impl GateTarget {
+    fn from_spec(
+        spec: &GateSpec,
+        dataset: &DroneRacingDataset,
+        reference_rows: &[usize],
+    ) -> anyhow::Result<Self> {
+        let center = Vec3::from_array(spec.center);
+        let (reference_row, reference_pose) =
+            closest_reference_pose(dataset, reference_rows, center)?;
+        Ok(Self {
+            name: spec.name.clone(),
+            center,
+            normal: Vec3::from_array(spec.normal).normalize_or_zero(),
+            visual_radius_m: spec.half_height.max(0.35),
+            reference_row,
+            reference_pos_world: reference_pose.pos_world,
+            reference_rot_world_from_body: reference_pose.rot_world_from_body,
+        })
+    }
+}
+
+fn closest_reference_pose(
+    dataset: &DroneRacingDataset,
+    rows: &[usize],
+    center: Vec3,
+) -> anyhow::Result<(usize, DronePose)> {
+    let mut best: Option<(usize, f32)> = None;
+    for &row in rows {
+        let frame = dataset.frame(row)?;
+        let pos = Vec3::from_array(frame.pos_world);
+        let dist_sq = pos.distance_squared(center);
+        if best.is_none_or(|(_, best_dist)| dist_sq < best_dist) {
+            best = Some((row, dist_sq));
+        }
+    }
+    let (row, _) = best.context("no reference rows for gate pose")?;
+    let frame = dataset.frame(row)?;
+    Ok((
+        row,
+        DronePose::from_plant(DronePlantState::from_frame(&frame)),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -704,7 +1195,6 @@ struct DroneLeWmController {
     target_emb: Tensor,
     planner: IcemPlanner,
     history_raw: Vec<[f32; OBS_DIM]>,
-    hover_action: [f32; ACTION_DIM],
     target_action: [f32; ACTION_DIM],
     last_action: [f32; ACTION_DIM],
     enabled: bool,
@@ -795,7 +1285,6 @@ impl DroneLeWmController {
             .to_dtype(dtype)?
             .reshape((1, 1, 1, ACTION_DIM))?;
 
-        let hover_action = [0.0, 0.0, dynamics.hover_throttle, 0.0];
         let sim_steps_per_model_step = ((dynamics.sim_hz / cfg.model_hz).round() as usize).max(1);
         let target_pose =
             target_pose_for_horizon(state, horizon, cfg.model_hz, cfg.target_lookahead);
@@ -819,9 +1308,8 @@ impl DroneLeWmController {
             target_emb,
             planner: IcemPlanner::new(planner_cfg),
             history_raw: vec![state.obs16(); history_size],
-            hover_action,
             target_action,
-            last_action: hover_action,
+            last_action: state.previous_action,
             enabled: true,
             sim_steps_per_model_step,
             model_hz: cfg.model_hz,
@@ -836,7 +1324,7 @@ impl DroneLeWmController {
             last_iterations: 0,
             last_error: None,
         };
-        controller.reset_warm_start()?;
+        controller.reset_warm_start(state.previous_action)?;
         controller.device.synchronize()?;
         Ok(controller)
     }
@@ -853,16 +1341,16 @@ impl DroneLeWmController {
         self.last_plan_ms = 0.0;
         self.last_iterations = 0;
         self.last_error = None;
-        self.last_action = self.hover_action;
+        self.last_action = state.previous_action;
         self.last_carrot = state.target.pos_world;
-        self.reset_warm_start()
+        self.reset_warm_start(state.previous_action)
     }
 
-    fn reset_warm_start(&mut self) -> anyhow::Result<()> {
+    fn reset_warm_start(&mut self, action: [f32; ACTION_DIM]) -> anyhow::Result<()> {
         let horizon = self.planner.config().horizon;
         let mut values = Vec::with_capacity(horizon * ACTION_DIM);
         for _ in 0..horizon {
-            values.extend_from_slice(&self.hover_action);
+            values.extend_from_slice(&action);
         }
         let sequence = Tensor::from_vec(values, (1, horizon, ACTION_DIM), &self.device)?
             .to_dtype(self.dtype)?;
@@ -1259,6 +1747,7 @@ fn update_controls(
     mut control: ResMut<SimControl>,
     mut camera: ResMut<FollowCameraConfig>,
     mut state: ResMut<SimState>,
+    mut gate_loop: Option<ResMut<GateLoop>>,
     mut controller: Option<NonSendMut<DroneLeWmController>>,
 ) {
     if keys.just_pressed(KeyCode::KeyP) {
@@ -1272,7 +1761,10 @@ fn update_controls(
     if keys.just_pressed(KeyCode::Backspace) {
         control.action = control.hover_action;
         control.accumulator = 0.0;
-        state.reset(control.hover_action);
+        state.reset();
+        if let Some(gate_loop) = gate_loop.as_mut() {
+            gate_loop.reset(&mut state);
+        }
         if let Some(controller) = controller.as_mut() {
             controller
                 .reset(&state)
@@ -1356,6 +1848,7 @@ fn step_simulation(
     time: Res<Time>,
     mut control: ResMut<SimControl>,
     mut state: ResMut<SimState>,
+    mut gate_loop: Option<ResMut<GateLoop>>,
     mut controller: Option<NonSendMut<DroneLeWmController>>,
 ) {
     if control.paused {
@@ -1374,6 +1867,13 @@ fn step_simulation(
             action = controller.last_action;
         }
         state.step(action, dt);
+        if let Some(gate_loop) = gate_loop.as_mut() {
+            gate_loop.update_state_target(&mut state);
+            if gate_loop.finished {
+                control.paused = true;
+                break;
+            }
+        }
         control.action = action;
         if let Some(controller) = controller.as_mut()
             && controller.enabled
@@ -1462,6 +1962,7 @@ fn draw_sim_overlays(
     state: Res<SimState>,
     control: Res<SimControl>,
     camera: Res<FollowCameraConfig>,
+    gate_loop: Option<Res<GateLoop>>,
     controller: Option<NonSend<DroneLeWmController>>,
 ) {
     let pose = state.pose;
@@ -1475,6 +1976,9 @@ fn draw_sim_overlays(
     );
     draw_trail(&mut gizmos, &state.trail);
     draw_action_bars(&mut gizmos, pos, &control.action);
+    if let Some(gate_loop) = gate_loop.as_ref() {
+        draw_gate_loop(&mut gizmos, gate_loop);
+    }
     draw_target_pose(&mut gizmos, state.target);
     if let Some(controller) = controller.as_ref() {
         let carrot = view_vec3(controller.last_carrot);
@@ -1513,11 +2017,28 @@ fn draw_sim_overlays(
             )
         })
         .unwrap_or_else(|| "lewm:not-loaded".to_string());
+    let gate_text = gate_loop
+        .as_ref()
+        .map(|gate_loop| {
+            let active = gate_loop
+                .active_gate()
+                .map(|gate| format!("{}@row{}", gate.name, gate.reference_row))
+                .unwrap_or_else(|| "done".to_string());
+            format!(
+                " gate={} lap={}/{} passed={} flight={}",
+                active,
+                gate_loop.laps_completed,
+                gate_loop.desired_laps,
+                gate_loop.pass_count,
+                gate_loop.flight,
+            )
+        })
+        .unwrap_or_default();
     let text = format!(
         "{} t={:.2}s step={} pos=[{:.2} {:.2} {:.2}] dist={:.2}\n\
          a roll={:.2} pitch={:.2} thr={:.2} yaw={:.2} vel=[{:.2} {:.2} {:.2}] rates=[{:.2} {:.2} {:.2}]\n\
          obs16 pos=[{:.2} {:.2} {:.2}] cam dist={:.1} height={:.1} spring={:.1} step_ms={:.4}\n\
-         {}",
+         {}{}",
         status,
         state.time,
         state.step,
@@ -1543,6 +2064,7 @@ fn draw_sim_overlays(
         camera.spring,
         state.avg_step_ms,
         lewm_text,
+        gate_text,
     );
     gizmos.text(
         Isometry3d::from_translation(pos + Vec3::Y * 1.35),
@@ -1566,6 +2088,64 @@ fn draw_target_pose(gizmos: &mut Gizmos, target: TargetPose) {
         Vec2::new(-0.5, 0.0),
         Color::srgb(1.0, 0.25, 0.95),
     );
+}
+
+fn draw_gate_loop(gizmos: &mut Gizmos, gate_loop: &GateLoop) {
+    for (idx, gate) in gate_loop.gates.iter().enumerate() {
+        let active = !gate_loop.finished && idx == gate_loop.current_index;
+        let color = if active {
+            Color::srgb(1.0, 0.35, 0.95)
+        } else {
+            Color::srgba(0.10, 0.85, 1.0, 0.65)
+        };
+        draw_gate_cylinder(gizmos, gate, gate_loop.pass_radius_m, active, color);
+    }
+}
+
+fn draw_gate_cylinder(
+    gizmos: &mut Gizmos,
+    gate: &GateTarget,
+    pass_radius_m: f32,
+    active: bool,
+    color: Color,
+) {
+    let center = view_vec3(gate.center);
+    let normal = drone_to_view_vec(gate.normal).normalize_or(Vec3::Z);
+    let radius = gate.visual_radius_m.max(pass_radius_m);
+    let half_depth = if active { 0.18 } else { 0.10 };
+    let front = center + normal * half_depth;
+    let back = center - normal * half_depth;
+    let rotation = Quat::from_rotation_arc(Vec3::Z, normal);
+
+    gizmos
+        .circle(Isometry3d::new(front, rotation), radius, color)
+        .resolution(48);
+    gizmos
+        .circle(Isometry3d::new(back, rotation), radius, color)
+        .resolution(48);
+
+    let (right, up) = gate_ring_basis(normal);
+    for dir in [right, -right, up, -up] {
+        gizmos.line(front + dir * radius, back + dir * radius, color);
+    }
+    if active {
+        gizmos.arrow(center, center + normal * 0.75, color);
+        draw_cross(gizmos, center, pass_radius_m * 0.35, color);
+        let reference_pos = view_vec3(gate.reference_pos_world);
+        gizmos.sphere(reference_pos, 0.08, Color::srgb(0.95, 0.95, 0.85));
+        draw_cross(gizmos, reference_pos, 0.20, Color::srgb(0.95, 0.95, 0.85));
+    }
+}
+
+fn gate_ring_basis(normal: Vec3) -> (Vec3, Vec3) {
+    let helper = if normal.z.abs() < 0.9 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let right = helper.cross(normal).normalize_or(Vec3::X);
+    let up = normal.cross(right).normalize_or(Vec3::Y);
+    (right, up)
 }
 
 fn draw_trail(gizmos: &mut Gizmos, trail: &[Vec3]) {
