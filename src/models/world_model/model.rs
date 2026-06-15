@@ -1,4 +1,4 @@
-use candle::{Module, Result, Tensor};
+use candle::{D, IndexOp, Module, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder, layer_norm, linear};
 
 use super::config::{ObservationEncoderConfig, VectorMlpConfig, WorldModelConfig};
@@ -134,6 +134,24 @@ impl WorldModel {
 
         let refs = frames.iter().collect::<Vec<_>>();
         Tensor::stack(&refs, 1)?.reshape((b, s, (), d))
+    }
+
+    pub fn goal_cost(&self, predicted_emb: &Tensor, goal_emb: &Tensor) -> Result<Tensor> {
+        let pred_dims = predicted_emb.dims();
+        if pred_dims.len() != 4 {
+            candle::bail!(
+                "predicted_emb expects [batch, samples, time, dim], got {:?}",
+                predicted_emb.shape()
+            );
+        }
+        let goal = match goal_emb.dims() {
+            [b, d] if *b == pred_dims[0] && *d == pred_dims[3] => goal_emb.clone(),
+            [b, t, d] if *b == pred_dims[0] && *d == pred_dims[3] => goal_emb.i((.., t - 1, ..))?,
+            other => candle::bail!("unsupported goal embedding shape {other:?}"),
+        };
+        let pred_last = predicted_emb.i((.., .., pred_dims[2] - 1, ..))?;
+        let goal = goal.unsqueeze(1)?.broadcast_as(pred_last.shape())?;
+        (pred_last - goal)?.sqr()?.sum(D::Minus1)
     }
 }
 

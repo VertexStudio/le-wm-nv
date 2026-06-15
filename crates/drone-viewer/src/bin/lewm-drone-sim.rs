@@ -1,7 +1,15 @@
-use std::env;
+use std::{env, fs, path::PathBuf, time::Instant};
 
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 use bevy::{input::mouse::MouseWheel, prelude::*};
+use candle::{DType, Device as CandleDevice, Tensor};
+use le_wm_nv::{
+    checkpoint,
+    data::drone_racing::{DroneNormalization, RunningStats},
+    models::world_model::{WorldModel, WorldModelConfig},
+    planner::{ActionBounds, CandidateScorer, IcemConfig, IcemPlanner},
+    runtime::{DTypeSpec, DeviceSpec},
+};
 
 const ACTION_DIM: usize = 4;
 const OBS_DIM: usize = 16;
@@ -9,10 +17,20 @@ const TELEMETRY_FONT_SIZE: f32 = 0.11;
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
-    App::new()
-        .insert_resource(args.camera)
+    if args.headless_steps > 0 {
+        return run_headless(args);
+    }
+
+    let sim_state = SimState::new(args.dynamics.clone(), args.target.to_pose(), args.max_trail);
+    let controller = args
+        .lewm
+        .as_ref()
+        .map(|cfg| DroneLeWmController::load(cfg, &args.dynamics, &sim_state))
+        .transpose()?;
+    let mut app = App::new();
+    app.insert_resource(args.camera)
         .insert_resource(SimControl::new(args.dynamics.hover_throttle))
-        .insert_resource(SimState::new(args.dynamics, args.max_trail))
+        .insert_resource(sim_state)
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "le-wm-nv Drone Dynamics Sim".to_string(),
@@ -33,8 +51,53 @@ fn main() -> anyhow::Result<()> {
                 draw_sim_overlays,
             )
                 .chain(),
-        )
-        .run();
+        );
+    if let Some(controller) = controller {
+        app.insert_non_send(controller);
+    }
+    app.run();
+    Ok(())
+}
+
+fn run_headless(args: Args) -> anyhow::Result<()> {
+    let sim_state = SimState::new(args.dynamics.clone(), args.target.to_pose(), args.max_trail);
+    let mut state = sim_state;
+    let mut control = SimControl::new(args.dynamics.hover_throttle);
+    let lewm = args
+        .lewm
+        .as_ref()
+        .context("--headless-steps requires LeWM control config")?;
+    let mut controller = DroneLeWmController::load(lewm, &args.dynamics, &state)?;
+    control.action = controller.plan(&state)?;
+    let start_dist = (state.target.pos_world - state.pose.pos_world).length();
+    let started = Instant::now();
+    let dt = 1.0 / state.dynamics.sim_hz;
+
+    for _ in 0..args.headless_steps {
+        state.step(control.action, dt);
+        if controller.observe_if_due(&state) && controller.should_plan_now() {
+            control.action = controller.plan(&state)?;
+        }
+    }
+    let end_dist = (state.target.pos_world - state.pose.pos_world).length();
+    println!(
+        "headless steps={} sim_time={:.3}s wall={:.3}s start_dist={:.3} end_dist={:.3} pos=[{:.3} {:.3} {:.3}] action=[{:.3} {:.3} {:.3} {:.3}] plans={} last_plan_ms={:.3} best={:.6}",
+        args.headless_steps,
+        state.time,
+        started.elapsed().as_secs_f32(),
+        start_dist,
+        end_dist,
+        state.pose.pos_world.x,
+        state.pose.pos_world.y,
+        state.pose.pos_world.z,
+        control.action[0],
+        control.action[1],
+        control.action[2],
+        control.action[3],
+        controller.plan_count,
+        controller.last_plan_ms,
+        controller.last_best_score,
+    );
     Ok(())
 }
 
@@ -42,7 +105,10 @@ fn main() -> anyhow::Result<()> {
 struct Args {
     dynamics: DynamicsConfig,
     camera: FollowCameraConfig,
+    target: TargetConfig,
+    lewm: Option<LeWmControlConfig>,
     max_trail: usize,
+    headless_steps: usize,
 }
 
 impl Args {
@@ -54,7 +120,13 @@ impl Args {
                 height: 2.2,
                 spring: 8.0,
             },
+            target: TargetConfig {
+                pos_world: Vec3::new(4.0, 0.0, 1.6),
+                yaw_rad: 0.0,
+            },
+            lewm: None,
             max_trail: 2400,
+            headless_steps: 0,
         };
         let mut iter = env::args().skip(1);
         while let Some(arg) = iter.next() {
@@ -79,6 +151,31 @@ impl Args {
                 "--camera-distance" => args.camera.distance = next_parse(&mut iter, &arg)?,
                 "--camera-height" => args.camera.height = next_parse(&mut iter, &arg)?,
                 "--camera-spring" => args.camera.spring = next_parse(&mut iter, &arg)?,
+                "--target-pos" => args.target.pos_world = next_vec3(&mut iter, &arg)?,
+                "--target-yaw" => args.target.yaw_rad = next_parse(&mut iter, &arg)?,
+                "--model-dir" => args.lewm_mut().model_dir = Some(next_path(&mut iter, &arg)?),
+                "--weights" => args.lewm_mut().weights = Some(next_path(&mut iter, &arg)?),
+                "--config" => args.lewm_mut().config = Some(next_path(&mut iter, &arg)?),
+                "--normalization" => {
+                    args.lewm_mut().normalization = Some(next_path(&mut iter, &arg)?)
+                }
+                "--device" => args.lewm_mut().device = next_parse(&mut iter, &arg)?,
+                "--dtype" => args.lewm_mut().dtype = next_parse(&mut iter, &arg)?,
+                "--model-hz" => args.lewm_mut().model_hz = next_parse(&mut iter, &arg)?,
+                "--planner-horizon" => args.lewm_mut().horizon = next_parse(&mut iter, &arg)?,
+                "--planner-samples" => args.lewm_mut().samples = next_parse(&mut iter, &arg)?,
+                "--planner-elites" => args.lewm_mut().elites = next_parse(&mut iter, &arg)?,
+                "--planner-iterations" => args.lewm_mut().iterations = next_parse(&mut iter, &arg)?,
+                "--planner-every" => {
+                    args.lewm_mut().plan_every_model_steps = next_parse(&mut iter, &arg)?
+                }
+                "--planner-init-std" => args.lewm_mut().init_std = next_parse(&mut iter, &arg)?,
+                "--planner-min-std" => args.lewm_mut().min_std = next_parse(&mut iter, &arg)?,
+                "--target-lookahead" => {
+                    args.lewm_mut().target_lookahead = next_parse(&mut iter, &arg)?
+                }
+                "--seed" => args.lewm_mut().seed = Some(next_parse(&mut iter, &arg)?),
+                "--headless-steps" => args.headless_steps = next_parse(&mut iter, &arg)?,
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -88,6 +185,10 @@ impl Args {
         }
         args.validate()?;
         Ok(args)
+    }
+
+    fn lewm_mut(&mut self) -> &mut LeWmControlConfig {
+        self.lewm.get_or_insert_with(LeWmControlConfig::default)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -110,6 +211,18 @@ impl Args {
             self.dynamics.max_thrust_weight >= 1.0,
             "--max-thrust-weight must be at least 1.0"
         );
+        ensure!(
+            self.dynamics.max_roll_rate > 0.0,
+            "--max-roll-rate must be positive"
+        );
+        ensure!(
+            self.dynamics.max_pitch_rate > 0.0,
+            "--max-pitch-rate must be positive"
+        );
+        ensure!(
+            self.dynamics.max_yaw_rate > 0.0,
+            "--max-yaw-rate must be positive"
+        );
         ensure!(self.max_trail > 1, "--max-trail must be greater than 1");
         ensure!(
             self.camera.distance > 0.25,
@@ -120,6 +233,23 @@ impl Args {
             "--camera-height must be non-negative"
         );
         ensure!(self.camera.spring > 0.0, "--camera-spring must be positive");
+        ensure!(
+            self.target.pos_world.is_finite(),
+            "--target-pos must contain finite values"
+        );
+        ensure!(
+            self.target.yaw_rad.is_finite(),
+            "--target-yaw must be finite"
+        );
+        if let Some(lewm) = self.lewm.as_ref() {
+            lewm.validate()?;
+        }
+        if self.headless_steps > 0 {
+            ensure!(
+                self.lewm.is_some(),
+                "--headless-steps requires --model-dir or --weights"
+            );
+        }
         Ok(())
     }
 }
@@ -137,6 +267,31 @@ where
         .map_err(|err| anyhow::anyhow!("invalid value `{value}` for {flag}: {err}"))
 }
 
+fn next_path(iter: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(iter.next().ok_or_else(|| {
+        anyhow::anyhow!("missing value after {flag}")
+    })?))
+}
+
+fn next_vec3(iter: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<Vec3> {
+    let value = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing value after {flag}"))?;
+    parse_vec3(&value).with_context(|| format!("invalid value `{value}` for {flag}"))
+}
+
+fn parse_vec3(value: &str) -> anyhow::Result<Vec3> {
+    let parts = value.split(',').collect::<Vec<_>>();
+    ensure!(
+        parts.len() == 3,
+        "expected comma-separated x,y,z, got {value}"
+    );
+    let x = parts[0].trim().parse::<f32>()?;
+    let y = parts[1].trim().parse::<f32>()?;
+    let z = parts[2].trim().parse::<f32>()?;
+    Ok(Vec3::new(x, y, z))
+}
+
 fn print_help() {
     println!(
         "Usage: lewm-drone-sim [options]\n\
@@ -147,7 +302,7 @@ fn print_help() {
            --max-frame-steps <n>         default 20\n\
            --mass <kg>                   default 1.3\n\
            --gravity <m/s^2>             default 9.81\n\
-           --hover-throttle <0..1>       default 0.5\n\
+           --hover-throttle <0..1>       default 0.305\n\
            --max-thrust-weight <ratio>   default 2.2\n\
            --max-roll-rate <rad/s>       default 8\n\
            --max-pitch-rate <rad/s>      default 8\n\
@@ -163,8 +318,32 @@ fn print_help() {
            --camera-spring <rate>        default 8\n\
            --max-trail <steps>           default 2400\n\
          \n\
+         Target options:\n\
+           --target-pos <x,y,z>           default 4,0,1.6\n\
+           --target-yaw <rad>             default 0\n\
+         \n\
+         LeWM control options:\n\
+           --model-dir <dir>              run dir containing final.safetensors, model-config.json, normalization.json\n\
+           --weights <path>               overrides --model-dir/final.safetensors\n\
+           --config <path>                overrides --model-dir/model-config.json\n\
+           --normalization <path>         overrides --model-dir/normalization.json\n\
+           --device <cuda[:idx]>          default cuda:0\n\
+           --dtype <f32|bf16|f16>         default f32\n\
+           --model-hz <hz>                default 100\n\
+           --planner-horizon <steps>      default 12, clamped to checkpoint history\n\
+           --planner-samples <n>          default 64\n\
+           --planner-elites <n>           default 8\n\
+           --planner-iterations <n>       default 1\n\
+           --planner-every <model steps>  default 5\n\
+           --planner-init-std <raw units> default 0.25\n\
+           --planner-min-std <raw units>  default 0.005\n\
+           --target-lookahead <meters>    default 0.5\n\
+           --seed <u64>                   deterministic CUDA candidate noise\n\
+           --headless-steps <n>           run planner/sim smoke test without Bevy window\n\
+         \n\
          Controls:\n\
            W/S pitch forward/back, A/D roll left/right, Q/E yaw left/right, R/F throttle\n\
+           L toggles LeWM control when loaded\n\
            Z zero roll/pitch/yaw, X hover throttle, P pause, Backspace reset\n\
            mouse wheel or [/] camera distance, 3/4 camera height, 1/2 camera spring"
     );
@@ -196,7 +375,7 @@ impl Default for DynamicsConfig {
             max_frame_steps: 20,
             mass: 1.3,
             gravity: 9.81,
-            hover_throttle: 0.5,
+            hover_throttle: 0.305,
             max_thrust_weight: 2.2,
             max_roll_rate: 8.0,
             max_pitch_rate: 8.0,
@@ -214,6 +393,140 @@ struct FollowCameraConfig {
     distance: f32,
     height: f32,
     spring: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TargetConfig {
+    pos_world: Vec3,
+    yaw_rad: f32,
+}
+
+impl TargetConfig {
+    fn to_pose(self) -> TargetPose {
+        TargetPose {
+            pos_world: self.pos_world,
+            rot_world_from_body: Quat::from_rotation_z(self.yaw_rad),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LeWmControlConfig {
+    model_dir: Option<PathBuf>,
+    weights: Option<PathBuf>,
+    config: Option<PathBuf>,
+    normalization: Option<PathBuf>,
+    device: DeviceSpec,
+    dtype: DTypeSpec,
+    model_hz: f32,
+    horizon: usize,
+    samples: usize,
+    elites: usize,
+    iterations: usize,
+    plan_every_model_steps: usize,
+    init_std: f32,
+    min_std: f32,
+    target_lookahead: f32,
+    seed: Option<u64>,
+}
+
+impl Default for LeWmControlConfig {
+    fn default() -> Self {
+        Self {
+            model_dir: None,
+            weights: None,
+            config: None,
+            normalization: None,
+            device: DeviceSpec::default(),
+            dtype: DTypeSpec::default(),
+            model_hz: 100.0,
+            horizon: 12,
+            samples: 64,
+            elites: 8,
+            iterations: 1,
+            plan_every_model_steps: 5,
+            init_std: 0.25,
+            min_std: 0.005,
+            target_lookahead: 0.5,
+            seed: None,
+        }
+    }
+}
+
+impl LeWmControlConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        let has_model_dir = self.model_dir.is_some();
+        let has_explicit_files =
+            self.weights.is_some() && self.config.is_some() && self.normalization.is_some();
+        ensure!(
+            has_model_dir || has_explicit_files,
+            "LeWM control requires --model-dir or all of --weights, --config, --normalization"
+        );
+        ensure!(self.model_hz > 0.0, "--model-hz must be positive");
+        ensure!(
+            self.horizon > 0,
+            "--planner-horizon must be greater than zero"
+        );
+        ensure!(self.samples >= 2, "--planner-samples must be at least two");
+        ensure!(self.elites >= 2, "--planner-elites must be at least two");
+        ensure!(
+            self.elites <= self.samples,
+            "--planner-elites cannot exceed --planner-samples"
+        );
+        ensure!(
+            self.iterations > 0,
+            "--planner-iterations must be greater than zero"
+        );
+        ensure!(
+            self.plan_every_model_steps > 0,
+            "--planner-every must be greater than zero"
+        );
+        ensure!(
+            self.init_std.is_finite() && self.init_std > 0.0,
+            "--planner-init-std must be finite and positive"
+        );
+        ensure!(
+            self.min_std.is_finite() && self.min_std >= 0.0,
+            "--planner-min-std must be finite and non-negative"
+        );
+        ensure!(
+            self.target_lookahead.is_finite() && self.target_lookahead > 0.0,
+            "--target-lookahead must be finite and positive"
+        );
+        Ok(())
+    }
+
+    fn weights_path(&self) -> anyhow::Result<PathBuf> {
+        self.file_path(self.weights.as_ref(), "final.safetensors", "--weights")
+    }
+
+    fn config_path(&self) -> anyhow::Result<PathBuf> {
+        self.file_path(self.config.as_ref(), "model-config.json", "--config")
+    }
+
+    fn normalization_path(&self) -> anyhow::Result<PathBuf> {
+        self.file_path(
+            self.normalization.as_ref(),
+            "normalization.json",
+            "--normalization",
+        )
+    }
+
+    fn file_path(
+        &self,
+        explicit: Option<&PathBuf>,
+        model_dir_name: &str,
+        flag: &str,
+    ) -> anyhow::Result<PathBuf> {
+        if let Some(path) = explicit {
+            return Ok(path.clone());
+        }
+        let dir = self
+            .model_dir
+            .as_ref()
+            .with_context(|| format!("missing {flag} and --model-dir"))?;
+        Ok(dir.join(model_dir_name))
+    }
 }
 
 #[derive(Resource)]
@@ -251,22 +564,20 @@ struct SimState {
 }
 
 impl SimState {
-    fn new(dynamics: DynamicsConfig, max_trail: usize) -> Self {
+    fn new(dynamics: DynamicsConfig, target: TargetPose, max_trail: usize) -> Self {
         let pose = DronePose::initial();
+        let hover_action = [0.0, 0.0, dynamics.hover_throttle, 0.0];
         Self {
             dynamics,
             pose,
-            previous_action: [0.0, 0.0, 0.0, 0.0],
+            previous_action: hover_action,
             time: 0.0,
             step: 0,
             last_step_ms: 0.0,
             avg_step_ms: 0.0,
             trail: vec![pose.pos_world],
             max_trail,
-            target: TargetPose {
-                pos_world: Vec3::new(4.0, 0.0, 1.6),
-                rot_world_from_body: Quat::IDENTITY,
-            },
+            target,
         }
     }
 
@@ -335,7 +646,7 @@ impl DronePose {
 
         let desired_rates = Vec3::new(
             -roll * cfg.max_roll_rate,
-            pitch * cfg.max_pitch_rate,
+            -pitch * cfg.max_pitch_rate,
             yaw * cfg.max_yaw_rate,
         );
         let rate_error = desired_rates - self.ang_vel_body;
@@ -377,6 +688,375 @@ impl DronePose {
 struct TargetPose {
     pos_world: Vec3,
     rot_world_from_body: Quat,
+}
+
+struct DroneLeWmController {
+    model: WorldModel,
+    device: CandleDevice,
+    dtype: DType,
+    obs_mean: Tensor,
+    obs_std: Tensor,
+    action_mean: Tensor,
+    action_std: Tensor,
+    target_emb: Tensor,
+    planner: IcemPlanner,
+    history_raw: Vec<[f32; OBS_DIM]>,
+    hover_action: [f32; ACTION_DIM],
+    last_action: [f32; ACTION_DIM],
+    enabled: bool,
+    sim_steps_per_model_step: usize,
+    next_observe_step: usize,
+    model_step: usize,
+    plan_every_model_steps: usize,
+    target_lookahead: f32,
+    last_carrot: Vec3,
+    plan_count: usize,
+    last_best_score: f32,
+    last_plan_ms: f32,
+    last_iterations: usize,
+    last_error: Option<String>,
+}
+
+impl DroneLeWmController {
+    fn load(
+        cfg: &LeWmControlConfig,
+        dynamics: &DynamicsConfig,
+        state: &SimState,
+    ) -> anyhow::Result<Self> {
+        let weights = cfg.weights_path()?;
+        let config = cfg.config_path()?;
+        let normalization = cfg.normalization_path()?;
+        let model_cfg: WorldModelConfig = serde_json::from_str(
+            &fs::read_to_string(&config)
+                .with_context(|| format!("failed to read {}", config.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", config.display()))?;
+        let normalization: DroneNormalization = serde_json::from_str(
+            &fs::read_to_string(&normalization)
+                .with_context(|| format!("failed to read {}", normalization.display()))?,
+        )
+        .with_context(|| "failed to parse LeWM normalization")?;
+        validate_stats("observation", &normalization.observation, OBS_DIM)?;
+        validate_stats("action", &normalization.action, ACTION_DIM)?;
+
+        let device = cfg.device.resolve()?;
+        let dtype = cfg.dtype.dtype();
+        let vb = checkpoint::var_builder_from_path(&weights, dtype, &device)
+            .with_context(|| format!("failed to load weights {}", weights.display()))?;
+        let model = WorldModel::new(model_cfg.clone(), vb)?;
+        ensure!(
+            model_cfg.history_size > 0,
+            "model history_size must be greater than zero"
+        );
+        ensure!(
+            model_cfg.action_encoder.input_dim == ACTION_DIM,
+            "model action dim {} does not match simulator action dim {ACTION_DIM}",
+            model_cfg.action_encoder.input_dim
+        );
+        let history_size = model_cfg.history_size;
+        let horizon = cfg.horizon.max(history_size);
+        let elites = cfg.elites.min(cfg.samples);
+        let mut planner_cfg = IcemConfig::new(horizon, cfg.samples, elites, ACTION_DIM);
+        planner_cfg.iterations = cfg.iterations;
+        planner_cfg.keep_elites = elites;
+        planner_cfg.init_std = cfg.init_std;
+        planner_cfg.min_std = cfg.min_std;
+        planner_cfg.seed = cfg.seed;
+        planner_cfg.action_bounds = ActionBounds {
+            low: vec![-1.0, -1.0, 0.0, -1.0],
+            high: vec![1.0, 1.0, 1.0, 1.0],
+        };
+
+        let obs_mean = Tensor::from_vec(normalization.observation.mean, (OBS_DIM,), &device)?
+            .to_dtype(dtype)?
+            .reshape((1, 1, OBS_DIM))?;
+        let obs_std = Tensor::from_vec(normalization.observation.std, (OBS_DIM,), &device)?
+            .to_dtype(dtype)?
+            .reshape((1, 1, OBS_DIM))?;
+        let action_mean = Tensor::from_vec(normalization.action.mean, (ACTION_DIM,), &device)?
+            .to_dtype(dtype)?
+            .reshape((1, 1, 1, ACTION_DIM))?;
+        let action_std = Tensor::from_vec(normalization.action.std, (ACTION_DIM,), &device)?
+            .to_dtype(dtype)?
+            .reshape((1, 1, 1, ACTION_DIM))?;
+
+        let hover_action = [0.0, 0.0, dynamics.hover_throttle, 0.0];
+        let sim_steps_per_model_step = ((dynamics.sim_hz / cfg.model_hz).round() as usize).max(1);
+        let target_emb = encode_target_embedding(
+            &model,
+            &obs_mean,
+            &obs_std,
+            dtype,
+            &device,
+            state.target,
+            hover_action,
+        )?;
+        let mut controller = Self {
+            model,
+            device,
+            dtype,
+            obs_mean,
+            obs_std,
+            action_mean,
+            action_std,
+            target_emb,
+            planner: IcemPlanner::new(planner_cfg),
+            history_raw: vec![state.obs16(); history_size],
+            hover_action,
+            last_action: hover_action,
+            enabled: true,
+            sim_steps_per_model_step,
+            next_observe_step: sim_steps_per_model_step,
+            model_step: 0,
+            plan_every_model_steps: cfg.plan_every_model_steps,
+            target_lookahead: cfg.target_lookahead,
+            last_carrot: state.target.pos_world,
+            plan_count: 0,
+            last_best_score: f32::NAN,
+            last_plan_ms: 0.0,
+            last_iterations: 0,
+            last_error: None,
+        };
+        controller.reset_warm_start()?;
+        controller.device.synchronize()?;
+        Ok(controller)
+    }
+
+    fn reset(&mut self, state: &SimState) -> anyhow::Result<()> {
+        let obs = state.obs16();
+        for slot in &mut self.history_raw {
+            *slot = obs;
+        }
+        self.next_observe_step = state.step + self.sim_steps_per_model_step;
+        self.model_step = 0;
+        self.plan_count = 0;
+        self.last_best_score = f32::NAN;
+        self.last_plan_ms = 0.0;
+        self.last_iterations = 0;
+        self.last_error = None;
+        self.last_action = self.hover_action;
+        self.last_carrot = state.target.pos_world;
+        self.reset_warm_start()
+    }
+
+    fn reset_warm_start(&mut self) -> anyhow::Result<()> {
+        let horizon = self.planner.config().horizon;
+        let mut values = Vec::with_capacity(horizon * ACTION_DIM);
+        for _ in 0..horizon {
+            values.extend_from_slice(&self.hover_action);
+        }
+        let sequence = Tensor::from_vec(values, (1, horizon, ACTION_DIM), &self.device)?
+            .to_dtype(self.dtype)?;
+        self.planner.set_warm_start_sequence(sequence);
+        Ok(())
+    }
+
+    fn observe_if_due(&mut self, state: &SimState) -> bool {
+        if state.step < self.next_observe_step {
+            return false;
+        }
+        while self.next_observe_step <= state.step {
+            self.next_observe_step += self.sim_steps_per_model_step;
+        }
+        self.observe(state.obs16());
+        self.model_step += 1;
+        true
+    }
+
+    fn observe(&mut self, obs: [f32; OBS_DIM]) {
+        self.history_raw.rotate_left(1);
+        if let Some(last) = self.history_raw.last_mut() {
+            *last = obs;
+        }
+    }
+
+    fn should_plan_now(&self) -> bool {
+        self.model_step % self.plan_every_model_steps == 0
+    }
+
+    fn plan(&mut self, state: &SimState) -> anyhow::Result<[f32; ACTION_DIM]> {
+        self.device.synchronize()?;
+        let started = Instant::now();
+        let carrot = self.carrot_pose(state);
+        let target_emb = encode_target_embedding(
+            &self.model,
+            &self.obs_mean,
+            &self.obs_std,
+            self.dtype,
+            &self.device,
+            carrot,
+            self.hover_action,
+        )?;
+        let history = self.history_tensor()?;
+        let history = history
+            .broadcast_sub(&self.obs_mean)?
+            .broadcast_div(&self.obs_std)?;
+        let history_emb = self.model.encode_vector(&history)?;
+        let scorer = DroneLeWmScorer {
+            model: &self.model,
+            device: &self.device,
+            dtype: self.dtype,
+            history_emb: &history_emb,
+            target_emb: &target_emb,
+            action_mean: &self.action_mean,
+            action_std: &self.action_std,
+        };
+        let result = self.planner.plan_device(&scorer)?;
+        self.device.synchronize()?;
+
+        let first = result.first_action.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let row = first
+            .first()
+            .context("LeWM planner produced an empty first action")?;
+        ensure!(
+            row.len() == ACTION_DIM,
+            "LeWM first action dim {} does not match {ACTION_DIM}",
+            row.len()
+        );
+        let mut action = [0.0f32; ACTION_DIM];
+        action.copy_from_slice(row);
+        action = clamp_action(action);
+
+        self.last_best_score = best_score(&result.scores).unwrap_or(f32::NAN);
+        self.last_plan_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.last_iterations = result.iterations_completed;
+        self.plan_count += 1;
+        self.last_action = action;
+        self.last_carrot = carrot.pos_world;
+        self.target_emb = target_emb;
+        Ok(action)
+    }
+
+    fn carrot_pose(&self, state: &SimState) -> TargetPose {
+        let delta = state.target.pos_world - state.pose.pos_world;
+        let dist = delta.length();
+        let snap_distance = self.target_lookahead * 3.0;
+        let pos_world = if dist > snap_distance {
+            state.pose.pos_world + delta / dist * self.target_lookahead
+        } else {
+            state.target.pos_world
+        };
+        TargetPose {
+            pos_world,
+            rot_world_from_body: state.target.rot_world_from_body,
+        }
+    }
+
+    fn history_tensor(&self) -> anyhow::Result<Tensor> {
+        let mut values = Vec::with_capacity(self.history_raw.len() * OBS_DIM);
+        for obs in &self.history_raw {
+            values.extend_from_slice(obs);
+        }
+        Ok(
+            Tensor::from_vec(values, (1, self.history_raw.len(), OBS_DIM), &self.device)?
+                .to_dtype(self.dtype)?,
+        )
+    }
+}
+
+struct DroneLeWmScorer<'a> {
+    model: &'a WorldModel,
+    device: &'a CandleDevice,
+    dtype: DType,
+    history_emb: &'a Tensor,
+    target_emb: &'a Tensor,
+    action_mean: &'a Tensor,
+    action_std: &'a Tensor,
+}
+
+impl CandidateScorer for DroneLeWmScorer<'_> {
+    fn device(&self) -> &CandleDevice {
+        self.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn batch_size(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn score_candidates(&self, action_candidates: &Tensor) -> candle::Result<Tensor> {
+        let action_candidates = action_candidates
+            .to_device(self.device)?
+            .to_dtype(self.dtype)?;
+        let normalized_actions = action_candidates
+            .broadcast_sub(self.action_mean)?
+            .broadcast_div(self.action_std)?;
+        let (_, history, dim) = self.history_emb.dims3()?;
+        let (_, samples, _, _) = normalized_actions.dims4()?;
+        let emb_init = self
+            .history_emb
+            .unsqueeze(1)?
+            .broadcast_as((1, samples, history, dim))?;
+        let rollout =
+            self.model
+                .rollout_embeddings_with_history(&emb_init, &normalized_actions, history)?;
+        self.model.goal_cost(&rollout, self.target_emb)
+    }
+}
+
+fn encode_target_embedding(
+    model: &WorldModel,
+    obs_mean: &Tensor,
+    obs_std: &Tensor,
+    dtype: DType,
+    device: &CandleDevice,
+    target: TargetPose,
+    target_action: [f32; ACTION_DIM],
+) -> anyhow::Result<Tensor> {
+    let target_obs = target_obs16(target, target_action);
+    let target = Tensor::from_vec(target_obs.to_vec(), (1, 1, OBS_DIM), device)?.to_dtype(dtype)?;
+    let target = target.broadcast_sub(obs_mean)?.broadcast_div(obs_std)?;
+    Ok(model.encode_vector(&target)?)
+}
+
+fn target_obs16(target: TargetPose, previous_action: [f32; ACTION_DIM]) -> [f32; OBS_DIM] {
+    let mut obs = [0.0; OBS_DIM];
+    obs[0..3].copy_from_slice(&vec3_array(target.pos_world));
+    obs[3..12].copy_from_slice(&rotmat_world_from_body_array(target.rot_world_from_body));
+    obs[12..16].copy_from_slice(&previous_action);
+    obs
+}
+
+fn validate_stats(name: &str, stats: &RunningStats, dim: usize) -> anyhow::Result<()> {
+    ensure!(
+        stats.mean.len() == dim && stats.std.len() == dim,
+        "{name} normalization dims mean={} std={} expected {dim}",
+        stats.mean.len(),
+        stats.std.len()
+    );
+    for (idx, (&mean, &std)) in stats.mean.iter().zip(stats.std.iter()).enumerate() {
+        ensure!(mean.is_finite(), "{name} mean[{idx}] is not finite");
+        ensure!(
+            std.is_finite() && std > 0.0,
+            "{name} std[{idx}] must be positive and finite"
+        );
+    }
+    Ok(())
+}
+
+fn clamp_action(action: [f32; ACTION_DIM]) -> [f32; ACTION_DIM] {
+    [
+        action[0].clamp(-1.0, 1.0),
+        action[1].clamp(-1.0, 1.0),
+        action[2].clamp(0.0, 1.0),
+        action[3].clamp(-1.0, 1.0),
+    ]
+}
+
+fn best_score(scores: &Tensor) -> anyhow::Result<f32> {
+    let values = scores
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    values
+        .into_iter()
+        .reduce(f32::min)
+        .context("planner produced empty score tensor")
 }
 
 #[derive(Component)]
@@ -475,14 +1155,26 @@ fn update_controls(
     mut control: ResMut<SimControl>,
     mut camera: ResMut<FollowCameraConfig>,
     mut state: ResMut<SimState>,
+    mut controller: Option<NonSendMut<DroneLeWmController>>,
 ) {
     if keys.just_pressed(KeyCode::KeyP) {
         control.paused = !control.paused;
+    }
+    if keys.just_pressed(KeyCode::KeyL)
+        && let Some(controller) = controller.as_mut()
+    {
+        controller.enabled = !controller.enabled;
     }
     if keys.just_pressed(KeyCode::Backspace) {
         control.action = control.hover_action;
         control.accumulator = 0.0;
         state.reset(control.hover_action);
+        if let Some(controller) = controller.as_mut() {
+            controller
+                .reset(&state)
+                .expect("failed to reset LeWM controller");
+            control.action = controller.last_action;
+        }
     }
     if keys.just_pressed(KeyCode::KeyZ) {
         control.action[0] = 0.0;
@@ -494,15 +1186,20 @@ fn update_controls(
     }
 
     let dt = time.delta_secs().max(1.0 / 240.0);
-    let target_roll = axis(keys.pressed(KeyCode::KeyA), keys.pressed(KeyCode::KeyD));
-    let target_pitch = axis(keys.pressed(KeyCode::KeyS), keys.pressed(KeyCode::KeyW));
-    let target_yaw = axis(keys.pressed(KeyCode::KeyQ), keys.pressed(KeyCode::KeyE));
-    control.action[0] = approach(control.action[0], target_roll, 5.0 * dt);
-    control.action[1] = approach(control.action[1], target_pitch, 5.0 * dt);
-    control.action[3] = approach(control.action[3], target_yaw, 5.0 * dt);
+    let lewm_enabled = controller
+        .as_ref()
+        .is_some_and(|controller| controller.enabled);
+    if !lewm_enabled {
+        let target_roll = axis(keys.pressed(KeyCode::KeyA), keys.pressed(KeyCode::KeyD));
+        let target_pitch = axis(keys.pressed(KeyCode::KeyS), keys.pressed(KeyCode::KeyW));
+        let target_yaw = axis(keys.pressed(KeyCode::KeyQ), keys.pressed(KeyCode::KeyE));
+        control.action[0] = approach(control.action[0], target_roll, 5.0 * dt);
+        control.action[1] = approach(control.action[1], target_pitch, 5.0 * dt);
+        control.action[3] = approach(control.action[3], target_yaw, 5.0 * dt);
 
-    let throttle_delta = axis(keys.pressed(KeyCode::KeyF), keys.pressed(KeyCode::KeyR));
-    control.action[2] = (control.action[2] + throttle_delta * 0.75 * dt).clamp(0.0, 1.0);
+        let throttle_delta = axis(keys.pressed(KeyCode::KeyF), keys.pressed(KeyCode::KeyR));
+        control.action[2] = (control.action[2] + throttle_delta * 0.75 * dt).clamp(0.0, 1.0);
+    }
 
     for event in scroll.read() {
         camera.distance = (camera.distance - event.y * 0.6).clamp(1.0, 40.0);
@@ -527,7 +1224,12 @@ fn update_controls(
     }
 }
 
-fn step_simulation(time: Res<Time>, mut control: ResMut<SimControl>, mut state: ResMut<SimState>) {
+fn step_simulation(
+    time: Res<Time>,
+    mut control: ResMut<SimControl>,
+    mut state: ResMut<SimState>,
+    mut controller: Option<NonSendMut<DroneLeWmController>>,
+) {
     if control.paused {
         return;
     }
@@ -537,7 +1239,23 @@ fn step_simulation(time: Res<Time>, mut control: ResMut<SimControl>, mut state: 
     while control.accumulator >= dt && steps < state.dynamics.max_frame_steps {
         control.accumulator -= dt;
         steps += 1;
-        state.step(control.action, dt);
+        let mut action = control.action;
+        if let Some(controller) = controller.as_ref()
+            && controller.enabled
+        {
+            action = controller.last_action;
+        }
+        state.step(action, dt);
+        control.action = action;
+        if let Some(controller) = controller.as_mut()
+            && controller.enabled
+            && controller.observe_if_due(&state)
+            && controller.should_plan_now()
+        {
+            control.action = controller
+                .plan(&state)
+                .expect("LeWM controller planning failed");
+        }
     }
 }
 
@@ -616,6 +1334,7 @@ fn draw_sim_overlays(
     state: Res<SimState>,
     control: Res<SimControl>,
     camera: Res<FollowCameraConfig>,
+    controller: Option<NonSend<DroneLeWmController>>,
 ) {
     let pose = state.pose;
     let pos = view_vec3(pose.pos_world);
@@ -629,6 +1348,12 @@ fn draw_sim_overlays(
     draw_trail(&mut gizmos, &state.trail);
     draw_action_bars(&mut gizmos, pos, &control.action);
     draw_target_pose(&mut gizmos, state.target);
+    if let Some(controller) = controller.as_ref() {
+        let carrot = view_vec3(controller.last_carrot);
+        gizmos.sphere(carrot, 0.13, Color::srgb(1.0, 0.55, 0.05));
+        draw_cross(&mut gizmos, carrot, 0.25, Color::srgb(1.0, 0.55, 0.05));
+        gizmos.line(pos, carrot, Color::srgb(1.0, 0.55, 0.05));
+    }
 
     let vel_view = drone_to_view_vec(pose.vel_world);
     if vel_view.length_squared() > 1e-6 {
@@ -638,10 +1363,33 @@ fn draw_sim_overlays(
     let obs = state.obs16();
     let target_dist = (state.target.pos_world - pose.pos_world).length();
     let status = if control.paused { "paused" } else { "running" };
+    let lewm_text = controller
+        .as_ref()
+        .map(|controller| {
+            let mode = if controller.enabled {
+                "lewm:on"
+            } else {
+                "lewm:off"
+            };
+            format!(
+                "{} plans={} plan_ms={:.2} best={:.3} model_step={} every={} carrot=[{:.2} {:.2} {:.2}]",
+                mode,
+                controller.plan_count,
+                controller.last_plan_ms,
+                controller.last_best_score,
+                controller.model_step,
+                controller.plan_every_model_steps,
+                controller.last_carrot.x,
+                controller.last_carrot.y,
+                controller.last_carrot.z,
+            )
+        })
+        .unwrap_or_else(|| "lewm:not-loaded".to_string());
     let text = format!(
         "{} t={:.2}s step={} pos=[{:.2} {:.2} {:.2}] dist={:.2}\n\
          a roll={:.2} pitch={:.2} thr={:.2} yaw={:.2} vel=[{:.2} {:.2} {:.2}] rates=[{:.2} {:.2} {:.2}]\n\
-         obs16 pos=[{:.2} {:.2} {:.2}] cam dist={:.1} height={:.1} spring={:.1} step_ms={:.4}",
+         obs16 pos=[{:.2} {:.2} {:.2}] cam dist={:.1} height={:.1} spring={:.1} step_ms={:.4}\n\
+         {}",
         status,
         state.time,
         state.step,
@@ -666,6 +1414,7 @@ fn draw_sim_overlays(
         camera.height,
         camera.spring,
         state.avg_step_ms,
+        lewm_text,
     );
     gizmos.text(
         Isometry3d::from_translation(pos + Vec3::Y * 1.35),
