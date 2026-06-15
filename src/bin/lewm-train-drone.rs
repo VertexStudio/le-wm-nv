@@ -347,14 +347,14 @@ fn default_dataset_dir() -> PathBuf {
     home_dir()
         .join(".stable_worldmodel")
         .join("le-wm-nv-data")
-        .join("drone-racing-autonomous-100hz")
+        .join("drone-racing-autonomous-100hz-pose16")
 }
 
 fn default_output_dir() -> PathBuf {
     home_dir()
         .join(".stable_worldmodel")
         .join("le-wm-nv-runs")
-        .join("drone-state-lewm-autonomous-100hz")
+        .join("drone-pose16-lewm-autonomous-100hz")
 }
 
 fn home_dir() -> PathBuf {

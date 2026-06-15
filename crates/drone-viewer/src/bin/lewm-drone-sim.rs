@@ -7,7 +7,7 @@ use le_wm_nv::{
     checkpoint,
     data::drone_racing::{DroneNormalization, RunningStats},
     drone_plant::{DronePlantConfig, DronePlantState},
-    models::world_model::{WorldModel, WorldModelConfig},
+    models::world_model::{ObservationEncoderConfig, WorldModel, WorldModelConfig},
     planner::{ActionBounds, CandidateScorer, IcemConfig, IcemPlanner},
     runtime::{DTypeSpec, DeviceSpec},
 };
@@ -331,7 +331,7 @@ fn print_help() {
            --device <cuda[:idx]>          default cuda:0\n\
            --dtype <f32|bf16|f16>         default f32\n\
            --model-hz <hz>                default 100\n\
-           --planner-horizon <steps>      default 12, clamped to checkpoint history\n\
+           --planner-horizon <steps>      future LeWM rollout steps, default 12\n\
            --planner-samples <n>          default 64\n\
            --planner-elites <n>           default 8\n\
            --planner-iterations <n>       default 1\n\
@@ -697,9 +697,11 @@ struct DroneLeWmController {
     planner: IcemPlanner,
     history_raw: Vec<[f32; OBS_DIM]>,
     hover_action: [f32; ACTION_DIM],
+    target_action: [f32; ACTION_DIM],
     last_action: [f32; ACTION_DIM],
     enabled: bool,
     sim_steps_per_model_step: usize,
+    model_hz: f32,
     next_observe_step: usize,
     model_step: usize,
     plan_every_model_steps: usize,
@@ -748,8 +750,18 @@ impl DroneLeWmController {
             "model action dim {} does not match simulator action dim {ACTION_DIM}",
             model_cfg.action_encoder.input_dim
         );
+        match &model_cfg.observation_encoder {
+            ObservationEncoderConfig::VectorMlp(vector_cfg) => ensure!(
+                vector_cfg.input_dim == OBS_DIM,
+                "model observation dim {} does not match simulator obs dim {OBS_DIM}",
+                vector_cfg.input_dim
+            ),
+            ObservationEncoderConfig::ImageVit { .. } => {
+                anyhow::bail!("drone simulator requires a vector-observation LeWM model")
+            }
+        }
         let history_size = model_cfg.history_size;
-        let horizon = cfg.horizon.max(history_size);
+        let horizon = cfg.horizon;
         let elites = cfg.elites.min(cfg.samples);
         let mut planner_cfg = IcemConfig::new(horizon, cfg.samples, elites, ACTION_DIM);
         planner_cfg.iterations = cfg.iterations;
@@ -761,6 +773,9 @@ impl DroneLeWmController {
             low: vec![-1.0, -1.0, 0.0, -1.0],
             high: vec![1.0, 1.0, 1.0, 1.0],
         };
+
+        let mut target_action = [0.0f32; ACTION_DIM];
+        target_action.copy_from_slice(&normalization.action.mean[..ACTION_DIM]);
 
         let obs_mean = Tensor::from_vec(normalization.observation.mean, (OBS_DIM,), &device)?
             .to_dtype(dtype)?
@@ -777,14 +792,16 @@ impl DroneLeWmController {
 
         let hover_action = [0.0, 0.0, dynamics.hover_throttle, 0.0];
         let sim_steps_per_model_step = ((dynamics.sim_hz / cfg.model_hz).round() as usize).max(1);
+        let target_pose =
+            target_pose_for_horizon(state, horizon, cfg.model_hz, cfg.target_lookahead);
         let target_emb = encode_target_embedding(
             &model,
             &obs_mean,
             &obs_std,
             dtype,
             &device,
-            state.target,
-            hover_action,
+            target_pose,
+            target_action,
         )?;
         let mut controller = Self {
             model,
@@ -798,9 +815,11 @@ impl DroneLeWmController {
             planner: IcemPlanner::new(planner_cfg),
             history_raw: vec![state.obs16(); history_size],
             hover_action,
+            target_action,
             last_action: hover_action,
             enabled: true,
             sim_steps_per_model_step,
+            model_hz: cfg.model_hz,
             next_observe_step: sim_steps_per_model_step,
             model_step: 0,
             plan_every_model_steps: cfg.plan_every_model_steps,
@@ -872,21 +891,27 @@ impl DroneLeWmController {
     fn plan(&mut self, state: &SimState) -> anyhow::Result<[f32; ACTION_DIM]> {
         self.device.synchronize()?;
         let started = Instant::now();
-        let carrot = self.carrot_pose(state);
+        let target_pose = target_pose_for_horizon(
+            state,
+            self.planner.config().horizon,
+            self.model_hz,
+            self.target_lookahead,
+        );
         let target_emb = encode_target_embedding(
             &self.model,
             &self.obs_mean,
             &self.obs_std,
             self.dtype,
             &self.device,
-            carrot,
-            self.hover_action,
+            target_pose,
+            self.target_action,
         )?;
         let history = self.history_tensor()?;
         let history = history
             .broadcast_sub(&self.obs_mean)?
             .broadcast_div(&self.obs_std)?;
         let history_emb = self.model.encode_vector(&history)?;
+        let action_prefix = self.action_history_prefix_tensor()?;
         let scorer = DroneLeWmScorer {
             model: &self.model,
             device: &self.device,
@@ -895,6 +920,7 @@ impl DroneLeWmController {
             target_emb: &target_emb,
             action_mean: &self.action_mean,
             action_std: &self.action_std,
+            action_prefix: action_prefix.as_ref(),
         };
         let result = self.planner.plan_device(&scorer)?;
         self.device.synchronize()?;
@@ -917,24 +943,9 @@ impl DroneLeWmController {
         self.last_iterations = result.iterations_completed;
         self.plan_count += 1;
         self.last_action = action;
-        self.last_carrot = carrot.pos_world;
+        self.last_carrot = target_pose.pos_world;
         self.target_emb = target_emb;
         Ok(action)
-    }
-
-    fn carrot_pose(&self, state: &SimState) -> TargetPose {
-        let delta = state.target.pos_world - state.pose.pos_world;
-        let dist = delta.length();
-        let snap_distance = self.target_lookahead * 3.0;
-        let pos_world = if dist > snap_distance {
-            state.pose.pos_world + delta / dist * self.target_lookahead
-        } else {
-            state.target.pos_world
-        };
-        TargetPose {
-            pos_world,
-            rot_world_from_body: state.target.rot_world_from_body,
-        }
     }
 
     fn history_tensor(&self) -> anyhow::Result<Tensor> {
@@ -947,6 +958,21 @@ impl DroneLeWmController {
                 .to_dtype(self.dtype)?,
         )
     }
+
+    fn action_history_prefix_tensor(&self) -> anyhow::Result<Option<Tensor>> {
+        if self.history_raw.len() <= 1 {
+            return Ok(None);
+        }
+        let prefix_len = self.history_raw.len() - 1;
+        let mut values = Vec::with_capacity(prefix_len * ACTION_DIM);
+        for obs in self.history_raw.iter().skip(1) {
+            values.extend_from_slice(&obs[12..16]);
+        }
+        Ok(Some(
+            Tensor::from_vec(values, (1, 1, prefix_len, ACTION_DIM), &self.device)?
+                .to_dtype(self.dtype)?,
+        ))
+    }
 }
 
 struct DroneLeWmScorer<'a> {
@@ -957,6 +983,7 @@ struct DroneLeWmScorer<'a> {
     target_emb: &'a Tensor,
     action_mean: &'a Tensor,
     action_std: &'a Tensor,
+    action_prefix: Option<&'a Tensor>,
 }
 
 impl CandidateScorer for DroneLeWmScorer<'_> {
@@ -976,11 +1003,18 @@ impl CandidateScorer for DroneLeWmScorer<'_> {
         let action_candidates = action_candidates
             .to_device(self.device)?
             .to_dtype(self.dtype)?;
-        let normalized_actions = action_candidates
+        let (_, samples, _, _) = action_candidates.dims4()?;
+        let actions = match self.action_prefix {
+            Some(prefix) => {
+                let prefix = prefix.broadcast_as((1, samples, prefix.dim(2)?, ACTION_DIM))?;
+                Tensor::cat(&[&prefix, &action_candidates], 2)?
+            }
+            None => action_candidates,
+        };
+        let normalized_actions = actions
             .broadcast_sub(self.action_mean)?
             .broadcast_div(self.action_std)?;
         let (_, history, dim) = self.history_emb.dims3()?;
-        let (_, samples, _, _) = normalized_actions.dims4()?;
         let emb_init = self
             .history_emb
             .unsqueeze(1)?
@@ -1005,6 +1039,53 @@ fn encode_target_embedding(
     let target = Tensor::from_vec(target_obs.to_vec(), (1, 1, OBS_DIM), device)?.to_dtype(dtype)?;
     let target = target.broadcast_sub(obs_mean)?.broadcast_div(obs_std)?;
     Ok(model.encode_vector(&target)?)
+}
+
+fn target_pose_for_horizon(
+    state: &SimState,
+    horizon: usize,
+    model_hz: f32,
+    max_lookahead: f32,
+) -> TargetPose {
+    TargetPose {
+        pos_world: target_position_for_horizon(state, horizon, model_hz, max_lookahead),
+        rot_world_from_body: state.target.rot_world_from_body,
+    }
+}
+
+fn target_position_for_horizon(
+    state: &SimState,
+    horizon: usize,
+    model_hz: f32,
+    max_lookahead: f32,
+) -> Vec3 {
+    let delta = state.target.pos_world - state.pose.pos_world;
+    let dist = delta.length();
+    if dist <= 1e-5 {
+        state.target.pos_world
+    } else {
+        state.pose.pos_world
+            + delta / dist
+                * target_distance_for_horizon(state, horizon.max(1), model_hz, max_lookahead)
+    }
+}
+
+fn target_distance_for_horizon(
+    state: &SimState,
+    horizon: usize,
+    model_hz: f32,
+    max_lookahead: f32,
+) -> f32 {
+    let dist = (state.target.pos_world - state.pose.pos_world).length();
+    if dist <= 1e-5 {
+        return 0.0;
+    }
+    let horizon_seconds = horizon as f32 / model_hz.max(1e-3);
+    let planning_speed = state.pose.vel_world.length().clamp(1.5, 5.0);
+    (planning_speed * horizon_seconds)
+        .max(0.05)
+        .min(max_lookahead)
+        .min(dist)
 }
 
 fn target_obs16(target: TargetPose, previous_action: [f32; ACTION_DIM]) -> [f32; OBS_DIM] {
