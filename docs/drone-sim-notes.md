@@ -60,6 +60,43 @@ The runtime plant keeps the added terms with neutral defaults, so existing
 simulator behavior does not change unless these flags are passed. Sign flips
 remain opt-in in the fitter and are not part of the accepted plant.
 
+## Plan trace diagnostics
+
+`lewm-drone-sim --headless-steps ... --plan-trace <path>` writes per-plan JSON
+diagnostics from the live simulator. Each event records current pose, target
+pose, active gate, selected action sequence, matching dataset expert action
+sequence when available, LeWM scores for both sequences, per-step embedding
+costs, and source-row pose drift.
+
+Current traced failure:
+
+```text
+trace=target/drone-plan-traces/full-lap-h6-fitted-plant.json
+planner=h6/s64/e8/i1 future-min
+plant=fitted aggressive plant
+result=gates=2/4, best_gate_dists=[1:0.85,2:0.84,3:1.63,4:inf]
+```
+
+Gate-3 summary from that trace:
+
+```text
+events=142
+selected_better_than_expert=103
+expert_better_than_selected=39
+mean_selected_score=425.7
+mean_expert_score=484.2
+mean_first_action_l2=1.00
+source_pose_drift=0.98m..49.90m
+target_distance_min=0.60m
+gate3_best_distance=1.63m
+```
+
+Interpretation: this is not just a plant fidelity problem. During gate 3, the
+LeWM objective often scores the selected action sequence better than the
+dataset expert sequence, while the plant state is already drifting away from
+the recorded source-row pose. The next useful work is to improve closed-loop
+target/objective/model behavior, not to add more plant knobs.
+
 ## LeWM expert-action latent rollout
 
 `lewm-drone-rollout-eval` evaluates the trained drone WorldModel directly,

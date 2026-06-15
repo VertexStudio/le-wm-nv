@@ -19,6 +19,7 @@ use le_wm_nv::{
     planner::{ActionBounds, CandidateScorer, IcemConfig, IcemPlanner},
     runtime::{DTypeSpec, DeviceSpec},
 };
+use serde::Serialize;
 
 const ACTION_DIM: usize = 4;
 const OBS_DIM: usize = 12;
@@ -103,6 +104,8 @@ fn run_headless(args: Args) -> anyhow::Result<()> {
         .as_ref()
         .map(|cfg| GateLoop::load(cfg, args.start.as_ref(), &mut state))
         .transpose()?;
+    let expert_lookup = ExpertActionLookup::load(args.start.as_ref(), args.plan_trace.as_ref())?;
+    let mut plan_trace = PlanTrace::new(args.plan_trace.clone());
     let mut control = SimControl::new(args.dynamics.hover_throttle);
     let lewm = args
         .lewm
@@ -110,6 +113,11 @@ fn run_headless(args: Args) -> anyhow::Result<()> {
         .context("--headless-steps requires LeWM control config")?;
     let mut controller = DroneLeWmController::load(lewm, &args.dynamics, &state)?;
     control.action = controller.plan(&state)?;
+    if plan_trace.enabled() {
+        let event =
+            controller.trace_last_plan(&state, gate_loop.as_ref(), expert_lookup.as_ref())?;
+        plan_trace.push(event);
+    }
     let start_dist = (state.target.pos_world - state.pose.pos_world).length();
     let started = Instant::now();
     let dt = 1.0 / state.dynamics.sim_hz;
@@ -124,8 +132,17 @@ fn run_headless(args: Args) -> anyhow::Result<()> {
         }
         if controller.observe_if_due(&state) && controller.should_plan_now() {
             control.action = controller.plan(&state)?;
+            if plan_trace.enabled() {
+                let event = controller.trace_last_plan(
+                    &state,
+                    gate_loop.as_ref(),
+                    expert_lookup.as_ref(),
+                )?;
+                plan_trace.push(event);
+            }
         }
     }
+    plan_trace.write()?;
     let end_dist = (state.target.pos_world - state.pose.pos_world).length();
     let gate_text = gate_loop
         .as_ref()
@@ -162,6 +179,169 @@ fn run_headless(args: Args) -> anyhow::Result<()> {
         gate_text,
     );
     Ok(())
+}
+
+struct PlanTrace {
+    path: Option<PathBuf>,
+    events: Vec<PlanTraceEvent>,
+}
+
+impl PlanTrace {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            events: Vec::new(),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.path.is_some()
+    }
+
+    fn push(&mut self, event: PlanTraceEvent) {
+        self.events.push(event);
+    }
+
+    fn write(&self) -> anyhow::Result<()> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let payload = PlanTraceOutput {
+            event_count: self.events.len(),
+            events: &self.events,
+        };
+        fs::write(path, serde_json::to_vec_pretty(&payload)?)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
+#[derive(Serialize)]
+struct PlanTraceOutput<'a> {
+    event_count: usize,
+    events: &'a [PlanTraceEvent],
+}
+
+#[derive(Serialize)]
+struct PlanTraceEvent {
+    plan_index: usize,
+    sim_step: usize,
+    model_step: usize,
+    sim_time: f32,
+    source_row: Option<usize>,
+    source_pos: Option<[f32; 3]>,
+    source_pos_distance_m: Option<f32>,
+    gate: Option<PlanTraceGate>,
+    current_pos: [f32; 3],
+    target_pos: [f32; 3],
+    target_rot: [f32; 9],
+    selected_first_action: [f32; ACTION_DIM],
+    selected_sequence: Vec<[f32; ACTION_DIM]>,
+    selected_score: f32,
+    selected_step_costs: Vec<f32>,
+    candidate_best_score: f32,
+    expert_first_action: Option<[f32; ACTION_DIM]>,
+    expert_sequence: Option<Vec<[f32; ACTION_DIM]>>,
+    expert_score: Option<f32>,
+    expert_step_costs: Option<Vec<f32>>,
+    first_action_l2: Option<f32>,
+    selected_saturated_channels: usize,
+    planner_ms: f32,
+    planner_iterations: usize,
+    target_distance_m: f32,
+    best_gate_dists: Option<Vec<f32>>,
+}
+
+#[derive(Serialize)]
+struct PlanTraceGate {
+    current_index: usize,
+    gate_count: usize,
+    pass_count: usize,
+    laps_completed: usize,
+    desired_laps: usize,
+    name: String,
+    center: [f32; 3],
+    entry_row: usize,
+    pass_row: usize,
+}
+
+struct ExpertActionLookup {
+    dataset: DroneRacingDataset,
+    start_row: usize,
+}
+
+struct ExpertActionSequence {
+    source_row: usize,
+    source_pos: [f32; 3],
+    actions: Vec<[f32; ACTION_DIM]>,
+}
+
+impl ExpertActionLookup {
+    fn load(
+        start: Option<&StartConfig>,
+        trace_path: Option<&PathBuf>,
+    ) -> anyhow::Result<Option<Self>> {
+        if trace_path.is_none() {
+            return Ok(None);
+        }
+        let Some(start) = start else {
+            return Ok(None);
+        };
+        let Some(start_row) = start.row else {
+            return Ok(None);
+        };
+        let dataset = DroneRacingDataset::open(
+            &start.dataset_dir,
+            DroneBatchConfig {
+                batch_size: 1,
+                sequence_steps: 2,
+                normalize_observations: false,
+                normalize_actions: false,
+            },
+        )
+        .with_context(|| {
+            format!(
+                "failed to open expert trace dataset {}",
+                start.dataset_dir.display()
+            )
+        })?;
+        Ok(Some(Self { dataset, start_row }))
+    }
+
+    fn source_row(&self, model_step: usize) -> usize {
+        self.start_row + model_step
+    }
+
+    fn sequence(
+        &self,
+        model_step: usize,
+        horizon: usize,
+    ) -> anyhow::Result<Option<ExpertActionSequence>> {
+        let source_row = self.source_row(model_step);
+        if source_row + horizon >= self.dataset.metadata().rows {
+            return Ok(None);
+        }
+        let first = self.dataset.frame(source_row)?;
+        let mut actions = Vec::with_capacity(horizon);
+        for offset in 0..horizon {
+            let row = source_row + offset;
+            let frame = self.dataset.frame(row)?;
+            if frame.episode_idx != first.episode_idx
+                || frame.step_idx != first.step_idx + offset as i64
+            {
+                return Ok(None);
+            }
+            actions.push(frame.channels_norm);
+        }
+        Ok(Some(ExpertActionSequence {
+            source_row,
+            source_pos: first.pos_world,
+            actions,
+        }))
+    }
 }
 
 fn inspect_gate_targets(args: Args) -> anyhow::Result<()> {
@@ -335,6 +515,7 @@ struct Args {
     lewm: Option<LeWmControlConfig>,
     max_trail: usize,
     headless_steps: usize,
+    plan_trace: Option<PathBuf>,
     inspect_gate_targets: bool,
     oracle_replay_rows: usize,
 }
@@ -357,6 +538,7 @@ impl Args {
             lewm: None,
             max_trail: 2400,
             headless_steps: 0,
+            plan_trace: None,
             inspect_gate_targets: false,
             oracle_replay_rows: 0,
         };
@@ -429,6 +611,7 @@ impl Args {
                 "--planner-objective" => args.lewm_mut().objective = next_parse(&mut iter, &arg)?,
                 "--seed" => args.lewm_mut().seed = Some(next_parse(&mut iter, &arg)?),
                 "--headless-steps" => args.headless_steps = next_parse(&mut iter, &arg)?,
+                "--plan-trace" => args.plan_trace = Some(next_path(&mut iter, &arg)?),
                 "--inspect-gate-targets" => args.inspect_gate_targets = true,
                 "--oracle-replay-rows" => args.oracle_replay_rows = next_parse(&mut iter, &arg)?,
                 "-h" | "--help" => {
@@ -536,6 +719,12 @@ impl Args {
             ensure!(
                 self.lewm.is_some(),
                 "--headless-steps requires --model-dir or --weights"
+            );
+        }
+        if self.plan_trace.is_some() {
+            ensure!(
+                self.headless_steps > 0,
+                "--plan-trace is only supported with --headless-steps"
             );
         }
         Ok(())
@@ -670,6 +859,7 @@ fn print_help() {
           --planner-objective <terminal|future-mean|future-min> default future-mean\n\
           --seed <u64>                   deterministic CUDA candidate noise\n\
            --headless-steps <n>           run planner/sim smoke test without Bevy window\n\
+           --plan-trace <path>            write headless per-plan JSON diagnostics\n\
            --inspect-gate-targets         print ordered gate entry/pass poses and exit\n\
            --oracle-replay-rows <n>       replay recorded dataset actions through the analytic plant\n\
          \n\
@@ -1578,6 +1768,7 @@ struct DroneLeWmController {
     plan_every_model_steps: usize,
     history_actions_raw: Vec<[f32; ACTION_DIM]>,
     last_target_pos: Vec3,
+    last_sequence_normalized: Option<Tensor>,
     plan_count: usize,
     last_best_score: f32,
     last_plan_ms: f32,
@@ -1677,6 +1868,7 @@ impl DroneLeWmController {
             plan_every_model_steps: cfg.plan_every_model_steps,
             history_actions_raw: vec![state.previous_action; history_size.saturating_sub(1)],
             last_target_pos: state.target.pos_world,
+            last_sequence_normalized: None,
             plan_count: 0,
             last_best_score: f32::NAN,
             last_plan_ms: 0.0,
@@ -1702,6 +1894,7 @@ impl DroneLeWmController {
         self.last_error = None;
         self.last_action = state.previous_action;
         self.last_target_pos = state.target.pos_world;
+        self.last_sequence_normalized = None;
         self.history_actions_raw =
             vec![state.previous_action; self.history_raw.len().saturating_sub(1)];
         self.reset_warm_start(state.previous_action)
@@ -1798,8 +1991,127 @@ impl DroneLeWmController {
         self.plan_count += 1;
         self.last_action = action;
         self.last_target_pos = target_pose.pos_world;
+        self.last_sequence_normalized = Some(result.sequence.clone());
         self.target_emb = target_emb;
         Ok(action)
+    }
+
+    fn trace_last_plan(
+        &self,
+        state: &SimState,
+        gate_loop: Option<&GateLoop>,
+        expert_lookup: Option<&ExpertActionLookup>,
+    ) -> anyhow::Result<PlanTraceEvent> {
+        let selected_sequence = self
+            .last_sequence_normalized
+            .as_ref()
+            .context("cannot trace before first LeWM plan")?;
+        let horizon = selected_sequence.dim(1)?;
+        let target_pose = state.target;
+        let target_emb = encode_target_embedding(
+            &self.model,
+            &self.obs_mean,
+            &self.obs_std,
+            self.dtype,
+            &self.device,
+            target_pose,
+        )?;
+        let history = self.history_tensor()?;
+        let history = history
+            .broadcast_sub(&self.obs_mean)?
+            .broadcast_div(&self.obs_std)?;
+        let history_emb = self.model.encode_vector(&history)?;
+        let action_prefix = self.action_history_prefix_tensor()?;
+        let scorer = DroneLeWmScorer {
+            model: &self.model,
+            device: &self.device,
+            dtype: self.dtype,
+            history_emb: &history_emb,
+            target_emb: &target_emb,
+            action_prefix: action_prefix.as_ref(),
+            objective: self.objective,
+        };
+        let selected_score = score_single_sequence(&scorer, selected_sequence)?;
+        let selected_step_costs =
+            sequence_step_costs(&scorer, selected_sequence, &history_emb, &target_emb)?;
+        let selected_sequence_raw = self.denormalize_action_sequence(selected_sequence)?;
+        let selected_first_action = selected_sequence_raw
+            .first()
+            .copied()
+            .context("selected sequence is empty")?;
+
+        let expert_sequence = match expert_lookup {
+            Some(lookup) => lookup.sequence(self.model_step, horizon)?,
+            None => None,
+        };
+        let source_row = expert_sequence
+            .as_ref()
+            .map(|sequence| sequence.source_row)
+            .or_else(|| expert_lookup.map(|lookup| lookup.source_row(self.model_step)));
+        let source_pos = expert_sequence.as_ref().map(|sequence| sequence.source_pos);
+        let source_pos_distance_m = source_pos
+            .map(Vec3::from_array)
+            .map(|source_pos| (source_pos - state.pose.pos_world).length());
+        let expert_trace = match expert_sequence {
+            Some(sequence) => {
+                let expert_tensor = self.normalize_action_sequence_tensor(&sequence.actions)?;
+                let expert_score = score_single_sequence(&scorer, &expert_tensor)?;
+                let expert_step_costs =
+                    sequence_step_costs(&scorer, &expert_tensor, &history_emb, &target_emb)?;
+                let expert_first = sequence.actions.first().copied();
+                let action_l2 = expert_first.map(|expert| action_l2(selected_first_action, expert));
+                Some((
+                    sequence.actions,
+                    expert_score,
+                    expert_step_costs,
+                    expert_first,
+                    action_l2,
+                ))
+            }
+            None => None,
+        };
+
+        let (
+            expert_sequence,
+            expert_score,
+            expert_step_costs,
+            expert_first_action,
+            first_action_l2,
+        ) = match expert_trace {
+            Some((actions, score, costs, first, l2)) => {
+                (Some(actions), Some(score), Some(costs), first, l2)
+            }
+            None => (None, None, None, None, None),
+        };
+
+        Ok(PlanTraceEvent {
+            plan_index: self.plan_count,
+            sim_step: state.step,
+            model_step: self.model_step,
+            sim_time: state.time,
+            source_row,
+            source_pos,
+            source_pos_distance_m,
+            gate: gate_loop.and_then(gate_trace),
+            current_pos: vec3_array(state.pose.pos_world),
+            target_pos: vec3_array(target_pose.pos_world),
+            target_rot: rotmat_row_major_array(target_pose.rot_world_from_body),
+            selected_first_action,
+            selected_sequence: selected_sequence_raw,
+            selected_score,
+            selected_step_costs,
+            candidate_best_score: self.last_best_score,
+            expert_first_action,
+            expert_sequence,
+            expert_score,
+            expert_step_costs,
+            first_action_l2,
+            selected_saturated_channels: saturated_channels(selected_first_action),
+            planner_ms: self.last_plan_ms,
+            planner_iterations: self.last_iterations,
+            target_distance_m: (target_pose.pos_world - state.pose.pos_world).length(),
+            best_gate_dists: gate_loop.map(|gate_loop| gate_loop.best_dist_m.clone()),
+        })
     }
 
     fn history_tensor(&self) -> anyhow::Result<Tensor> {
@@ -1848,6 +2160,42 @@ impl DroneLeWmController {
             out[idx] = action[idx] * self.action_std[idx] + self.action_mean[idx];
         }
         out
+    }
+
+    fn normalize_action_sequence_tensor(
+        &self,
+        actions: &[[f32; ACTION_DIM]],
+    ) -> anyhow::Result<Tensor> {
+        let mut values = Vec::with_capacity(actions.len() * ACTION_DIM);
+        for action in actions {
+            values.extend_from_slice(&self.normalize_action(*action));
+        }
+        Ok(
+            Tensor::from_vec(values, (1, actions.len(), ACTION_DIM), &self.device)?
+                .to_dtype(self.dtype)?,
+        )
+    }
+
+    fn denormalize_action_sequence(
+        &self,
+        sequence: &Tensor,
+    ) -> anyhow::Result<Vec<[f32; ACTION_DIM]>> {
+        let rows = sequence.to_dtype(DType::F32)?.to_vec3::<f32>()?;
+        let batch = rows
+            .first()
+            .context("selected action sequence has empty batch")?;
+        let mut out = Vec::with_capacity(batch.len());
+        for row in batch {
+            ensure!(
+                row.len() == ACTION_DIM,
+                "selected action sequence dim {} does not match {ACTION_DIM}",
+                row.len()
+            );
+            let mut normalized = [0.0f32; ACTION_DIM];
+            normalized.copy_from_slice(row);
+            out.push(clamp_action(self.denormalize_action(normalized)));
+        }
+        Ok(out)
     }
 }
 
@@ -1902,6 +2250,109 @@ impl CandidateScorer for DroneLeWmScorer<'_> {
             self.objective,
         )
     }
+}
+
+fn score_single_sequence(scorer: &DroneLeWmScorer<'_>, sequence: &Tensor) -> anyhow::Result<f32> {
+    let scores = scorer.score_candidates(&sequence.unsqueeze(1)?)?;
+    let values = scores.squeeze(1)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    values
+        .first()
+        .copied()
+        .context("single-sequence score tensor was empty")
+}
+
+fn sequence_step_costs(
+    scorer: &DroneLeWmScorer<'_>,
+    sequence: &Tensor,
+    history_emb: &Tensor,
+    target_emb: &Tensor,
+) -> anyhow::Result<Vec<f32>> {
+    let action_candidates = sequence
+        .unsqueeze(1)?
+        .to_device(scorer.device)?
+        .to_dtype(scorer.dtype)?;
+    let (_, samples, _, _) = action_candidates.dims4()?;
+    let actions = match scorer.action_prefix {
+        Some(prefix) => {
+            let prefix = prefix.broadcast_as((1, samples, prefix.dim(2)?, ACTION_DIM))?;
+            Tensor::cat(&[&prefix, &action_candidates], 2)?
+        }
+        None => action_candidates,
+    };
+    let (_, history, dim) = history_emb.dims3()?;
+    let emb_init = history_emb
+        .unsqueeze(1)?
+        .broadcast_as((1, samples, history, dim))?;
+    let rollout = scorer
+        .model
+        .rollout_embeddings_with_history(&emb_init, &actions, history)?;
+    let (_, _, time, _) = rollout.dims4()?;
+    ensure!(
+        history < time,
+        "rollout history_size {history} is outside time {time}"
+    );
+    let future_len = time - history;
+    let future = rollout.narrow(2, history, future_len)?;
+    let target = target_embedding_for_cost(target_emb, dim)?;
+    let target = target
+        .unsqueeze(1)?
+        .unsqueeze(2)?
+        .broadcast_as((1, samples, future_len, dim))?;
+    let costs = (future - target)?.sqr()?.sum(D::Minus1)?;
+    let values = costs.to_dtype(DType::F32)?.to_vec3::<f32>()?;
+    Ok(values
+        .first()
+        .and_then(|batch| batch.first())
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn target_embedding_for_cost(target_emb: &Tensor, dim: usize) -> anyhow::Result<Tensor> {
+    match target_emb.dims() {
+        [1, d] if *d == dim => Ok(target_emb.clone()),
+        [1, t, d] if *d == dim => Ok(target_emb.narrow(1, t - 1, 1)?.squeeze(1)?),
+        other => anyhow::bail!("unsupported target embedding shape {other:?}"),
+    }
+}
+
+fn gate_trace(gate_loop: &GateLoop) -> Option<PlanTraceGate> {
+    let gate = gate_loop.active_gate()?;
+    Some(PlanTraceGate {
+        current_index: gate_loop.current_index,
+        gate_count: gate_loop.gates.len(),
+        pass_count: gate_loop.pass_count,
+        laps_completed: gate_loop.laps_completed,
+        desired_laps: gate_loop.desired_laps,
+        name: gate.name.clone(),
+        center: vec3_array(gate.center),
+        entry_row: gate.entry_row,
+        pass_row: gate.pass_row,
+    })
+}
+
+fn action_l2(lhs: [f32; ACTION_DIM], rhs: [f32; ACTION_DIM]) -> f32 {
+    lhs.iter()
+        .zip(rhs)
+        .map(|(lhs, rhs)| {
+            let delta = lhs - rhs;
+            delta * delta
+        })
+        .sum::<f32>()
+        .sqrt()
+}
+
+fn saturated_channels(action: [f32; ACTION_DIM]) -> usize {
+    action
+        .iter()
+        .enumerate()
+        .filter(|(idx, value)| {
+            if *idx == 2 {
+                **value <= 0.001 || **value >= 0.999
+            } else {
+                value.abs() >= 0.999
+            }
+        })
+        .count()
 }
 
 fn rollout_cost(
