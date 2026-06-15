@@ -30,7 +30,6 @@ const KEYBOARD_RATE_SLEW: f32 = 4.0;
 const KEYBOARD_CLIMB_RATE_MPS: f32 = 2.0;
 const KEYBOARD_VERTICAL_VEL_KP: f32 = 0.05;
 const KEYBOARD_THROTTLE_SLEW: f32 = 1.5;
-const PLANNER_ACTION_STD_LIMIT: f32 = 3.0;
 const GATE_ENTRY_LEAD_STEPS: usize = 12;
 const GATE_REFERENCE_SEARCH_LIMIT_STEPS: usize = 450;
 
@@ -38,6 +37,9 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     if args.inspect_gate_targets {
         return inspect_gate_targets(args);
+    }
+    if args.oracle_replay_rows > 0 {
+        return run_oracle_replay(args);
     }
     if args.headless_steps > 0 {
         return run_headless(args);
@@ -200,6 +202,129 @@ fn inspect_gate_targets(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_oracle_replay(args: Args) -> anyhow::Result<()> {
+    let start = args
+        .start
+        .as_ref()
+        .context("--oracle-replay-rows requires --start-row")?;
+    let start_row = start
+        .row
+        .context("--oracle-replay-rows requires --start-row")?;
+    let dataset = DroneRacingDataset::open(
+        &start.dataset_dir,
+        DroneBatchConfig {
+            batch_size: 1,
+            sequence_steps: 2,
+            normalize_observations: false,
+            normalize_actions: false,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to open oracle dataset {}",
+            start.dataset_dir.display()
+        )
+    })?;
+    let mut state = initial_sim_state(&args)?;
+    let mut gate_loop = args
+        .gate_loop
+        .as_ref()
+        .map(|cfg| GateLoop::load(cfg, args.start.as_ref(), &mut state))
+        .transpose()?;
+
+    let mut compared = 0usize;
+    let mut pos_sq_sum = 0.0f64;
+    let mut rot_sq_sum = 0.0f64;
+    let mut max_pos_err = 0.0f32;
+    let mut final_pos_err = f32::NAN;
+    let mut final_rot_err = f32::NAN;
+    let mut final_row = start_row;
+    let started = Instant::now();
+
+    for offset in 0..args.oracle_replay_rows {
+        let row = start_row + offset;
+        let frame = dataset.frame(row)?;
+        let next_row = row + 1;
+        if next_row >= dataset.metadata().rows {
+            break;
+        }
+        let next = dataset.frame(next_row)?;
+        if frame.episode_idx != next.episode_idx {
+            break;
+        }
+        let duration = frame.dt.max(1.0 / state.dynamics.sim_hz);
+        let substeps = (duration * state.dynamics.sim_hz).round().max(1.0) as usize;
+        let dt = duration / substeps as f32;
+        for _ in 0..substeps {
+            state.step(frame.channels_norm, dt);
+            if let Some(gate_loop) = gate_loop.as_mut() {
+                gate_loop.update_state_target(&mut state);
+            }
+        }
+        let expected = DronePose::from_plant(DronePlantState::from_frame(&next));
+        final_pos_err = state.pose.pos_world.distance(expected.pos_world);
+        final_rot_err = state
+            .pose
+            .rot_world_from_body
+            .angle_between(expected.rot_world_from_body);
+        max_pos_err = max_pos_err.max(final_pos_err);
+        pos_sq_sum += f64::from(final_pos_err).powi(2);
+        rot_sq_sum += f64::from(final_rot_err).powi(2);
+        compared += 1;
+        final_row = next_row;
+        if gate_loop
+            .as_ref()
+            .is_some_and(|gate_loop| gate_loop.finished)
+        {
+            break;
+        }
+    }
+
+    let gate_text = gate_loop
+        .as_ref()
+        .map(|gate_loop| {
+            format!(
+                " gates={} lap={}/{} gate={}/{} finished={} best_gate_dists=[{}]",
+                gate_loop.pass_count,
+                gate_loop.laps_completed,
+                gate_loop.desired_laps,
+                gate_loop.current_index + 1,
+                gate_loop.gates.len(),
+                gate_loop.finished,
+                gate_loop.best_distance_text(),
+            )
+        })
+        .unwrap_or_default();
+    let pos_rmse = if compared > 0 {
+        (pos_sq_sum / compared as f64).sqrt()
+    } else {
+        f64::NAN
+    };
+    let rot_rmse = if compared > 0 {
+        (rot_sq_sum / compared as f64).sqrt()
+    } else {
+        f64::NAN
+    };
+    println!(
+        "oracle_replay start_row={} final_row={} compared_rows={} sim_time={:.3}s wall={:.3}s pos_rmse={:.3} max_pos_err={:.3} final_pos_err={:.3} rot_rmse={:.3} final_rot_err={:.3} final_pos=[{:.3} {:.3} {:.3}]{}",
+        start_row,
+        final_row,
+        compared,
+        state.time,
+        started.elapsed().as_secs_f32(),
+        pos_rmse,
+        max_pos_err,
+        final_pos_err,
+        rot_rmse,
+        final_rot_err,
+        state.pose.pos_world.x,
+        state.pose.pos_world.y,
+        state.pose.pos_world.z,
+        gate_text,
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct Args {
     dynamics: DynamicsConfig,
@@ -211,6 +336,7 @@ struct Args {
     max_trail: usize,
     headless_steps: usize,
     inspect_gate_targets: bool,
+    oracle_replay_rows: usize,
 }
 
 impl Args {
@@ -232,6 +358,7 @@ impl Args {
             max_trail: 2400,
             headless_steps: 0,
             inspect_gate_targets: false,
+            oracle_replay_rows: 0,
         };
         let mut iter = env::args().skip(1);
         while let Some(arg) = iter.next() {
@@ -298,6 +425,7 @@ impl Args {
                 "--seed" => args.lewm_mut().seed = Some(next_parse(&mut iter, &arg)?),
                 "--headless-steps" => args.headless_steps = next_parse(&mut iter, &arg)?,
                 "--inspect-gate-targets" => args.inspect_gate_targets = true,
+                "--oracle-replay-rows" => args.oracle_replay_rows = next_parse(&mut iter, &arg)?,
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -516,6 +644,7 @@ fn print_help() {
            --seed <u64>                   deterministic CUDA candidate noise\n\
            --headless-steps <n>           run planner/sim smoke test without Bevy window\n\
            --inspect-gate-targets         print ordered gate entry/pass poses and exit\n\
+           --oracle-replay-rows <n>       replay recorded dataset actions through the analytic plant\n\
          \n\
          Controls:\n\
            W/S forward/back tilt, A/D left/right tilt, Q/E yaw left/right, R/F climb/descent\n\
@@ -599,10 +728,11 @@ struct TargetConfig {
 }
 
 impl TargetConfig {
-    fn to_pose(self) -> TargetPose {
+    fn to_pose(self, previous_action: [f32; ACTION_DIM]) -> TargetPose {
         TargetPose {
             pos_world: self.pos_world,
             rot_world_from_body: Quat::from_rotation_z(self.yaw_rad),
+            previous_action,
         }
     }
 }
@@ -638,8 +768,9 @@ impl StartConfig {
 }
 
 fn initial_sim_state(args: &Args) -> anyhow::Result<SimState> {
-    let target = args.target.to_pose();
     let Some(start) = args.start.as_ref() else {
+        let previous_action = [0.0, 0.0, args.dynamics.hover_throttle, 0.0];
+        let target = args.target.to_pose(previous_action);
         return Ok(SimState::new(args.dynamics.clone(), target, args.max_trail));
     };
     let dataset = DroneRacingDataset::open(
@@ -667,6 +798,7 @@ fn initial_sim_state(args: &Args) -> anyhow::Result<SimState> {
     } else {
         frame.channels_norm
     };
+    let target = args.target.to_pose(prev_action);
     let pose = DronePose::from_plant(DronePlantState::from_frame(&frame));
     Ok(SimState::from_start_frame(
         args.dynamics.clone(),
@@ -1160,8 +1292,10 @@ struct GateTarget {
     pass_row: usize,
     entry_pos_world: Vec3,
     entry_rot_world_from_body: Quat,
+    entry_previous_action: [f32; ACTION_DIM],
     pass_pos_world: Vec3,
     pass_rot_world_from_body: Quat,
+    pass_previous_action: [f32; ACTION_DIM],
 }
 
 impl GateTarget {
@@ -1198,9 +1332,11 @@ impl GateTarget {
             closest_reference_index_after(dataset, reference_rows, center, search_start)?;
         let pass_row = reference_rows[pass_idx];
         let pass_pose = pose_at_row(dataset, pass_row)?;
+        let pass_previous_action = previous_action_at_row(dataset, pass_row)?;
         let entry_idx = entry_reference_index(pass_idx, search_start);
         let entry_row = reference_rows[entry_idx];
         let entry_pose = pose_at_row(dataset, entry_row)?;
+        let entry_previous_action = previous_action_at_row(dataset, entry_row)?;
         let display_normal = horizontal_unit(pass_pose.pos_world - entry_pose.pos_world)
             .or_else(|| {
                 trajectory_direction(dataset, reference_rows, entry_idx, pass_idx)
@@ -1217,8 +1353,10 @@ impl GateTarget {
             pass_row,
             entry_pos_world: entry_pose.pos_world,
             entry_rot_world_from_body: entry_pose.rot_world_from_body,
+            entry_previous_action,
             pass_pos_world: pass_pose.pos_world,
             pass_rot_world_from_body: pass_pose.rot_world_from_body,
+            pass_previous_action,
         })
     }
 
@@ -1226,6 +1364,7 @@ impl GateTarget {
         TargetPose {
             pos_world: self.entry_pos_world,
             rot_world_from_body: self.entry_rot_world_from_body,
+            previous_action: self.entry_previous_action,
         }
     }
 
@@ -1233,6 +1372,7 @@ impl GateTarget {
         TargetPose {
             pos_world: self.pass_pos_world,
             rot_world_from_body: self.pass_rot_world_from_body,
+            previous_action: self.pass_previous_action,
         }
     }
 }
@@ -1267,6 +1407,20 @@ fn entry_reference_index(pass_idx: usize, min_idx: usize) -> usize {
 fn pose_at_row(dataset: &DroneRacingDataset, row: usize) -> anyhow::Result<DronePose> {
     let frame = dataset.frame(row)?;
     Ok(DronePose::from_plant(DronePlantState::from_frame(&frame)))
+}
+
+fn previous_action_at_row(
+    dataset: &DroneRacingDataset,
+    row: usize,
+) -> anyhow::Result<[f32; ACTION_DIM]> {
+    let frame = dataset.frame(row)?;
+    if frame.step_idx > 0 && row > 0 {
+        let previous = dataset.frame(row - 1)?;
+        if previous.episode_idx == frame.episode_idx {
+            return Ok(previous.channels_norm);
+        }
+    }
+    Ok(frame.channels_norm)
 }
 
 fn trajectory_direction(
@@ -1336,6 +1490,7 @@ impl DronePose {
 struct TargetPose {
     pos_world: Vec3,
     rot_world_from_body: Quat,
+    previous_action: [f32; ACTION_DIM],
 }
 
 fn pose_summary(row: Option<usize>, pose: DronePose) -> String {
@@ -1343,7 +1498,14 @@ fn pose_summary(row: Option<usize>, pose: DronePose) -> String {
 }
 
 fn target_pose_summary(row: Option<usize>, pose: TargetPose) -> String {
-    attitude_summary(row, pose.pos_world, pose.rot_world_from_body)
+    format!(
+        "{} prev_action=[{:+.3} {:+.3} {:+.3} {:+.3}]",
+        attitude_summary(row, pose.pos_world, pose.rot_world_from_body),
+        pose.previous_action[0],
+        pose.previous_action[1],
+        pose.previous_action[2],
+        pose.previous_action[3],
+    )
 }
 
 fn attitude_summary(row: Option<usize>, pos_world: Vec3, rot_world_from_body: Quat) -> String {
@@ -1386,7 +1548,6 @@ struct DroneLeWmController {
     target_emb: Tensor,
     planner: IcemPlanner,
     history_raw: Vec<[f32; OBS_DIM]>,
-    target_action: [f32; ACTION_DIM],
     last_action: [f32; ACTION_DIM],
     enabled: bool,
     sim_steps_per_model_step: usize,
@@ -1458,10 +1619,7 @@ impl DroneLeWmController {
         planner_cfg.init_std = cfg.init_std;
         planner_cfg.min_std = cfg.min_std;
         planner_cfg.seed = cfg.seed;
-        planner_cfg.action_bounds = action_bounds_from_stats(&normalization.action);
-
-        let mut target_action = [0.0f32; ACTION_DIM];
-        target_action.copy_from_slice(&normalization.action.mean[..ACTION_DIM]);
+        planner_cfg.action_bounds = full_action_bounds();
 
         let obs_mean = Tensor::from_vec(normalization.observation.mean, (OBS_DIM,), &device)?
             .to_dtype(dtype)?
@@ -1479,15 +1637,8 @@ impl DroneLeWmController {
         let sim_steps_per_model_step = ((dynamics.sim_hz / cfg.model_hz).round() as usize).max(1);
         let target_pose =
             target_pose_for_horizon(state, horizon, cfg.model_hz, cfg.target_lookahead);
-        let target_emb = encode_target_embedding(
-            &model,
-            &obs_mean,
-            &obs_std,
-            dtype,
-            &device,
-            target_pose,
-            target_action,
-        )?;
+        let target_emb =
+            encode_target_embedding(&model, &obs_mean, &obs_std, dtype, &device, target_pose)?;
         let mut controller = Self {
             model,
             device,
@@ -1499,7 +1650,6 @@ impl DroneLeWmController {
             target_emb,
             planner: IcemPlanner::new(planner_cfg),
             history_raw: vec![state.obs16(); history_size],
-            target_action,
             last_action: state.previous_action,
             enabled: true,
             sim_steps_per_model_step,
@@ -1588,7 +1738,6 @@ impl DroneLeWmController {
             self.dtype,
             &self.device,
             target_pose,
-            self.target_action,
         )?;
         let history = self.history_tensor()?;
         let history = history
@@ -1717,9 +1866,8 @@ fn encode_target_embedding(
     dtype: DType,
     device: &CandleDevice,
     target: TargetPose,
-    target_action: [f32; ACTION_DIM],
 ) -> anyhow::Result<Tensor> {
-    let target_obs = target_obs16(target, target_action);
+    let target_obs = target_obs16(target);
     let target = Tensor::from_vec(target_obs.to_vec(), (1, 1, OBS_DIM), device)?.to_dtype(dtype)?;
     let target = target.broadcast_sub(obs_mean)?.broadcast_div(obs_std)?;
     Ok(model.encode_vector(&target)?)
@@ -1734,6 +1882,7 @@ fn target_pose_for_horizon(
     TargetPose {
         pos_world: target_position_for_horizon(state, horizon, model_hz, max_lookahead),
         rot_world_from_body: state.target.rot_world_from_body,
+        previous_action: state.target.previous_action,
     }
 }
 
@@ -1772,35 +1921,19 @@ fn target_distance_for_horizon(
         .min(dist)
 }
 
-fn target_obs16(target: TargetPose, previous_action: [f32; ACTION_DIM]) -> [f32; OBS_DIM] {
+fn target_obs16(target: TargetPose) -> [f32; OBS_DIM] {
     let mut obs = [0.0; OBS_DIM];
     obs[0..3].copy_from_slice(&vec3_array(target.pos_world));
     obs[3..12].copy_from_slice(&rotmat_row_major_array(target.rot_world_from_body));
-    obs[12..16].copy_from_slice(&previous_action);
+    obs[12..16].copy_from_slice(&target.previous_action);
     obs
 }
 
-fn action_bounds_from_stats(stats: &RunningStats) -> ActionBounds {
-    let mut low = Vec::with_capacity(ACTION_DIM);
-    let mut high = Vec::with_capacity(ACTION_DIM);
-    for idx in 0..ACTION_DIM {
-        let center = stats.mean[idx];
-        let spread = stats.std[idx].max(1e-3) * PLANNER_ACTION_STD_LIMIT;
-        let (lo, hi) = if idx == 2 {
-            (
-                (center - spread).clamp(0.0, 1.0),
-                (center + spread).clamp(0.0, 1.0),
-            )
-        } else {
-            (
-                (center - spread).clamp(-1.0, 1.0),
-                (center + spread).clamp(-1.0, 1.0),
-            )
-        };
-        low.push(lo);
-        high.push(hi);
+fn full_action_bounds() -> ActionBounds {
+    ActionBounds {
+        low: vec![-1.0, -1.0, 0.0, -1.0],
+        high: vec![1.0, 1.0, 1.0, 1.0],
     }
-    ActionBounds { low, high }
 }
 
 fn validate_stats(name: &str, stats: &RunningStats, dim: usize) -> anyhow::Result<()> {
