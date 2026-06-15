@@ -66,3 +66,7 @@ path = "src/bin/lewm-drone-import.rs"
 [[bin]]
 name = "lewm-train-drone"
 path = "src/bin/lewm-train-drone.rs"
+
+[[bin]]
+name = "lewm-drone-dynamics-stats"
+path = "src/bin/lewm-drone-dynamics-stats.rs"
