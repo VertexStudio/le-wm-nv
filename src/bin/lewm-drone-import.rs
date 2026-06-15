@@ -130,7 +130,7 @@ fn default_output_dir() -> PathBuf {
     home_dir()
         .join(".stable_worldmodel")
         .join("le-wm-nv-data")
-        .join("drone-racing-autonomous-100hz-pose16")
+        .join("drone-racing-autonomous-100hz-pose12")
 }
 
 fn home_dir() -> PathBuf {

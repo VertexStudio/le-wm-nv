@@ -241,6 +241,8 @@ pub struct IcemConfig {
     pub elites: usize,
     pub keep_elites: usize,
     pub iterations: usize,
+    pub noise_beta: f32,
+    pub alpha: f32,
     pub action_dim: usize,
     pub action_bounds: ActionBounds,
     pub init_std: f32,
@@ -258,6 +260,8 @@ impl IcemConfig {
             elites,
             keep_elites: elites,
             iterations: 4,
+            noise_beta: 2.0,
+            alpha: 0.1,
             action_dim,
             action_bounds: ActionBounds::symmetric(action_dim, 1.0),
             init_std: 1.0,
@@ -294,6 +298,12 @@ impl IcemConfig {
         }
         if self.iterations == 0 {
             candle::bail!("iCEM iterations must be greater than zero");
+        }
+        if !self.noise_beta.is_finite() || self.noise_beta < 0.0 {
+            candle::bail!("iCEM noise_beta must be finite and non-negative");
+        }
+        if !self.alpha.is_finite() || !(0.0..=1.0).contains(&self.alpha) {
+            candle::bail!("iCEM alpha must be finite and in [0, 1]");
         }
         if self.action_dim == 0 {
             candle::bail!("iCEM action_dim must be greater than zero");
@@ -726,7 +736,7 @@ impl IcemPlanner {
                 break;
             }
 
-            let sampled = sample_candidates(
+            let sampled = sample_candidates_with_temporal_noise(
                 &mean,
                 &std,
                 cfg.samples,
@@ -735,6 +745,7 @@ impl IcemPlanner {
                 dtype,
                 device,
                 &mut sampler,
+                cfg.noise_beta,
             )?;
             let candidates = match carried_elites.as_ref() {
                 Some(elites) => Tensor::cat(&[&sampled, elites], 1)?,
@@ -745,8 +756,10 @@ impl IcemPlanner {
             validate_scores_shape(&scores, batch, candidate_count)?;
 
             let elites = select_elites(&candidates, &scores, cfg.elites)?;
-            mean = elites.mean(1)?;
-            std = enforce_min_std(&elites.var(1)?.sqrt()?, cfg.min_std)?;
+            let elite_mean = elites.mean(1)?;
+            let elite_std = enforce_min_std(&elites.var(1)?.sqrt()?, cfg.min_std)?;
+            mean = momentum_update(&mean, &elite_mean, cfg.alpha)?;
+            std = enforce_min_std(&momentum_update(&std, &elite_std, cfg.alpha)?, cfg.min_std)?;
             carried_elites = if cfg.keep_elites == 0 {
                 None
             } else {
@@ -931,6 +944,28 @@ fn sample_candidates(
     let (_, horizon, action_dim) = mean.dims3()?;
     let shape = (batch, samples, horizon, action_dim);
     let noise = sampler.standard_normal(shape, dtype, device)?;
+    let mean = mean.unsqueeze(1)?.broadcast_as(shape)?;
+    let std = std.unsqueeze(1)?.broadcast_as(shape)?;
+    let candidates = mean.broadcast_add(&noise.broadcast_mul(&std)?)?;
+    clamp_actions(&candidates, low, high)
+}
+
+fn sample_candidates_with_temporal_noise(
+    mean: &Tensor,
+    std: &Tensor,
+    samples: usize,
+    low: &Tensor,
+    high: &Tensor,
+    dtype: DType,
+    device: &Device,
+    sampler: &mut PlanSampler,
+    noise_beta: f32,
+) -> Result<Tensor> {
+    let batch = mean.dim(0)?;
+    let (_, horizon, action_dim) = mean.dims3()?;
+    let shape = (batch, samples, horizon, action_dim);
+    let noise = sampler.standard_normal(shape, DType::F32, device)?;
+    let noise = color_temporal_noise(&noise, noise_beta)?.to_dtype(dtype)?;
     let mean = mean.unsqueeze(1)?.broadcast_as(shape)?;
     let std = std.unsqueeze(1)?.broadcast_as(shape)?;
     let candidates = mean.broadcast_add(&noise.broadcast_mul(&std)?)?;
@@ -1216,6 +1251,78 @@ fn round_curand_normal_count(count: usize) -> Result<usize> {
     }
 }
 
+fn color_temporal_noise(noise: &Tensor, noise_beta: f32) -> Result<Tensor> {
+    let [batch, samples, horizon, action_dim] = noise.dims() else {
+        candle::bail!(
+            "planner noise expects [batch, samples, horizon, action_dim], got {:?}",
+            noise.shape()
+        );
+    };
+    if noise_beta == 0.0 || *horizon <= 1 {
+        return Ok(noise.clone());
+    }
+    if !noise.device().is_cuda() || noise.dtype() != DType::F32 {
+        candle::bail!("iCEM colored noise requires CUDA f32 noise");
+    }
+
+    let noise = noise.contiguous()?;
+    let (storage, layout) = noise.storage_and_layout();
+    let Storage::Cuda(storage) = &*storage else {
+        candle::bail!("iCEM colored noise requires CUDA storage");
+    };
+    let input_slice = storage.as_cuda_slice::<f32>()?;
+    let Some((start, end)) = layout.contiguous_offsets() else {
+        candle::bail!("iCEM colored noise tensor must be contiguous");
+    };
+    let input_view = input_slice.slice(start..end);
+    let cuda = storage.device.clone();
+    let elem_count = end.checked_sub(start).ok_or_else(|| {
+        candle::Error::Msg("planner colored-noise layout underflowed".to_string())
+    })?;
+    let mut output = unsafe { cuda.alloc::<f32>(elem_count)? };
+
+    let ptx = cached_planner_ptx(
+        &TEMPORAL_NOISE_PTX,
+        TEMPORAL_NOISE_CUDA,
+        "temporal-colored-noise",
+    )?;
+    let func =
+        cuda.get_or_load_custom_func("swm_temporal_color_noise_f32", "swm_temporal_noise", ptx)?;
+
+    let sequences = batch
+        .checked_mul(*samples)
+        .and_then(|v| v.checked_mul(*action_dim))
+        .ok_or_else(|| candle::Error::Msg("planner colored-noise shape overflowed".to_string()))?;
+    let block = 128u32;
+    let grid = (sequences as u32).div_ceil(block);
+    let smooth = (noise_beta / (noise_beta + 1.0)).clamp(0.0, 0.98);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let sequences_u32 = sequences as u32;
+    let horizon_u32 = *horizon as u32;
+    let action_dim_u32 = *action_dim as u32;
+    let stream = cuda.cuda_stream();
+    let mut builder = stream.launch_builder(&func);
+    builder.arg(&input_view);
+    builder.arg(&mut output);
+    builder.arg(&sequences_u32);
+    builder.arg(&horizon_u32);
+    builder.arg(&action_dim_u32);
+    builder.arg(&smooth);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    let storage = CudaStorage::wrap_cuda_slice(output, cuda);
+    Ok(Tensor::from_storage(
+        Storage::Cuda(storage),
+        (*batch, *samples, *horizon, *action_dim),
+        BackpropOp::none(),
+        false,
+    ))
+}
+
 fn mppi_weighted_sequence(
     candidates: &Tensor,
     scores: &Tensor,
@@ -1254,6 +1361,16 @@ fn enforce_min_std(std: &Tensor, min_std: f32) -> Result<Tensor> {
         .to_dtype(std.dtype())?
         .broadcast_as(std.shape())?;
     std.broadcast_maximum(&floor)
+}
+
+fn momentum_update(previous: &Tensor, current: &Tensor, alpha: f32) -> Result<Tensor> {
+    if alpha == 0.0 {
+        return Ok(current.clone());
+    }
+    if alpha == 1.0 {
+        return Ok(previous.clone());
+    }
+    (previous * alpha as f64)? + (current * (1.0 - alpha) as f64)?
 }
 
 fn validate_scores_shape(scores: &Tensor, batch: usize, samples: usize) -> Result<()> {
@@ -1386,6 +1503,7 @@ fn best_indices_from_tensor(indices: &Tensor) -> Result<Vec<usize>> {
     Ok(best_indices)
 }
 
+static TEMPORAL_NOISE_PTX: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 static LOWEST_K_INDICES_PTX: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
 fn cached_planner_ptx(
@@ -1469,6 +1587,52 @@ extern "C" __global__ void swm_lowest_k_indices_f32(
 }
 "#;
 
+const TEMPORAL_NOISE_CUDA: &str = r#"
+extern "C" __global__ void swm_temporal_color_noise_f32(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    unsigned int sequences,
+    unsigned int horizon,
+    unsigned int action_dim,
+    float smooth
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= sequences) {
+        return;
+    }
+
+    const unsigned int action = idx % action_dim;
+    const unsigned int sample = idx / action_dim;
+    const unsigned long long base =
+        static_cast<unsigned long long>(sample) * horizon * action_dim + action;
+    const float keep = 1.0f - smooth;
+
+    float prev = input[base];
+    float mean = 0.0f;
+    for (unsigned int t = 0; t < horizon; ++t) {
+        const unsigned long long offset = base + static_cast<unsigned long long>(t) * action_dim;
+        const float raw = input[offset];
+        prev = (t == 0) ? raw : fmaf(smooth, prev, keep * raw);
+        output[offset] = prev;
+        mean += prev;
+    }
+    mean /= static_cast<float>(horizon);
+
+    float var = 0.0f;
+    for (unsigned int t = 0; t < horizon; ++t) {
+        const unsigned long long offset = base + static_cast<unsigned long long>(t) * action_dim;
+        const float centered = output[offset] - mean;
+        output[offset] = centered;
+        var += centered * centered;
+    }
+    const float inv_std = rsqrtf(var / static_cast<float>(horizon) + 1.0e-6f);
+    for (unsigned int t = 0; t < horizon; ++t) {
+        const unsigned long long offset = base + static_cast<unsigned long long>(t) * action_dim;
+        output[offset] *= inv_std;
+    }
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1511,6 +1675,18 @@ mod tests {
         let indices = lowest_score_indices(&scores, 4)?;
 
         assert_eq!(indices.to_vec2::<u32>()?, &[[1023, 1022, 1021, 1020]]);
+        Ok(())
+    }
+
+    #[test]
+    fn temporal_colored_noise_runs_on_cuda() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let noise = Tensor::randn(0f32, 1f32, (2, 8, 6, 4), &device)?;
+        let colored = color_temporal_noise(&noise, 2.0)?;
+        assert_eq!(colored.dims(), &[2, 8, 6, 4]);
+
+        let values = colored.reshape((2 * 8 * 6 * 4,))?.to_vec1::<f32>()?;
+        assert!(values.iter().all(|value| value.is_finite()));
         Ok(())
     }
 

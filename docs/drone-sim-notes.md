@@ -59,31 +59,11 @@ without the analytic plant. It uses real dataset history rows, rolls LeWM with
 recorded expert actions, and compares predicted embeddings to embeddings of the
 actual future observations.
 
-Reference run:
+The current drone LeWM observation contract is pose-only:
 
 ```text
-model=/home/rozgo/.stable_worldmodel/le-wm-nv-runs/drone-pose16-lewm-sigreg-all-data-20260614-175103
-dataset=/home/rozgo/.stable_worldmodel/le-wm-nv-data/drone-racing-autonomous-100hz-pose16
-start_row=1020
-history=8
+pos_world[0..3]
+rotmat_world_from_body[0..9]
 ```
 
-Results:
-
-```text
-horizon=25
-one_step:      mean_l2=3.2474 mean_cos=0.9762 final_l2=3.3272 final_cos=0.9768
-autoregressive mean_l2=8.2077 mean_cos=0.7924 final_l2=14.8561 final_cos=0.4218
-
-horizon=50
-one_step:      mean_l2=3.9211 mean_cos=0.9661 final_l2=8.6083 final_cos=0.8715
-autoregressive mean_l2=15.1003 mean_cos=0.4552 final_l2=23.0681 final_cos=0.3509
-
-horizon=300
-one_step:      mean_l2=6.6681 mean_cos=0.9234 final_l2=6.5364 final_cos=0.9199
-autoregressive mean_l2=13.3634 mean_cos=0.6336 final_l2=22.4809 final_cos=0.2389
-```
-
-Interpretation: local teacher-forced prediction is reasonably aligned on this
-gate segment, but autoregressive latent rollout degrades quickly. That points
-at rollout stability and planner/model coupling before more plant tuning.
+Regenerate rollout numbers after training a pose12 model.

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import re
 import subprocess
@@ -38,7 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--horizons", default="12,25,40")
     parser.add_argument("--samples", default="32,64,128")
-    parser.add_argument("--lookaheads", default="0.5,1.0,2.0")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--planner-every", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
@@ -66,37 +64,36 @@ def main() -> None:
 
     horizons = parse_int_list(args.horizons, "--horizons")
     samples = parse_int_list(args.samples, "--samples")
-    lookaheads = parse_float_list(args.lookaheads, "--lookaheads")
     output = args.output or default_output_path()
     output.parent.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []
     started = time.perf_counter()
     with output.open("w", encoding="utf-8") as f:
-        for horizon, sample_count, lookahead in itertools.product(
-            horizons, samples, lookaheads
-        ):
-            elites = max(2, sample_count // 4)
-            result = run_case(
-                sim_bin=sim_bin,
-                model_dir=model_dir,
-                steps=args.steps,
-                horizon=horizon,
-                samples=sample_count,
-                elites=elites,
-                iterations=args.iterations,
-                planner_every=args.planner_every,
-                lookahead=lookahead,
-                seed=args.seed,
-                target_pos=args.target_pos,
-                target_yaw=args.target_yaw,
-                timeout_sec=args.timeout_sec,
-            )
-            f.write(json.dumps(result, sort_keys=True) + "\n")
-            f.flush()
-            results.append(result)
-            print(format_case(result))
-            if args.fail_fast and result["returncode"] != 0:
+        for horizon in horizons:
+            for sample_count in samples:
+                elites = max(2, sample_count // 4)
+                result = run_case(
+                    sim_bin=sim_bin,
+                    model_dir=model_dir,
+                    steps=args.steps,
+                    horizon=horizon,
+                    samples=sample_count,
+                    elites=elites,
+                    iterations=args.iterations,
+                    planner_every=args.planner_every,
+                    seed=args.seed,
+                    target_pos=args.target_pos,
+                    target_yaw=args.target_yaw,
+                    timeout_sec=args.timeout_sec,
+                )
+                f.write(json.dumps(result, sort_keys=True) + "\n")
+                f.flush()
+                results.append(result)
+                print(format_case(result))
+                if args.fail_fast and result["returncode"] != 0:
+                    break
+            if args.fail_fast and results and results[-1]["returncode"] != 0:
                 break
 
     print_summary(results, output, time.perf_counter() - started)
@@ -108,13 +105,6 @@ def parse_int_list(value: str, flag: str) -> list[int]:
     out = [int(part.strip()) for part in value.split(",") if part.strip()]
     if not out or any(item <= 0 for item in out):
         raise SystemExit(f"{flag} must contain positive integers")
-    return out
-
-
-def parse_float_list(value: str, flag: str) -> list[float]:
-    out = [float(part.strip()) for part in value.split(",") if part.strip()]
-    if not out or any(item <= 0.0 for item in out):
-        raise SystemExit(f"{flag} must contain positive floats")
     return out
 
 
@@ -133,7 +123,6 @@ def run_case(
     elites: int,
     iterations: int,
     planner_every: int,
-    lookahead: float,
     seed: int,
     target_pos: list[float],
     target_yaw: float,
@@ -155,8 +144,6 @@ def run_case(
         str(iterations),
         "--planner-every",
         str(planner_every),
-        "--target-lookahead",
-        f"{lookahead}",
         "--target-pos",
         ",".join(f"{value}" for value in target_pos),
         "--target-yaw",
@@ -184,7 +171,6 @@ def run_case(
             "elites": elites,
             "iterations": iterations,
             "planner_every": planner_every,
-            "lookahead": lookahead,
             "seed": seed,
             "target_pos": target_pos,
             "target_yaw": target_yaw,
@@ -203,7 +189,6 @@ def run_case(
             "elites": elites,
             "iterations": iterations,
             "planner_every": planner_every,
-            "lookahead": lookahead,
             "seed": seed,
             "target_pos": target_pos,
             "target_yaw": target_yaw,
@@ -248,17 +233,16 @@ def format_case(result: dict[str, Any]) -> str:
     metrics = result.get("metrics") or {}
     if not metrics:
         return (
-            "h={horizon:>2} samples={samples:>3} lookahead={lookahead:.2f} "
+            "h={horizon:>2} samples={samples:>3} "
             "rc={returncode} no metrics"
         ).format(**result)
     return (
-        "h={horizon:>2} samples={samples:>3} lookahead={lookahead:.2f} "
+        "h={horizon:>2} samples={samples:>3} "
         "end={end:.3f} delta={delta:+.3f} wall={wall:.3f}s "
         "plan_ms={plan:.2f} saturated={sat}"
     ).format(
         horizon=result["horizon"],
         samples=result["samples"],
-        lookahead=result["lookahead"],
         end=metrics["end_dist"],
         delta=metrics["distance_delta"],
         wall=metrics["wall"],
@@ -278,10 +262,9 @@ def print_summary(results: list[dict[str, Any]], output: Path, elapsed_sec: floa
     for result in ranked[: min(5, len(ranked))]:
         metrics = result["metrics"]
         print(
-            "  h={} samples={} lookahead={:.2f} end={:.3f} delta={:+.3f} plan_ms={:.2f}".format(
+            "  h={} samples={} end={:.3f} delta={:+.3f} plan_ms={:.2f}".format(
                 result["horizon"],
                 result["samples"],
-                result["lookahead"],
                 metrics["end_dist"],
                 metrics["distance_delta"],
                 metrics["last_plan_ms"],

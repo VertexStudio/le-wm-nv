@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the drone pose16 observation contract used by the LeWM simulator."""
+"""Audit the drone pose12 observation contract used by the LeWM simulator."""
 
 from __future__ import annotations
 
@@ -15,17 +15,16 @@ import numpy as np
 
 
 EXPECTED_ACTION_DIM = 4
-EXPECTED_OBS_DIM = 16
+EXPECTED_OBS_DIM = 12
 EXPECTED_COLUMNS = [
     "pos_world[0..3]",
     "rotmat_world_from_body[0..9]",
-    "previous_channels_norm[0..4]",
 ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate drone pose16 dataset/model schema and CSV rotation conventions."
+        description="Validate drone pose12 dataset/model schema and CSV rotation conventions."
     )
     parser.add_argument(
         "--dataset-dir",
@@ -33,7 +32,7 @@ def parse_args() -> argparse.Namespace:
         default=Path.home()
         / ".stable_worldmodel"
         / "le-wm-nv-data"
-        / "drone-racing-autonomous-100hz-pose16",
+        / "drone-racing-autonomous-100hz-pose12",
     )
     parser.add_argument(
         "--model-dir",
@@ -170,7 +169,7 @@ def audit_model_dir(model_dir: Path) -> dict[str, Any]:
         "action_input_dim": action.get("input_dim"),
         "history_size": model_cfg.get("history_size"),
         "predictor_num_frames": model_cfg.get("predictor", {}).get("num_frames"),
-        "vector_pose16_ok": obs.get("kind") == "vector_mlp"
+        "vector_pose12_ok": obs.get("kind") == "vector_mlp"
         and obs.get("input_dim") == EXPECTED_OBS_DIM,
         "action_ok": action.get("input_dim") == EXPECTED_ACTION_DIM,
         "normalization": stats_dims(normalization),
@@ -326,7 +325,7 @@ def collect_failures(report: dict[str, Any]) -> list[str]:
     if not metadata["observation_dim_ok"]:
         failures.append("metadata observation_dim is not 16")
     if not metadata["columns_ok"]:
-        failures.append("metadata observation columns are not pose16")
+        failures.append("metadata observation columns are not pose12")
     obs_norm = metadata["normalization"]["observation"]
     action_norm = metadata["normalization"]["action"]
     if obs_norm != {"mean": EXPECTED_OBS_DIM, "std": EXPECTED_OBS_DIM}:
@@ -344,8 +343,8 @@ def collect_failures(report: dict[str, Any]) -> list[str]:
         failures.append("CSV roll/pitch/yaw do not look like radians")
     model = report.get("model")
     if model is not None:
-        if not model["vector_pose16_ok"]:
-            failures.append("model is not vector pose16")
+        if not model["vector_pose12_ok"]:
+            failures.append("model is not vector pose12")
         if not model["action_ok"]:
             failures.append("model action dimension is not 4")
         model_obs_norm = model["normalization"]["observation"]

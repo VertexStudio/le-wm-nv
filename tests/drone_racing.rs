@@ -4,16 +4,12 @@ use le_wm_nv::data::drone_racing::{
 };
 
 #[test]
-fn drone_lewm_observation_is_pose_and_previous_control() {
+fn drone_lewm_observation_is_pose_only() {
     let columns = DroneColumns::default();
-    assert_eq!(DRONE_OBSERVATION_DIM, 16);
+    assert_eq!(DRONE_OBSERVATION_DIM, 12);
     assert_eq!(
         columns.observation,
-        [
-            "pos_world[0..3]",
-            "rotmat_world_from_body[0..9]",
-            "previous_channels_norm[0..4]",
-        ]
+        ["pos_world[0..3]", "rotmat_world_from_body[0..9]",]
     );
 }
 

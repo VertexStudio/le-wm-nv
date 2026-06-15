@@ -10,7 +10,7 @@ use hdf5::File;
 use serde::{Deserialize, Serialize};
 
 pub const DRONE_ACTION_DIM: usize = 4;
-pub const DRONE_OBSERVATION_DIM: usize = 16;
+pub const DRONE_OBSERVATION_DIM: usize = 12;
 pub const DRONE_STATE_DELTA_DIM: usize = 13;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -69,14 +69,10 @@ impl Default for DroneColumns {
             .into_iter()
             .map(str::to_string)
             .collect(),
-            observation: [
-                "pos_world[0..3]",
-                "rotmat_world_from_body[0..9]",
-                "previous_channels_norm[0..4]",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+            observation: ["pos_world[0..3]", "rotmat_world_from_body[0..9]"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             state_delta: [
                 "delta_pos_body[0..3]",
                 "delta_rot_body[0..3]",
@@ -357,16 +353,6 @@ impl DroneRacingDataset {
         output[base..base + 3].copy_from_slice(&self.pos_world[row * 3..row * 3 + 3]);
         output[base + 3..base + 12]
             .copy_from_slice(&self.rotmat_world_from_body[row * 9..row * 9 + 9]);
-        let prev_row = if self.step_idx[row] > 0
-            && row > 0
-            && self.episode_idx[row - 1] == self.episode_idx[row]
-        {
-            row - 1
-        } else {
-            row
-        };
-        output[base + 12..base + 16]
-            .copy_from_slice(&self.channels_norm[prev_row * 4..prev_row * 4 + 4]);
         if self.config.normalize_observations {
             normalize_in_place(
                 &mut output[base..base + DRONE_OBSERVATION_DIM],
@@ -601,15 +587,6 @@ fn raw_observation(data: &ImportedDroneData, row: usize) -> [f32; DRONE_OBSERVAT
     let mut out = [0f32; DRONE_OBSERVATION_DIM];
     out[0..3].copy_from_slice(&data.pos_world[row * 3..row * 3 + 3]);
     out[3..12].copy_from_slice(&data.rotmat_world_from_body[row * 9..row * 9 + 9]);
-    let prev = if data.step_idx[row] > 0
-        && row > 0
-        && data.episode_idx[row - 1] == data.episode_idx[row]
-    {
-        row - 1
-    } else {
-        row
-    };
-    out[12..16].copy_from_slice(&data.channels_norm[prev * 4..prev * 4 + 4]);
     out
 }
 

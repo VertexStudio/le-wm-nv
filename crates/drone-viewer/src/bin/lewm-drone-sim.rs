@@ -21,7 +21,7 @@ use le_wm_nv::{
 };
 
 const ACTION_DIM: usize = 4;
-const OBS_DIM: usize = 16;
+const OBS_DIM: usize = 12;
 const TELEMETRY_FONT_SIZE: f32 = 0.11;
 const KEYBOARD_MAX_TILT_RAD: f32 = 0.42;
 const KEYBOARD_ATTITUDE_KP: f32 = 6.0;
@@ -419,9 +419,6 @@ impl Args {
                 }
                 "--planner-init-std" => args.lewm_mut().init_std = next_parse(&mut iter, &arg)?,
                 "--planner-min-std" => args.lewm_mut().min_std = next_parse(&mut iter, &arg)?,
-                "--target-lookahead" => {
-                    args.lewm_mut().target_lookahead = next_parse(&mut iter, &arg)?
-                }
                 "--seed" => args.lewm_mut().seed = Some(next_parse(&mut iter, &arg)?),
                 "--headless-steps" => args.headless_steps = next_parse(&mut iter, &arg)?,
                 "--inspect-gate-targets" => args.inspect_gate_targets = true,
@@ -637,11 +634,10 @@ fn print_help() {
            --planner-samples <n>          default 64\n\
            --planner-elites <n>           default 8\n\
            --planner-iterations <n>       default 1\n\
-           --planner-every <model steps>  default 5\n\
-           --planner-init-std <raw units> default 0.25\n\
-           --planner-min-std <raw units>  default 0.005\n\
-           --target-lookahead <meters>    default 0.5\n\
-           --seed <u64>                   deterministic CUDA candidate noise\n\
+          --planner-every <model steps>  default 5\n\
+          --planner-init-std <raw units> default 0.25\n\
+          --planner-min-std <raw units>  default 0.005\n\
+          --seed <u64>                   deterministic CUDA candidate noise\n\
            --headless-steps <n>           run planner/sim smoke test without Bevy window\n\
            --inspect-gate-targets         print ordered gate entry/pass poses and exit\n\
            --oracle-replay-rows <n>       replay recorded dataset actions through the analytic plant\n\
@@ -728,11 +724,10 @@ struct TargetConfig {
 }
 
 impl TargetConfig {
-    fn to_pose(self, previous_action: [f32; ACTION_DIM]) -> TargetPose {
+    fn to_pose(self) -> TargetPose {
         TargetPose {
             pos_world: self.pos_world,
             rot_world_from_body: Quat::from_rotation_z(self.yaw_rad),
-            previous_action,
         }
     }
 }
@@ -769,8 +764,7 @@ impl StartConfig {
 
 fn initial_sim_state(args: &Args) -> anyhow::Result<SimState> {
     let Some(start) = args.start.as_ref() else {
-        let previous_action = [0.0, 0.0, args.dynamics.hover_throttle, 0.0];
-        let target = args.target.to_pose(previous_action);
+        let target = args.target.to_pose();
         return Ok(SimState::new(args.dynamics.clone(), target, args.max_trail));
     };
     let dataset = DroneRacingDataset::open(
@@ -798,7 +792,7 @@ fn initial_sim_state(args: &Args) -> anyhow::Result<SimState> {
     } else {
         frame.channels_norm
     };
-    let target = args.target.to_pose(prev_action);
+    let target = args.target.to_pose();
     let pose = DronePose::from_plant(DronePlantState::from_frame(&frame));
     Ok(SimState::from_start_frame(
         args.dynamics.clone(),
@@ -861,7 +855,7 @@ fn default_dataset_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".stable_worldmodel")
         .join("le-wm-nv-data")
-        .join("drone-racing-autonomous-100hz-pose16")
+        .join("drone-racing-autonomous-100hz-pose12")
 }
 
 fn default_gates_path() -> PathBuf {
@@ -884,7 +878,6 @@ struct LeWmControlConfig {
     plan_every_model_steps: usize,
     init_std: f32,
     min_std: f32,
-    target_lookahead: f32,
     seed: Option<u64>,
 }
 
@@ -905,7 +898,6 @@ impl Default for LeWmControlConfig {
             plan_every_model_steps: 5,
             init_std: 0.25,
             min_std: 0.005,
-            target_lookahead: 0.5,
             seed: None,
         }
     }
@@ -946,10 +938,6 @@ impl LeWmControlConfig {
         ensure!(
             self.min_std.is_finite() && self.min_std >= 0.0,
             "--planner-min-std must be finite and non-negative"
-        );
-        ensure!(
-            self.target_lookahead.is_finite() && self.target_lookahead > 0.0,
-            "--target-lookahead must be finite and positive"
         );
         Ok(())
     }
@@ -1096,11 +1084,10 @@ impl SimState {
         };
     }
 
-    fn obs16(&self) -> [f32; OBS_DIM] {
+    fn obs12(&self) -> [f32; OBS_DIM] {
         let mut obs = [0.0; OBS_DIM];
         obs[0..3].copy_from_slice(&vec3_array(self.pose.pos_world));
         obs[3..12].copy_from_slice(&rotmat_row_major_array(self.pose.rot_world_from_body));
-        obs[12..16].copy_from_slice(&self.previous_action);
         obs
     }
 }
@@ -1292,10 +1279,8 @@ struct GateTarget {
     pass_row: usize,
     entry_pos_world: Vec3,
     entry_rot_world_from_body: Quat,
-    entry_previous_action: [f32; ACTION_DIM],
     pass_pos_world: Vec3,
     pass_rot_world_from_body: Quat,
-    pass_previous_action: [f32; ACTION_DIM],
 }
 
 impl GateTarget {
@@ -1332,11 +1317,9 @@ impl GateTarget {
             closest_reference_index_after(dataset, reference_rows, center, search_start)?;
         let pass_row = reference_rows[pass_idx];
         let pass_pose = pose_at_row(dataset, pass_row)?;
-        let pass_previous_action = previous_action_at_row(dataset, pass_row)?;
         let entry_idx = entry_reference_index(pass_idx, search_start);
         let entry_row = reference_rows[entry_idx];
         let entry_pose = pose_at_row(dataset, entry_row)?;
-        let entry_previous_action = previous_action_at_row(dataset, entry_row)?;
         let display_normal = horizontal_unit(pass_pose.pos_world - entry_pose.pos_world)
             .or_else(|| {
                 trajectory_direction(dataset, reference_rows, entry_idx, pass_idx)
@@ -1353,10 +1336,8 @@ impl GateTarget {
             pass_row,
             entry_pos_world: entry_pose.pos_world,
             entry_rot_world_from_body: entry_pose.rot_world_from_body,
-            entry_previous_action,
             pass_pos_world: pass_pose.pos_world,
             pass_rot_world_from_body: pass_pose.rot_world_from_body,
-            pass_previous_action,
         })
     }
 
@@ -1364,7 +1345,6 @@ impl GateTarget {
         TargetPose {
             pos_world: self.entry_pos_world,
             rot_world_from_body: self.entry_rot_world_from_body,
-            previous_action: self.entry_previous_action,
         }
     }
 
@@ -1372,7 +1352,6 @@ impl GateTarget {
         TargetPose {
             pos_world: self.pass_pos_world,
             rot_world_from_body: self.pass_rot_world_from_body,
-            previous_action: self.pass_previous_action,
         }
     }
 }
@@ -1407,20 +1386,6 @@ fn entry_reference_index(pass_idx: usize, min_idx: usize) -> usize {
 fn pose_at_row(dataset: &DroneRacingDataset, row: usize) -> anyhow::Result<DronePose> {
     let frame = dataset.frame(row)?;
     Ok(DronePose::from_plant(DronePlantState::from_frame(&frame)))
-}
-
-fn previous_action_at_row(
-    dataset: &DroneRacingDataset,
-    row: usize,
-) -> anyhow::Result<[f32; ACTION_DIM]> {
-    let frame = dataset.frame(row)?;
-    if frame.step_idx > 0 && row > 0 {
-        let previous = dataset.frame(row - 1)?;
-        if previous.episode_idx == frame.episode_idx {
-            return Ok(previous.channels_norm);
-        }
-    }
-    Ok(frame.channels_norm)
 }
 
 fn trajectory_direction(
@@ -1490,7 +1455,6 @@ impl DronePose {
 struct TargetPose {
     pos_world: Vec3,
     rot_world_from_body: Quat,
-    previous_action: [f32; ACTION_DIM],
 }
 
 fn pose_summary(row: Option<usize>, pose: DronePose) -> String {
@@ -1498,14 +1462,7 @@ fn pose_summary(row: Option<usize>, pose: DronePose) -> String {
 }
 
 fn target_pose_summary(row: Option<usize>, pose: TargetPose) -> String {
-    format!(
-        "{} prev_action=[{:+.3} {:+.3} {:+.3} {:+.3}]",
-        attitude_summary(row, pose.pos_world, pose.rot_world_from_body),
-        pose.previous_action[0],
-        pose.previous_action[1],
-        pose.previous_action[2],
-        pose.previous_action[3],
-    )
+    attitude_summary(row, pose.pos_world, pose.rot_world_from_body)
 }
 
 fn attitude_summary(row: Option<usize>, pos_world: Vec3, rot_world_from_body: Quat) -> String {
@@ -1551,12 +1508,11 @@ struct DroneLeWmController {
     last_action: [f32; ACTION_DIM],
     enabled: bool,
     sim_steps_per_model_step: usize,
-    model_hz: f32,
     next_observe_step: usize,
     model_step: usize,
     plan_every_model_steps: usize,
-    target_lookahead: f32,
-    last_carrot: Vec3,
+    history_actions_raw: Vec<[f32; ACTION_DIM]>,
+    last_target_pos: Vec3,
     plan_count: usize,
     last_best_score: f32,
     last_plan_ms: f32,
@@ -1635,8 +1591,7 @@ impl DroneLeWmController {
             .reshape((1, 1, 1, ACTION_DIM))?;
 
         let sim_steps_per_model_step = ((dynamics.sim_hz / cfg.model_hz).round() as usize).max(1);
-        let target_pose =
-            target_pose_for_horizon(state, horizon, cfg.model_hz, cfg.target_lookahead);
+        let target_pose = state.target;
         let target_emb =
             encode_target_embedding(&model, &obs_mean, &obs_std, dtype, &device, target_pose)?;
         let mut controller = Self {
@@ -1649,16 +1604,15 @@ impl DroneLeWmController {
             action_std,
             target_emb,
             planner: IcemPlanner::new(planner_cfg),
-            history_raw: vec![state.obs16(); history_size],
+            history_raw: vec![state.obs12(); history_size],
             last_action: state.previous_action,
             enabled: true,
             sim_steps_per_model_step,
-            model_hz: cfg.model_hz,
             next_observe_step: sim_steps_per_model_step,
             model_step: 0,
             plan_every_model_steps: cfg.plan_every_model_steps,
-            target_lookahead: cfg.target_lookahead,
-            last_carrot: state.target.pos_world,
+            history_actions_raw: vec![state.previous_action; history_size.saturating_sub(1)],
+            last_target_pos: state.target.pos_world,
             plan_count: 0,
             last_best_score: f32::NAN,
             last_plan_ms: 0.0,
@@ -1671,7 +1625,7 @@ impl DroneLeWmController {
     }
 
     fn reset(&mut self, state: &SimState) -> anyhow::Result<()> {
-        let obs = state.obs16();
+        let obs = state.obs12();
         for slot in &mut self.history_raw {
             *slot = obs;
         }
@@ -1683,7 +1637,9 @@ impl DroneLeWmController {
         self.last_iterations = 0;
         self.last_error = None;
         self.last_action = state.previous_action;
-        self.last_carrot = state.target.pos_world;
+        self.last_target_pos = state.target.pos_world;
+        self.history_actions_raw =
+            vec![state.previous_action; self.history_raw.len().saturating_sub(1)];
         self.reset_warm_start(state.previous_action)
     }
 
@@ -1706,15 +1662,21 @@ impl DroneLeWmController {
         while self.next_observe_step <= state.step {
             self.next_observe_step += self.sim_steps_per_model_step;
         }
-        self.observe(state.obs16());
+        self.observe(state.obs12(), state.previous_action);
         self.model_step += 1;
         true
     }
 
-    fn observe(&mut self, obs: [f32; OBS_DIM]) {
+    fn observe(&mut self, obs: [f32; OBS_DIM], action: [f32; ACTION_DIM]) {
         self.history_raw.rotate_left(1);
         if let Some(last) = self.history_raw.last_mut() {
             *last = obs;
+        }
+        if !self.history_actions_raw.is_empty() {
+            self.history_actions_raw.rotate_left(1);
+            if let Some(last) = self.history_actions_raw.last_mut() {
+                *last = action;
+            }
         }
     }
 
@@ -1725,12 +1687,7 @@ impl DroneLeWmController {
     fn plan(&mut self, state: &SimState) -> anyhow::Result<[f32; ACTION_DIM]> {
         self.device.synchronize()?;
         let started = Instant::now();
-        let target_pose = target_pose_for_horizon(
-            state,
-            self.planner.config().horizon,
-            self.model_hz,
-            self.target_lookahead,
-        );
+        let target_pose = state.target;
         let target_emb = encode_target_embedding(
             &self.model,
             &self.obs_mean,
@@ -1776,7 +1733,7 @@ impl DroneLeWmController {
         self.last_iterations = result.iterations_completed;
         self.plan_count += 1;
         self.last_action = action;
-        self.last_carrot = target_pose.pos_world;
+        self.last_target_pos = target_pose.pos_world;
         self.target_emb = target_emb;
         Ok(action)
     }
@@ -1798,8 +1755,13 @@ impl DroneLeWmController {
         }
         let prefix_len = self.history_raw.len() - 1;
         let mut values = Vec::with_capacity(prefix_len * ACTION_DIM);
-        for obs in self.history_raw.iter().skip(1) {
-            values.extend_from_slice(&obs[12..16]);
+        ensure!(
+            self.history_actions_raw.len() == prefix_len,
+            "LeWM action history length {} does not match expected prefix length {prefix_len}",
+            self.history_actions_raw.len()
+        );
+        for action in &self.history_actions_raw {
+            values.extend_from_slice(action);
         }
         Ok(Some(
             Tensor::from_vec(values, (1, 1, prefix_len, ACTION_DIM), &self.device)?
@@ -1867,65 +1829,16 @@ fn encode_target_embedding(
     device: &CandleDevice,
     target: TargetPose,
 ) -> anyhow::Result<Tensor> {
-    let target_obs = target_obs16(target);
+    let target_obs = target_obs12(target);
     let target = Tensor::from_vec(target_obs.to_vec(), (1, 1, OBS_DIM), device)?.to_dtype(dtype)?;
     let target = target.broadcast_sub(obs_mean)?.broadcast_div(obs_std)?;
     Ok(model.encode_vector(&target)?)
 }
 
-fn target_pose_for_horizon(
-    state: &SimState,
-    horizon: usize,
-    model_hz: f32,
-    max_lookahead: f32,
-) -> TargetPose {
-    TargetPose {
-        pos_world: target_position_for_horizon(state, horizon, model_hz, max_lookahead),
-        rot_world_from_body: state.target.rot_world_from_body,
-        previous_action: state.target.previous_action,
-    }
-}
-
-fn target_position_for_horizon(
-    state: &SimState,
-    horizon: usize,
-    model_hz: f32,
-    max_lookahead: f32,
-) -> Vec3 {
-    let delta = state.target.pos_world - state.pose.pos_world;
-    let dist = delta.length();
-    if dist <= 1e-5 {
-        state.target.pos_world
-    } else {
-        state.pose.pos_world
-            + delta / dist
-                * target_distance_for_horizon(state, horizon.max(1), model_hz, max_lookahead)
-    }
-}
-
-fn target_distance_for_horizon(
-    state: &SimState,
-    horizon: usize,
-    model_hz: f32,
-    max_lookahead: f32,
-) -> f32 {
-    let dist = (state.target.pos_world - state.pose.pos_world).length();
-    if dist <= 1e-5 {
-        return 0.0;
-    }
-    let horizon_seconds = horizon as f32 / model_hz.max(1e-3);
-    let planning_speed = state.pose.vel_world.length().clamp(1.5, 5.0);
-    (planning_speed * horizon_seconds)
-        .max(0.05)
-        .min(max_lookahead)
-        .min(dist)
-}
-
-fn target_obs16(target: TargetPose) -> [f32; OBS_DIM] {
+fn target_obs12(target: TargetPose) -> [f32; OBS_DIM] {
     let mut obs = [0.0; OBS_DIM];
     obs[0..3].copy_from_slice(&vec3_array(target.pos_world));
     obs[3..12].copy_from_slice(&rotmat_row_major_array(target.rot_world_from_body));
-    obs[12..16].copy_from_slice(&target.previous_action);
     obs
 }
 
@@ -2374,10 +2287,10 @@ fn draw_sim_overlays(
     }
     draw_target_pose(&mut gizmos, state.target);
     if let Some(controller) = controller.as_ref() {
-        let carrot = view_vec3(controller.last_carrot);
-        gizmos.sphere(carrot, 0.13, Color::srgb(1.0, 0.55, 0.05));
-        draw_cross(&mut gizmos, carrot, 0.25, Color::srgb(1.0, 0.55, 0.05));
-        gizmos.line(pos, carrot, Color::srgb(1.0, 0.55, 0.05));
+        let target = view_vec3(controller.last_target_pos);
+        gizmos.sphere(target, 0.13, Color::srgb(1.0, 0.55, 0.05));
+        draw_cross(&mut gizmos, target, 0.25, Color::srgb(1.0, 0.55, 0.05));
+        gizmos.line(pos, target, Color::srgb(1.0, 0.55, 0.05));
     }
 
     let vel_view = drone_to_view_vec(pose.vel_world);
@@ -2394,7 +2307,7 @@ fn telemetry_text(
     controller: Option<&DroneLeWmController>,
 ) -> String {
     let pose = state.pose;
-    let obs = state.obs16();
+    let obs = state.obs12();
     let target_dist = (state.target.pos_world - pose.pos_world).length();
     let status = if control.paused { "paused" } else { "running" };
     let lewm_text = controller
@@ -2405,16 +2318,16 @@ fn telemetry_text(
                 "lewm:off"
             };
             format!(
-                "{} plans={} plan_ms={:.2} best={:.3} model_step={} every={} carrot=[{:.2} {:.2} {:.2}]",
+                "{} plans={} plan_ms={:.2} best={:.3} model_step={} every={} target=[{:.2} {:.2} {:.2}]",
                 mode,
                 controller.plan_count,
                 controller.last_plan_ms,
                 controller.last_best_score,
                 controller.model_step,
                 controller.plan_every_model_steps,
-                controller.last_carrot.x,
-                controller.last_carrot.y,
-                controller.last_carrot.z,
+                controller.last_target_pos.x,
+                controller.last_target_pos.y,
+                controller.last_target_pos.z,
             )
         })
         .unwrap_or_else(|| "lewm:not-loaded".to_string());
@@ -2442,7 +2355,7 @@ fn telemetry_text(
     format!(
         "{} t={:.2}s step={} pos=[{:.2} {:.2} {:.2}] dist={:.2}\n\
          a roll={:.2} pitch={:.2} thr={:.2} yaw={:.2} vel=[{:.2} {:.2} {:.2}] rates=[{:.2} {:.2} {:.2}]\n\
-         obs16 pos=[{:.2} {:.2} {:.2}] cam dist={:.1} height={:.1} spring={:.1} step_ms={:.4}\n\
+         obs12 pos=[{:.2} {:.2} {:.2}] cam dist={:.1} height={:.1} spring={:.1} step_ms={:.4}\n\
          {}{}",
         status,
         state.time,
