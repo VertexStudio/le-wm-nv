@@ -1,6 +1,21 @@
 use le_wm_nv::data::drone_racing::{
-    mat3_from_rotvec, mat3_mul, normalize_channels, rotvec_from_mat3,
+    DRONE_OBSERVATION_DIM, DroneColumns, mat3_from_rotvec, mat3_mul, normalize_channels,
+    rotvec_from_mat3,
 };
+
+#[test]
+fn drone_lewm_observation_is_pose_and_previous_control() {
+    let columns = DroneColumns::default();
+    assert_eq!(DRONE_OBSERVATION_DIM, 16);
+    assert_eq!(
+        columns.observation,
+        [
+            "pos_world[0..3]",
+            "rotmat_world_from_body[0..9]",
+            "previous_channels_norm[0..4]",
+        ]
+    );
+}
 
 #[test]
 fn normalizes_betaflight_channels_to_rc_action_space() {
