@@ -10,6 +10,10 @@ autobins = false
 name = "lewm-drone-viewer"
 path = "src/main.rs"
 
+[[bin]]
+name = "lewm-drone-sim"
+path = "src/bin/lewm-drone-sim.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 bevy = { git = "https://github.com/bevyengine/bevy", branch = "release-0.19.0", default-features = false, features = ["3d", "ui"] }
