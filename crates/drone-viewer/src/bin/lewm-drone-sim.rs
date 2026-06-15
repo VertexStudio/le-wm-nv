@@ -15,6 +15,12 @@ use le_wm_nv::{
 const ACTION_DIM: usize = 4;
 const OBS_DIM: usize = 16;
 const TELEMETRY_FONT_SIZE: f32 = 0.11;
+const KEYBOARD_MAX_TILT_RAD: f32 = 0.42;
+const KEYBOARD_ATTITUDE_KP: f32 = 6.0;
+const KEYBOARD_YAW_LIMIT: f32 = 0.28;
+const KEYBOARD_RATE_SLEW: f32 = 4.0;
+const KEYBOARD_THROTTLE_SLEW: f32 = 0.55;
+const PLANNER_ACTION_STD_LIMIT: f32 = 3.0;
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
@@ -343,9 +349,9 @@ fn print_help() {
            --headless-steps <n>           run planner/sim smoke test without Bevy window\n\
          \n\
          Controls:\n\
-           W/S pitch forward/back, A/D roll left/right, Q/E yaw left/right, R/F throttle\n\
+           W/S forward/back tilt, A/D left/right tilt, Q/E yaw left/right, R/F throttle\n\
            L toggles LeWM control when loaded\n\
-           Z zero roll/pitch/yaw, X hover throttle, P pause, Backspace reset\n\
+           Z level roll/pitch/yaw, X hover throttle, P pause, Backspace reset\n\
            mouse wheel or [/] camera distance, 3/4 camera height, 1/2 camera spring"
     );
 }
@@ -554,6 +560,7 @@ impl LeWmControlConfig {
 struct SimControl {
     action: [f32; ACTION_DIM],
     hover_action: [f32; ACTION_DIM],
+    manual_throttle: f32,
     paused: bool,
     accumulator: f32,
 }
@@ -564,6 +571,7 @@ impl SimControl {
         Self {
             action: hover_action,
             hover_action,
+            manual_throttle: hover_throttle,
             paused: false,
             accumulator: 0.0,
         }
@@ -769,10 +777,7 @@ impl DroneLeWmController {
         planner_cfg.init_std = cfg.init_std;
         planner_cfg.min_std = cfg.min_std;
         planner_cfg.seed = cfg.seed;
-        planner_cfg.action_bounds = ActionBounds {
-            low: vec![-1.0, -1.0, 0.0, -1.0],
-            high: vec![1.0, 1.0, 1.0, 1.0],
-        };
+        planner_cfg.action_bounds = action_bounds_from_stats(&normalization.action);
 
         let mut target_action = [0.0f32; ACTION_DIM];
         target_action.copy_from_slice(&normalization.action.mean[..ACTION_DIM]);
@@ -1096,6 +1101,29 @@ fn target_obs16(target: TargetPose, previous_action: [f32; ACTION_DIM]) -> [f32;
     obs
 }
 
+fn action_bounds_from_stats(stats: &RunningStats) -> ActionBounds {
+    let mut low = Vec::with_capacity(ACTION_DIM);
+    let mut high = Vec::with_capacity(ACTION_DIM);
+    for idx in 0..ACTION_DIM {
+        let center = stats.mean[idx];
+        let spread = stats.std[idx].max(1e-3) * PLANNER_ACTION_STD_LIMIT;
+        let (lo, hi) = if idx == 2 {
+            (
+                (center - spread).clamp(0.0, 1.0),
+                (center + spread).clamp(0.0, 1.0),
+            )
+        } else {
+            (
+                (center - spread).clamp(-1.0, 1.0),
+                (center + spread).clamp(-1.0, 1.0),
+            )
+        };
+        low.push(lo);
+        high.push(hi);
+    }
+    ActionBounds { low, high }
+}
+
 fn validate_stats(name: &str, stats: &RunningStats, dim: usize) -> anyhow::Result<()> {
     ensure!(
         stats.mean.len() == dim && stats.std.len() == dim,
@@ -1243,6 +1271,7 @@ fn update_controls(
     }
     if keys.just_pressed(KeyCode::Backspace) {
         control.action = control.hover_action;
+        control.manual_throttle = control.hover_action[2];
         control.accumulator = 0.0;
         state.reset(control.hover_action);
         if let Some(controller) = controller.as_mut() {
@@ -1258,6 +1287,7 @@ fn update_controls(
         control.action[3] = 0.0;
     }
     if keys.just_pressed(KeyCode::KeyX) {
+        control.manual_throttle = control.hover_action[2];
         control.action[2] = control.hover_action[2];
     }
 
@@ -1266,15 +1296,39 @@ fn update_controls(
         .as_ref()
         .is_some_and(|controller| controller.enabled);
     if !lewm_enabled {
-        let target_roll = axis(keys.pressed(KeyCode::KeyA), keys.pressed(KeyCode::KeyD));
-        let target_pitch = axis(keys.pressed(KeyCode::KeyS), keys.pressed(KeyCode::KeyW));
-        let target_yaw = axis(keys.pressed(KeyCode::KeyQ), keys.pressed(KeyCode::KeyE));
-        control.action[0] = approach(control.action[0], target_roll, 5.0 * dt);
-        control.action[1] = approach(control.action[1], target_pitch, 5.0 * dt);
-        control.action[3] = approach(control.action[3], target_yaw, 5.0 * dt);
+        let target_roll_angle =
+            axis(keys.pressed(KeyCode::KeyA), keys.pressed(KeyCode::KeyD)) * KEYBOARD_MAX_TILT_RAD;
+        let target_pitch_angle =
+            axis(keys.pressed(KeyCode::KeyS), keys.pressed(KeyCode::KeyW)) * KEYBOARD_MAX_TILT_RAD;
+        let target_yaw =
+            axis(keys.pressed(KeyCode::KeyQ), keys.pressed(KeyCode::KeyE)) * KEYBOARD_YAW_LIMIT;
+        let (roll_angle, pitch_angle, body_up_z) = roll_pitch_from_pose(state.pose);
+        let desired_roll_rate = (target_roll_angle - roll_angle) * KEYBOARD_ATTITUDE_KP;
+        let desired_pitch_rate = (target_pitch_angle - pitch_angle) * KEYBOARD_ATTITUDE_KP;
+        let target_roll = desired_roll_rate / state.dynamics.max_roll_rate;
+        let target_pitch = desired_pitch_rate / state.dynamics.max_pitch_rate;
+        control.action[0] = approach(
+            control.action[0],
+            target_roll.clamp(-1.0, 1.0),
+            KEYBOARD_RATE_SLEW * dt,
+        );
+        control.action[1] = approach(
+            control.action[1],
+            target_pitch.clamp(-1.0, 1.0),
+            KEYBOARD_RATE_SLEW * dt,
+        );
+        control.action[3] = approach(control.action[3], target_yaw, KEYBOARD_RATE_SLEW * dt);
 
         let throttle_delta = axis(keys.pressed(KeyCode::KeyF), keys.pressed(KeyCode::KeyR));
-        control.action[2] = (control.action[2] + throttle_delta * 0.75 * dt).clamp(0.0, 1.0);
+        control.manual_throttle = (control.manual_throttle
+            + throttle_delta * KEYBOARD_THROTTLE_SLEW * dt)
+            .clamp(0.0, 1.0);
+        let compensated_throttle = control.manual_throttle / body_up_z.clamp(0.35, 1.0);
+        control.action[2] = approach(
+            control.action[2],
+            compensated_throttle.clamp(0.0, 1.0),
+            KEYBOARD_THROTTLE_SLEW * 2.0 * dt,
+        );
     }
 
     for event in scroll.read() {
@@ -1565,6 +1619,13 @@ fn axis(negative: bool, positive: bool) -> f32 {
 fn approach(value: f32, target: f32, max_delta: f32) -> f32 {
     let delta = (target - value).clamp(-max_delta, max_delta);
     value + delta
+}
+
+fn roll_pitch_from_pose(pose: DronePose) -> (f32, f32, f32) {
+    let body_up = pose.rot_world_from_body * Vec3::Z;
+    let roll = (-body_up.y).atan2(body_up.z);
+    let pitch = body_up.x.atan2(body_up.z);
+    (roll, pitch, body_up.z)
 }
 
 fn transform_from_pose(pose: &DronePose) -> Transform {
