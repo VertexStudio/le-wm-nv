@@ -437,7 +437,6 @@ impl CemPlanner {
             cfg.init_std,
         )?;
         let (low, high) = self.workspace.bounds(&cfg.action_bounds, dtype, device)?;
-        let mut last_candidates = None;
         let mut last_scores = None;
         let mut iterations_completed = 0;
         let mut deadline_reached = false;
@@ -476,17 +475,14 @@ impl CemPlanner {
             mean = elites.mean(1)?;
             std = enforce_min_std(&elites.var(1)?.sqrt()?, cfg.min_std)?;
 
-            last_candidates = Some(candidates);
             last_scores = Some(scores);
             iterations_completed += 1;
         }
 
-        let candidates = last_candidates
-            .ok_or_else(|| candle::Error::Msg("CEM did not complete any iteration".to_string()))?;
         let scores = last_scores
             .ok_or_else(|| candle::Error::Msg("CEM did not produce scores".to_string()))?;
         let best_index_tensor = lowest_score_indices(&scores, 1)?;
-        let sequence = gather_candidate_sequences(&candidates, &best_index_tensor)?.squeeze(1)?;
+        let sequence = mean;
         let first_action = sequence.i((.., 0, ..))?;
         let elapsed = start.elapsed();
 
@@ -704,7 +700,6 @@ impl IcemPlanner {
         )?;
         let (low, high) = self.workspace.bounds(&cfg.action_bounds, dtype, device)?;
         let mut carried_elites = None;
-        let mut last_candidates = None;
         let mut last_scores = None;
         let mut iterations_completed = 0;
         let mut deadline_reached = false;
@@ -748,7 +743,7 @@ impl IcemPlanner {
                 cfg.noise_beta,
             )?;
             let candidates = match carried_elites.as_ref() {
-                Some(elites) => Tensor::cat(&[&sampled, elites], 1)?,
+                Some(elites) => inject_carried_elites(&sampled, elites, cfg.keep_elites)?,
                 None => sampled,
             };
             let candidate_count = candidates.dim(1)?;
@@ -766,17 +761,14 @@ impl IcemPlanner {
                 Some(elites.narrow(1, 0, cfg.keep_elites)?)
             };
 
-            last_candidates = Some(candidates);
             last_scores = Some(scores);
             iterations_completed += 1;
         }
 
-        let candidates = last_candidates
-            .ok_or_else(|| candle::Error::Msg("iCEM did not complete any iteration".to_string()))?;
         let scores = last_scores
             .ok_or_else(|| candle::Error::Msg("iCEM did not produce scores".to_string()))?;
         let best_index_tensor = lowest_score_indices(&scores, 1)?;
-        let sequence = gather_candidate_sequences(&candidates, &best_index_tensor)?.squeeze(1)?;
+        let sequence = mean;
         self.warm_start = Some(shift_sequence_for_warm_start(&sequence)?);
         let first_action = sequence.i((.., 0, ..))?;
         let elapsed = start.elapsed();
@@ -944,9 +936,11 @@ fn sample_candidates(
     let (_, horizon, action_dim) = mean.dims3()?;
     let shape = (batch, samples, horizon, action_dim);
     let noise = sampler.standard_normal(shape, dtype, device)?;
-    let mean = mean.unsqueeze(1)?.broadcast_as(shape)?;
+    let mean_candidate = mean.unsqueeze(1)?;
+    let mean = mean_candidate.broadcast_as(shape)?;
     let std = std.unsqueeze(1)?.broadcast_as(shape)?;
     let candidates = mean.broadcast_add(&noise.broadcast_mul(&std)?)?;
+    let candidates = inject_mean_candidate(&candidates, &mean_candidate)?;
     clamp_actions(&candidates, low, high)
 }
 
@@ -966,10 +960,51 @@ fn sample_candidates_with_temporal_noise(
     let shape = (batch, samples, horizon, action_dim);
     let noise = sampler.standard_normal(shape, DType::F32, device)?;
     let noise = color_temporal_noise(&noise, noise_beta)?.to_dtype(dtype)?;
-    let mean = mean.unsqueeze(1)?.broadcast_as(shape)?;
+    let mean_candidate = mean.unsqueeze(1)?;
+    let mean = mean_candidate.broadcast_as(shape)?;
     let std = std.unsqueeze(1)?.broadcast_as(shape)?;
     let candidates = mean.broadcast_add(&noise.broadcast_mul(&std)?)?;
+    let candidates = inject_mean_candidate(&candidates, &mean_candidate)?;
     clamp_actions(&candidates, low, high)
+}
+
+fn inject_mean_candidate(candidates: &Tensor, mean: &Tensor) -> Result<Tensor> {
+    let samples = candidates.dim(1)?;
+    if samples == 0 {
+        candle::bail!("candidate tensor must contain at least one sample");
+    }
+    if samples == 1 {
+        return Ok(mean.clone());
+    }
+    let rest = candidates.narrow(1, 1, samples - 1)?;
+    Tensor::cat(&[mean, &rest], 1)
+}
+
+fn inject_carried_elites(
+    candidates: &Tensor,
+    carried_elites: &Tensor,
+    keep_elites: usize,
+) -> Result<Tensor> {
+    if keep_elites == 0 {
+        return Ok(candidates.clone());
+    }
+    let samples = candidates.dim(1)?;
+    if samples <= 1 {
+        return Ok(candidates.clone());
+    }
+    let carried = carried_elites.dim(1)?;
+    let inject = keep_elites.min(carried).min(samples - 1);
+    if inject == 0 {
+        return Ok(candidates.clone());
+    }
+
+    let mean_candidate = candidates.narrow(1, 0, 1)?;
+    let elites = carried_elites.narrow(1, 0, inject)?;
+    if 1 + inject == samples {
+        return Tensor::cat(&[&mean_candidate, &elites], 1);
+    }
+    let rest = candidates.narrow(1, 1 + inject, samples - 1 - inject)?;
+    Tensor::cat(&[&mean_candidate, &elites, &rest], 1)
 }
 
 #[derive(Debug)]
@@ -1687,6 +1722,96 @@ mod tests {
 
         let values = colored.reshape((2 * 8 * 6 * 4,))?.to_vec1::<f32>()?;
         assert!(values.iter().all(|value| value.is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    fn sampled_candidates_include_mean_in_first_slot() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let mean = Tensor::new(&[[[0.25f32, -0.5], [0.75, 0.1]]], &device)?;
+        let std = Tensor::new(&[[[0.5f32, 0.5], [0.5, 0.5]]], &device)?;
+        let bounds = ActionBounds::symmetric(2, 1.0);
+        let workspace = PlannerWorkspace::new();
+        let (low, high) = workspace.bounds(&bounds, DType::F32, &device)?;
+        let mut sampler = PlanSampler::Device;
+
+        let candidates = sample_candidates(
+            &mean,
+            &std,
+            4,
+            &low,
+            &high,
+            DType::F32,
+            &device,
+            &mut sampler,
+        )?;
+        let first = candidates.i((0, 0, .., ..))?;
+
+        assert_eq!(first.to_vec2::<f32>()?, mean.squeeze(0)?.to_vec2::<f32>()?);
+        Ok(())
+    }
+
+    #[test]
+    fn carried_elites_replace_samples_without_growing_candidate_count() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let candidates = Tensor::arange(0f32, 5f32, &device)?.reshape((1, 5, 1, 1))?;
+        let carried = Tensor::new(&[[[[10f32]], [[11f32]]]], &device)?;
+
+        let injected = inject_carried_elites(&candidates, &carried, 2)?;
+
+        assert_eq!(injected.dims(), &[1, 5, 1, 1]);
+        assert_eq!(
+            injected.reshape((5,))?.to_vec1::<f32>()?,
+            &[0., 10., 11., 3., 4.]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn icem_returns_final_mean_sequence_not_best_sample() -> Result<()> {
+        struct FixedScoreScorer<'a> {
+            device: &'a Device,
+        }
+
+        impl CandidateScorer for FixedScoreScorer<'_> {
+            fn device(&self) -> &Device {
+                self.device
+            }
+
+            fn dtype(&self) -> DType {
+                DType::F32
+            }
+
+            fn batch_size(&self) -> Option<usize> {
+                Some(1)
+            }
+
+            fn score_candidates(&self, action_candidates: &Tensor) -> Result<Tensor> {
+                let samples = action_candidates.dim(1)?;
+                let mut scores = (0..samples).map(|idx| idx as f32).collect::<Vec<_>>();
+                scores[0] = 100.0;
+                Tensor::from_vec(scores, (1, samples), self.device)
+            }
+        }
+
+        let device = Device::new_cuda(0)?;
+        let mut cfg = IcemConfig::new(2, 4, 2, 1);
+        cfg.iterations = 1;
+        cfg.keep_elites = 0;
+        cfg.alpha = 1.0;
+        cfg.init_std = 0.5;
+        cfg.seed = Some(123);
+        let mut planner = IcemPlanner::new(cfg);
+        let warm_start = Tensor::new(&[[[0.25f32], [-0.5]]], &device)?;
+        planner.set_warm_start_sequence(warm_start.clone());
+
+        let result = planner.plan_device(&FixedScoreScorer { device: &device })?;
+
+        assert_eq!(best_indices_from_tensor(&result.best_indices)?, &[1]);
+        assert_eq!(
+            result.sequence.to_vec3::<f32>()?,
+            warm_start.to_vec3::<f32>()?
+        );
         Ok(())
     }
 

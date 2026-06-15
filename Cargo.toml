@@ -78,3 +78,11 @@ path = "src/bin/lewm-drone-fit-plant.rs"
 [[bin]]
 name = "lewm-drone-rollout-eval"
 path = "src/bin/lewm-drone-rollout-eval.rs"
+
+[[bin]]
+name = "lewm-drone-oracle-eval"
+path = "src/bin/lewm-drone-oracle-eval.rs"
+
+[[bin]]
+name = "lewm-drone-planner-eval"
+path = "src/bin/lewm-drone-planner-eval.rs"
