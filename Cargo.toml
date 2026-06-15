@@ -74,3 +74,7 @@ path = "src/bin/lewm-drone-dynamics-stats.rs"
 [[bin]]
 name = "lewm-drone-fit-plant"
 path = "src/bin/lewm-drone-fit-plant.rs"
+
+[[bin]]
+name = "lewm-drone-rollout-eval"
+path = "src/bin/lewm-drone-rollout-eval.rs"
