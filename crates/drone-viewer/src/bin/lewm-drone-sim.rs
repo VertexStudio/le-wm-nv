@@ -7,7 +7,7 @@ use bevy::{
     prelude::*,
 };
 use bevy_camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState};
-use candle::{DType, Device as CandleDevice, Tensor};
+use candle::{D, DType, Device as CandleDevice, Tensor};
 use le_wm_nv::{
     checkpoint,
     data::drone_racing::{
@@ -419,6 +419,7 @@ impl Args {
                 }
                 "--planner-init-std" => args.lewm_mut().init_std = next_parse(&mut iter, &arg)?,
                 "--planner-min-std" => args.lewm_mut().min_std = next_parse(&mut iter, &arg)?,
+                "--planner-objective" => args.lewm_mut().objective = next_parse(&mut iter, &arg)?,
                 "--seed" => args.lewm_mut().seed = Some(next_parse(&mut iter, &arg)?),
                 "--headless-steps" => args.headless_steps = next_parse(&mut iter, &arg)?,
                 "--inspect-gate-targets" => args.inspect_gate_targets = true,
@@ -635,8 +636,9 @@ fn print_help() {
            --planner-elites <n>           default 8\n\
            --planner-iterations <n>       default 1\n\
           --planner-every <model steps>  default 5\n\
-          --planner-init-std <raw units> default 0.25\n\
-          --planner-min-std <raw units>  default 0.005\n\
+          --planner-init-std <norm units> default 0.25\n\
+          --planner-min-std <norm units>  default 0.005\n\
+          --planner-objective <terminal|future-mean|future-min> default future-mean\n\
           --seed <u64>                   deterministic CUDA candidate noise\n\
            --headless-steps <n>           run planner/sim smoke test without Bevy window\n\
            --inspect-gate-targets         print ordered gate entry/pass poses and exit\n\
@@ -878,6 +880,7 @@ struct LeWmControlConfig {
     plan_every_model_steps: usize,
     init_std: f32,
     min_std: f32,
+    objective: PlannerObjective,
     seed: Option<u64>,
 }
 
@@ -898,7 +901,30 @@ impl Default for LeWmControlConfig {
             plan_every_model_steps: 5,
             init_std: 0.25,
             min_std: 0.005,
+            objective: PlannerObjective::FutureMean,
             seed: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannerObjective {
+    Terminal,
+    FutureMean,
+    FutureMin,
+}
+
+impl std::str::FromStr for PlannerObjective {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "terminal" => Ok(Self::Terminal),
+            "future-mean" => Ok(Self::FutureMean),
+            "future-min" => Ok(Self::FutureMin),
+            other => anyhow::bail!(
+                "unsupported --planner-objective `{other}`; expected terminal, future-mean, or future-min"
+            ),
         }
     }
 }
@@ -1500,10 +1526,11 @@ struct DroneLeWmController {
     dtype: DType,
     obs_mean: Tensor,
     obs_std: Tensor,
-    action_mean: Tensor,
-    action_std: Tensor,
+    action_mean: [f32; ACTION_DIM],
+    action_std: [f32; ACTION_DIM],
     target_emb: Tensor,
     planner: IcemPlanner,
+    objective: PlannerObjective,
     history_raw: Vec<[f32; OBS_DIM]>,
     last_action: [f32; ACTION_DIM],
     enabled: bool,
@@ -1541,6 +1568,9 @@ impl DroneLeWmController {
         .with_context(|| "failed to parse LeWM normalization")?;
         validate_stats("observation", &normalization.observation, OBS_DIM)?;
         validate_stats("action", &normalization.action, ACTION_DIM)?;
+        let action_mean = fixed_action_stats(&normalization.action.mean)?;
+        let action_std = fixed_action_stats(&normalization.action.std)?;
+        let action_bounds = normalized_action_bounds(&normalization.action)?;
 
         let device = cfg.device.resolve()?;
         let dtype = cfg.dtype.dtype();
@@ -1574,8 +1604,9 @@ impl DroneLeWmController {
         planner_cfg.keep_elites = elites;
         planner_cfg.init_std = cfg.init_std;
         planner_cfg.min_std = cfg.min_std;
+        planner_cfg.return_mean = false;
         planner_cfg.seed = cfg.seed;
-        planner_cfg.action_bounds = full_action_bounds();
+        planner_cfg.action_bounds = action_bounds;
 
         let obs_mean = Tensor::from_vec(normalization.observation.mean, (OBS_DIM,), &device)?
             .to_dtype(dtype)?
@@ -1583,12 +1614,6 @@ impl DroneLeWmController {
         let obs_std = Tensor::from_vec(normalization.observation.std, (OBS_DIM,), &device)?
             .to_dtype(dtype)?
             .reshape((1, 1, OBS_DIM))?;
-        let action_mean = Tensor::from_vec(normalization.action.mean, (ACTION_DIM,), &device)?
-            .to_dtype(dtype)?
-            .reshape((1, 1, 1, ACTION_DIM))?;
-        let action_std = Tensor::from_vec(normalization.action.std, (ACTION_DIM,), &device)?
-            .to_dtype(dtype)?
-            .reshape((1, 1, 1, ACTION_DIM))?;
 
         let sim_steps_per_model_step = ((dynamics.sim_hz / cfg.model_hz).round() as usize).max(1);
         let target_pose = state.target;
@@ -1604,6 +1629,7 @@ impl DroneLeWmController {
             action_std,
             target_emb,
             planner: IcemPlanner::new(planner_cfg),
+            objective: cfg.objective,
             history_raw: vec![state.obs12(); history_size],
             last_action: state.previous_action,
             enabled: true,
@@ -1645,6 +1671,7 @@ impl DroneLeWmController {
 
     fn reset_warm_start(&mut self, action: [f32; ACTION_DIM]) -> anyhow::Result<()> {
         let horizon = self.planner.config().horizon;
+        let action = self.normalize_action(action);
         let mut values = Vec::with_capacity(horizon * ACTION_DIM);
         for _ in 0..horizon {
             values.extend_from_slice(&action);
@@ -1708,9 +1735,8 @@ impl DroneLeWmController {
             dtype: self.dtype,
             history_emb: &history_emb,
             target_emb: &target_emb,
-            action_mean: &self.action_mean,
-            action_std: &self.action_std,
             action_prefix: action_prefix.as_ref(),
+            objective: self.objective,
         };
         let result = self.planner.plan_device(&scorer)?;
         self.device.synchronize()?;
@@ -1724,9 +1750,9 @@ impl DroneLeWmController {
             "LeWM first action dim {} does not match {ACTION_DIM}",
             row.len()
         );
-        let mut action = [0.0f32; ACTION_DIM];
-        action.copy_from_slice(row);
-        action = clamp_action(action);
+        let mut normalized_action = [0.0f32; ACTION_DIM];
+        normalized_action.copy_from_slice(row);
+        let action = clamp_action(self.denormalize_action(normalized_action));
 
         self.last_best_score = best_score(&result.scores).unwrap_or(f32::NAN);
         self.last_plan_ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -1761,12 +1787,29 @@ impl DroneLeWmController {
             self.history_actions_raw.len()
         );
         for action in &self.history_actions_raw {
-            values.extend_from_slice(action);
+            let normalized = self.normalize_action(*action);
+            values.extend_from_slice(&normalized);
         }
         Ok(Some(
             Tensor::from_vec(values, (1, 1, prefix_len, ACTION_DIM), &self.device)?
                 .to_dtype(self.dtype)?,
         ))
+    }
+
+    fn normalize_action(&self, action: [f32; ACTION_DIM]) -> [f32; ACTION_DIM] {
+        let mut out = [0.0f32; ACTION_DIM];
+        for idx in 0..ACTION_DIM {
+            out[idx] = (action[idx] - self.action_mean[idx]) / self.action_std[idx].max(1e-6);
+        }
+        out
+    }
+
+    fn denormalize_action(&self, action: [f32; ACTION_DIM]) -> [f32; ACTION_DIM] {
+        let mut out = [0.0f32; ACTION_DIM];
+        for idx in 0..ACTION_DIM {
+            out[idx] = action[idx] * self.action_std[idx] + self.action_mean[idx];
+        }
+        out
     }
 }
 
@@ -1776,9 +1819,8 @@ struct DroneLeWmScorer<'a> {
     dtype: DType,
     history_emb: &'a Tensor,
     target_emb: &'a Tensor,
-    action_mean: &'a Tensor,
-    action_std: &'a Tensor,
     action_prefix: Option<&'a Tensor>,
+    objective: PlannerObjective,
 }
 
 impl CandidateScorer for DroneLeWmScorer<'_> {
@@ -1806,18 +1848,54 @@ impl CandidateScorer for DroneLeWmScorer<'_> {
             }
             None => action_candidates,
         };
-        let normalized_actions = actions
-            .broadcast_sub(self.action_mean)?
-            .broadcast_div(self.action_std)?;
         let (_, history, dim) = self.history_emb.dims3()?;
         let emb_init = self
             .history_emb
             .unsqueeze(1)?
             .broadcast_as((1, samples, history, dim))?;
-        let rollout =
-            self.model
-                .rollout_embeddings_with_history(&emb_init, &normalized_actions, history)?;
-        self.model.goal_cost(&rollout, self.target_emb)
+        let rollout = self
+            .model
+            .rollout_embeddings_with_history(&emb_init, &actions, history)?;
+        rollout_cost(
+            self.model,
+            &rollout,
+            self.target_emb,
+            history,
+            self.objective,
+        )
+    }
+}
+
+fn rollout_cost(
+    model: &WorldModel,
+    rollout: &Tensor,
+    target_emb: &Tensor,
+    history_size: usize,
+    objective: PlannerObjective,
+) -> candle::Result<Tensor> {
+    if objective == PlannerObjective::Terminal {
+        return model.goal_cost(rollout, target_emb);
+    }
+    let (batch, samples, time, dim) = rollout.dims4()?;
+    if history_size >= time {
+        candle::bail!("rollout history_size {history_size} is outside time {time}");
+    }
+    let future_len = time - history_size;
+    let future = rollout.narrow(2, history_size, future_len)?;
+    let target = match target_emb.dims() {
+        [b, d] if *b == batch && *d == dim => target_emb.clone(),
+        [b, t, d] if *b == batch && *d == dim => target_emb.narrow(1, t - 1, 1)?.squeeze(1)?,
+        other => candle::bail!("unsupported target embedding shape {other:?}"),
+    };
+    let target = target
+        .unsqueeze(1)?
+        .unsqueeze(2)?
+        .broadcast_as((batch, samples, future_len, dim))?;
+    let step_cost = (future - target)?.sqr()?.sum(D::Minus1)?;
+    match objective {
+        PlannerObjective::Terminal => unreachable!(),
+        PlannerObjective::FutureMean => step_cost.mean(2),
+        PlannerObjective::FutureMin => step_cost.min_keepdim(2)?.squeeze(2),
     }
 }
 
@@ -1842,13 +1920,6 @@ fn target_obs12(target: TargetPose) -> [f32; OBS_DIM] {
     obs
 }
 
-fn full_action_bounds() -> ActionBounds {
-    ActionBounds {
-        low: vec![-1.0, -1.0, 0.0, -1.0],
-        high: vec![1.0, 1.0, 1.0, 1.0],
-    }
-}
-
 fn validate_stats(name: &str, stats: &RunningStats, dim: usize) -> anyhow::Result<()> {
     ensure!(
         stats.mean.len() == dim && stats.std.len() == dim,
@@ -1864,6 +1935,36 @@ fn validate_stats(name: &str, stats: &RunningStats, dim: usize) -> anyhow::Resul
         );
     }
     Ok(())
+}
+
+fn fixed_action_stats(values: &[f32]) -> anyhow::Result<[f32; ACTION_DIM]> {
+    ensure!(
+        values.len() == ACTION_DIM,
+        "action stats length {} does not match {ACTION_DIM}",
+        values.len()
+    );
+    let mut out = [0.0f32; ACTION_DIM];
+    out.copy_from_slice(values);
+    Ok(out)
+}
+
+fn normalized_action_bounds(stats: &RunningStats) -> anyhow::Result<ActionBounds> {
+    ensure!(
+        stats.mean.len() == ACTION_DIM && stats.std.len() == ACTION_DIM,
+        "action stats dims mean={} std={} expected {ACTION_DIM}",
+        stats.mean.len(),
+        stats.std.len()
+    );
+    let raw_low = [-1.0, -1.0, 0.0, -1.0];
+    let raw_high = [1.0, 1.0, 1.0, 1.0];
+    let mut low = Vec::with_capacity(ACTION_DIM);
+    let mut high = Vec::with_capacity(ACTION_DIM);
+    for idx in 0..ACTION_DIM {
+        let std = stats.std[idx].max(1e-6);
+        low.push((raw_low[idx] - stats.mean[idx]) / std);
+        high.push((raw_high[idx] - stats.mean[idx]) / std);
+    }
+    Ok(ActionBounds { low, high })
 }
 
 fn clamp_action(action: [f32; ACTION_DIM]) -> [f32; ACTION_DIM] {

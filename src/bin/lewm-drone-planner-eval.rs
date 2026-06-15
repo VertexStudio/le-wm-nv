@@ -5,8 +5,8 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
-use candle::{DType, Device as CandleDevice, IndexOp, Tensor};
-use clap::Parser;
+use candle::{D, DType, Device as CandleDevice, IndexOp, Tensor};
+use clap::{Parser, ValueEnum};
 use le_wm_nv::{
     checkpoint,
     data::drone_racing::{
@@ -14,7 +14,7 @@ use le_wm_nv::{
         DroneRacingDataset, RunningStats, shuffle,
     },
     models::world_model::{ObservationEncoderConfig, WorldModel, WorldModelConfig},
-    planner::{ActionBounds, CandidateScorer, IcemConfig, IcemPlanner},
+    planner::{ActionBounds, CandidateScorer, IcemConfig, IcemPlanner, IcemTraceDeviceStep},
     runtime::{DTypeSpec, DeviceSpec},
 };
 use serde::Serialize;
@@ -78,12 +78,56 @@ struct Args {
     #[arg(long, default_value_t = 0.005)]
     planner_min_std: f32,
 
+    /// Planner search domain. `raw` samples RC channels and normalizes before model scoring;
+    /// `normalized` samples the same action domain used by the trained action encoder.
+    #[arg(long, value_enum, default_value = "raw")]
+    planner_action_space: PlannerActionSpace,
+
+    /// Initial iCEM mean sequence used for each independent eval window.
+    #[arg(long, value_enum, default_value = "first-action")]
+    warm_start: WarmStartMode,
+
+    /// Optional latent-only receding closed-loop steps per horizon. Use 0 to disable.
+    #[arg(long, default_value_t = 0)]
+    closed_loop_steps: usize,
+
+    /// Trace iCEM per-iteration score movement without changing planner logic.
+    #[arg(long)]
+    trace_icem: bool,
+
+    /// Drone planning objective over LeWM rollout embeddings.
+    #[arg(long, value_enum, default_value = "future-mean")]
+    planner_objective: PlannerObjective,
+
     #[arg(long, default_value_t = 7)]
     seed: u64,
 
     /// Optional JSON report path. If omitted, writes target/drone-planner-eval/<stamp>.json.
     #[arg(long)]
     json_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum PlannerActionSpace {
+    Raw,
+    Normalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum WarmStartMode {
+    None,
+    FirstAction,
+    ExpertSequence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum PlannerObjective {
+    Terminal,
+    FutureMean,
+    FutureMin,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -118,7 +162,7 @@ fn main() -> anyhow::Result<()> {
         batch_size: args.chunk_size,
         sequence_steps,
         normalize_observations: true,
-        normalize_actions: false,
+        normalize_actions: args.planner_action_space == PlannerActionSpace::Normalized,
     };
     let dataset = DroneRacingDataset::open(&dataset_dir, batch_cfg)?;
     let run_normalization: DroneNormalization = read_json(&normalization_path)?;
@@ -143,29 +187,56 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to load weights {}", weights.display()))?;
     let model = WorldModel::new(model_cfg, vb)?;
 
-    let action_mean = Tensor::from_vec(
+    let raw_action_mean = Tensor::from_vec(
         dataset.metadata().normalization.action.mean.clone(),
         (DRONE_ACTION_DIM,),
         &device,
     )?
     .to_dtype(dtype)?
     .reshape((1, 1, 1, DRONE_ACTION_DIM))?;
-    let action_std = Tensor::from_vec(
+    let raw_action_std = Tensor::from_vec(
         dataset.metadata().normalization.action.std.clone(),
         (DRONE_ACTION_DIM,),
         &device,
     )?
     .to_dtype(dtype)?
     .reshape((1, 1, 1, DRONE_ACTION_DIM))?;
-    let mean_action_raw = dataset.metadata().normalization.action.mean.clone();
-
+    let identity_action_mean =
+        Tensor::zeros((DRONE_ACTION_DIM,), dtype, &device)?.reshape((1, 1, 1, DRONE_ACTION_DIM))?;
+    let identity_action_std =
+        Tensor::ones((DRONE_ACTION_DIM,), dtype, &device)?.reshape((1, 1, 1, DRONE_ACTION_DIM))?;
+    let (scorer_action_mean, scorer_action_std, action_bounds, mean_action_values) =
+        match args.planner_action_space {
+            PlannerActionSpace::Raw => (
+                &raw_action_mean,
+                &raw_action_std,
+                full_action_bounds(),
+                dataset.metadata().normalization.action.mean.clone(),
+            ),
+            PlannerActionSpace::Normalized => (
+                &identity_action_mean,
+                &identity_action_std,
+                normalized_action_bounds(&dataset.metadata().normalization.action)?,
+                vec![0.0; DRONE_ACTION_DIM],
+            ),
+        };
     let mut horizon_accums = horizons
         .iter()
         .copied()
         .map(HorizonAccum::new)
         .collect::<Vec<_>>();
+    let mut closed_loop_accums = horizons
+        .iter()
+        .copied()
+        .filter_map(|horizon| {
+            (args.closed_loop_steps > 0)
+                .then(|| ClosedLoopAccum::new(horizon, args.closed_loop_steps.min(horizon)))
+        })
+        .collect::<Vec<_>>();
+    let mut trace_accums = Vec::<TraceAccum>::new();
     let mut total_plan_sec = 0.0f64;
     let mut total_encode_sec = 0.0f64;
+    let mut total_closed_loop_sec = 0.0f64;
 
     for &horizon in &horizons {
         for (chunk_idx, chunk) in rows.chunks(args.chunk_size).enumerate() {
@@ -190,7 +261,7 @@ fn main() -> anyhow::Result<()> {
                 .actions
                 .narrow(1, history_size - 1, horizon)?;
             let mean_sequence =
-                mean_action_sequence(chunk.len(), horizon, &mean_action_raw, dtype, &device)?;
+                mean_action_sequence(chunk.len(), horizon, &mean_action_values, dtype, &device)?;
             let first_expert = expert_sequence.i((.., 0, ..))?;
 
             let scorer = OfflineScorer {
@@ -199,9 +270,10 @@ fn main() -> anyhow::Result<()> {
                 dtype,
                 history_emb: &history_emb,
                 target_emb: &target_emb,
-                action_mean: &action_mean,
-                action_std: &action_std,
+                action_mean: scorer_action_mean,
+                action_std: scorer_action_std,
                 action_prefix: &prefix,
+                objective: args.planner_objective,
             };
 
             let expert_scores = score_single_sequence(&scorer, &expert_sequence)?;
@@ -218,30 +290,55 @@ fn main() -> anyhow::Result<()> {
             cfg.keep_elites = args.planner_elites;
             cfg.init_std = args.planner_init_std;
             cfg.min_std = args.planner_min_std;
+            cfg.return_mean = false;
             cfg.seed = Some(args.seed ^ ((horizon as u64) << 32) ^ chunk_idx as u64);
-            cfg.action_bounds = full_action_bounds();
+            cfg.action_bounds = action_bounds.clone();
             let mut planner = IcemPlanner::new(cfg);
-            let warm_start = first_expert.unsqueeze(1)?.broadcast_as((
+            set_planner_warm_start(
+                &mut planner,
+                args.warm_start,
+                &first_expert,
+                &expert_sequence,
                 chunk.len(),
                 horizon,
-                DRONE_ACTION_DIM,
-            ))?;
-            planner.set_warm_start_sequence(warm_start);
+            )?;
 
             let plan_started = Instant::now();
-            let result = planner.plan_device(&scorer)?;
+            let (sequence, first_action, scores, plan_elapsed, trace_steps) = if args.trace_icem {
+                let trace = planner.trace_device(&scorer)?;
+                (
+                    trace.sequence,
+                    trace.first_action,
+                    trace.scores,
+                    trace.elapsed,
+                    Some(trace.steps),
+                )
+            } else {
+                let result = planner.plan_device(&scorer)?;
+                (
+                    result.sequence,
+                    result.first_action,
+                    result.scores,
+                    result.elapsed,
+                    None,
+                )
+            };
             device.synchronize()?;
             total_plan_sec += plan_started.elapsed().as_secs_f64();
 
-            let selected_scores = score_single_sequence(&scorer, &result.sequence)?
+            if let Some(trace_steps) = trace_steps.as_ref() {
+                accumulate_trace_steps(&mut trace_accums, horizon, trace_steps, &expert_scores)?;
+            }
+
+            let selected_scores = score_single_sequence(&scorer, &sequence)?
                 .to_dtype(DType::F32)?
                 .to_vec1::<f32>()?;
-            let candidate_best_scores = best_scores_per_row(&result.scores)?;
+            let candidate_best_scores = best_scores_per_row(&scores)?;
             let expert_scores = expert_scores.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             let mean_scores = mean_scores.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             let shuffled_scores = shuffled_scores.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-            let action_error = action_l2_per_row(&result.first_action, &first_expert)?;
-            let saturation = saturation_per_row(&result.first_action)?;
+            let action_error = action_l2_per_row(&first_action, &first_expert)?;
+            let saturation = saturation_per_row(&first_action, &action_bounds)?;
 
             let accum = horizon_accums
                 .iter_mut()
@@ -256,8 +353,38 @@ fn main() -> anyhow::Result<()> {
                     shuffled_score: shuffled_scores[idx],
                     first_action_l2: action_error[idx],
                     saturated: saturation[idx],
-                    plan_ms: result.elapsed.as_secs_f32() * 1000.0,
+                    plan_ms: plan_elapsed.as_secs_f32() * 1000.0,
                 });
+            }
+
+            if args.closed_loop_steps > 0 {
+                let closed_loop_start = Instant::now();
+                let metrics = latent_closed_loop(
+                    &model,
+                    &device,
+                    dtype,
+                    &history_emb,
+                    &target_emb,
+                    &prefix,
+                    &expert_sequence,
+                    scorer_action_mean,
+                    scorer_action_std,
+                    &action_bounds,
+                    args.warm_start,
+                    horizon,
+                    args.closed_loop_steps.min(horizon),
+                    &args,
+                    chunk_idx,
+                )?;
+                device.synchronize()?;
+                total_closed_loop_sec += closed_loop_start.elapsed().as_secs_f64();
+                let accum = closed_loop_accums
+                    .iter_mut()
+                    .find(|item| item.horizon == horizon)
+                    .expect("missing closed-loop horizon accumulator");
+                for metric in metrics {
+                    accum.push(metric);
+                }
             }
         }
     }
@@ -285,13 +412,24 @@ fn main() -> anyhow::Result<()> {
         planner_iterations: args.planner_iterations,
         planner_init_std: args.planner_init_std,
         planner_min_std: args.planner_min_std,
+        planner_action_space: args.planner_action_space,
+        warm_start: args.warm_start,
+        closed_loop_steps: args.closed_loop_steps,
+        trace_icem: args.trace_icem,
+        planner_objective: args.planner_objective,
         elapsed_sec,
         encode_sec: total_encode_sec,
         plan_sec: total_plan_sec,
+        closed_loop_sec: total_closed_loop_sec,
         plan_batches_per_sec: (report_batch_count(rows.len(), args.chunk_size)
             * horizon_reports.len()) as f64
             / total_plan_sec.max(1e-9),
         horizons: horizon_reports,
+        latent_closed_loop: closed_loop_accums
+            .into_iter()
+            .map(ClosedLoopAccum::finish)
+            .collect(),
+        icem_trace: trace_accums.into_iter().map(TraceAccum::finish).collect(),
     };
 
     print_report(&report);
@@ -310,6 +448,7 @@ struct OfflineScorer<'a> {
     action_mean: &'a Tensor,
     action_std: &'a Tensor,
     action_prefix: &'a Tensor,
+    objective: PlannerObjective,
 }
 
 impl CandidateScorer for OfflineScorer<'_> {
@@ -346,7 +485,46 @@ impl CandidateScorer for OfflineScorer<'_> {
         let rollout =
             self.model
                 .rollout_embeddings_with_history(&emb_init, &normalized_actions, history)?;
-        self.model.goal_cost(&rollout, self.target_emb)
+        rollout_cost(
+            self.model,
+            &rollout,
+            self.target_emb,
+            history,
+            self.objective,
+        )
+    }
+}
+
+fn rollout_cost(
+    model: &WorldModel,
+    rollout: &Tensor,
+    target_emb: &Tensor,
+    history_size: usize,
+    objective: PlannerObjective,
+) -> candle::Result<Tensor> {
+    if objective == PlannerObjective::Terminal {
+        return model.goal_cost(rollout, target_emb);
+    }
+    let (batch, samples, time, dim) = rollout.dims4()?;
+    if history_size >= time {
+        candle::bail!("rollout history_size {history_size} is outside time {time}");
+    }
+    let future_len = time - history_size;
+    let future = rollout.narrow(2, history_size, future_len)?;
+    let target = match target_emb.dims() {
+        [b, d] if *b == batch && *d == dim => target_emb.clone(),
+        [b, t, d] if *b == batch && *d == dim => target_emb.i((.., t - 1, ..))?,
+        other => candle::bail!("unsupported target embedding shape {other:?}"),
+    };
+    let target = target
+        .unsqueeze(1)?
+        .unsqueeze(2)?
+        .broadcast_as((batch, samples, future_len, dim))?;
+    let step_cost = (future - target)?.sqr()?.sum(D::Minus1)?;
+    match objective {
+        PlannerObjective::Terminal => unreachable!(),
+        PlannerObjective::FutureMean => step_cost.mean(2),
+        PlannerObjective::FutureMin => step_cost.min_keepdim(2)?.squeeze(2),
     }
 }
 
@@ -512,6 +690,23 @@ fn full_action_bounds() -> ActionBounds {
     }
 }
 
+fn normalized_action_bounds(stats: &RunningStats) -> anyhow::Result<ActionBounds> {
+    ensure!(
+        stats.mean.len() == DRONE_ACTION_DIM && stats.std.len() == DRONE_ACTION_DIM,
+        "action stats dim mismatch"
+    );
+    let raw_low = [-1.0, -1.0, 0.0, -1.0];
+    let raw_high = [1.0, 1.0, 1.0, 1.0];
+    let mut low = Vec::with_capacity(DRONE_ACTION_DIM);
+    let mut high = Vec::with_capacity(DRONE_ACTION_DIM);
+    for idx in 0..DRONE_ACTION_DIM {
+        let std = stats.std[idx].max(1e-6);
+        low.push((raw_low[idx] - stats.mean[idx]) / std);
+        high.push((raw_high[idx] - stats.mean[idx]) / std);
+    }
+    Ok(ActionBounds { low, high })
+}
+
 fn mean_action_sequence(
     batch: usize,
     horizon: usize,
@@ -534,6 +729,263 @@ fn score_single_sequence(scorer: &OfflineScorer<'_>, sequence: &Tensor) -> anyho
     Ok(scorer
         .score_candidates(&sequence.unsqueeze(1)?)?
         .squeeze(1)?)
+}
+
+fn accumulate_trace_steps(
+    accums: &mut Vec<TraceAccum>,
+    horizon: usize,
+    steps: &[IcemTraceDeviceStep],
+    expert_scores: &Tensor,
+) -> anyhow::Result<()> {
+    for step in steps {
+        let accum = trace_accum_mut(accums, horizon, step.iteration);
+        accum.push(
+            &step.mean_score,
+            &step.best_candidate_score,
+            &step.elite_mean_score,
+            &step.updated_mean_score,
+            expert_scores,
+        )?;
+    }
+    Ok(())
+}
+
+fn trace_accum_mut(
+    accums: &mut Vec<TraceAccum>,
+    horizon: usize,
+    iteration: usize,
+) -> &mut TraceAccum {
+    if let Some(idx) = accums
+        .iter()
+        .position(|item| item.horizon == horizon && item.iteration == iteration)
+    {
+        return &mut accums[idx];
+    }
+    accums.push(TraceAccum::new(horizon, iteration));
+    accums.last_mut().expect("trace accum just pushed")
+}
+
+fn score_sum(scores: &Tensor) -> anyhow::Result<(f64, usize)> {
+    let values = scores.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    Ok((
+        values.iter().map(|value| f64::from(*value)).sum(),
+        values.len(),
+    ))
+}
+
+fn set_planner_warm_start(
+    planner: &mut IcemPlanner,
+    mode: WarmStartMode,
+    first_expert: &Tensor,
+    expert_sequence: &Tensor,
+    batch: usize,
+    horizon: usize,
+) -> anyhow::Result<()> {
+    match mode {
+        WarmStartMode::None => {}
+        WarmStartMode::FirstAction => {
+            let warm_start =
+                first_expert
+                    .unsqueeze(1)?
+                    .broadcast_as((batch, horizon, DRONE_ACTION_DIM))?;
+            planner.set_warm_start_sequence(warm_start);
+        }
+        WarmStartMode::ExpertSequence => {
+            ensure!(
+                expert_sequence.dims() == [batch, horizon, DRONE_ACTION_DIM],
+                "expert warm-start shape {:?} does not match expected {:?}",
+                expert_sequence.shape(),
+                [batch, horizon, DRONE_ACTION_DIM]
+            );
+            planner.set_warm_start_sequence(expert_sequence.clone());
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn latent_closed_loop(
+    model: &WorldModel,
+    device: &CandleDevice,
+    dtype: DType,
+    history_emb: &Tensor,
+    target_emb: &Tensor,
+    action_prefix: &Tensor,
+    expert_sequence: &Tensor,
+    action_mean: &Tensor,
+    action_std: &Tensor,
+    action_bounds: &ActionBounds,
+    warm_start_mode: WarmStartMode,
+    horizon: usize,
+    steps: usize,
+    args: &Args,
+    chunk_idx: usize,
+) -> anyhow::Result<Vec<ClosedLoopRowMetric>> {
+    ensure!(steps > 0, "latent closed-loop steps must be positive");
+    ensure!(
+        steps <= horizon,
+        "latent closed-loop steps {steps} exceed horizon {horizon}"
+    );
+    let (batch, history, _) = history_emb.dims3()?;
+    let mut planned_history = history_emb.clone();
+    let mut expert_history = history_emb.clone();
+    let mut planned_prefix = action_prefix.squeeze(1)?;
+    let mut expert_prefix = planned_prefix.clone();
+    let first_expert = expert_sequence.i((.., 0, ..))?;
+
+    let start_cost = squared_l2_per_row(&planned_history.i((.., history - 1, ..))?, target_emb)?;
+    let mut planned_min = start_cost.clone();
+    let mut expert_min = start_cost.clone();
+    let mut first_action_l2_sum = vec![0.0f64; batch];
+    let mut plan_ms_sum = vec![0.0f64; batch];
+
+    let mut cfg = IcemConfig::new(
+        horizon,
+        args.planner_samples,
+        args.planner_elites,
+        DRONE_ACTION_DIM,
+    );
+    cfg.iterations = args.planner_iterations;
+    cfg.keep_elites = args.planner_elites;
+    cfg.init_std = args.planner_init_std;
+    cfg.min_std = args.planner_min_std;
+    cfg.return_mean = false;
+    cfg.seed = Some(args.seed ^ ((horizon as u64) << 32) ^ ((chunk_idx as u64) << 16));
+    cfg.action_bounds = action_bounds.clone();
+    let mut planner = IcemPlanner::new(cfg);
+    set_planner_warm_start(
+        &mut planner,
+        warm_start_mode,
+        &first_expert,
+        expert_sequence,
+        batch,
+        horizon,
+    )?;
+
+    for step in 0..steps {
+        let scorer_prefix = planned_prefix.unsqueeze(1)?;
+        let scorer = OfflineScorer {
+            model,
+            device,
+            dtype,
+            history_emb: &planned_history,
+            target_emb,
+            action_mean,
+            action_std,
+            action_prefix: &scorer_prefix,
+            objective: args.planner_objective,
+        };
+        let result = planner.plan_device(&scorer)?;
+        let expert_action = expert_sequence.i((.., step, ..))?;
+        let first_action_l2 = action_l2_per_row(&result.first_action, &expert_action)?;
+        for (dst, value) in first_action_l2_sum.iter_mut().zip(first_action_l2) {
+            *dst += f64::from(value);
+        }
+        for dst in &mut plan_ms_sum {
+            *dst += result.elapsed.as_secs_f64() * 1000.0;
+        }
+
+        planned_history = roll_latent_one_step(
+            model,
+            &planned_history,
+            &planned_prefix,
+            &result.first_action,
+            action_mean,
+            action_std,
+        )?;
+        planned_prefix = shift_action_prefix(&planned_prefix, &result.first_action)?;
+        let planned_cost =
+            squared_l2_per_row(&planned_history.i((.., history - 1, ..))?, target_emb)?;
+        for (dst, value) in planned_min.iter_mut().zip(planned_cost) {
+            *dst = dst.min(value);
+        }
+
+        expert_history = roll_latent_one_step(
+            model,
+            &expert_history,
+            &expert_prefix,
+            &expert_action,
+            action_mean,
+            action_std,
+        )?;
+        expert_prefix = shift_action_prefix(&expert_prefix, &expert_action)?;
+        let expert_cost =
+            squared_l2_per_row(&expert_history.i((.., history - 1, ..))?, target_emb)?;
+        for (dst, value) in expert_min.iter_mut().zip(expert_cost) {
+            *dst = dst.min(value);
+        }
+    }
+
+    let planned_final = squared_l2_per_row(&planned_history.i((.., history - 1, ..))?, target_emb)?;
+    let expert_final = squared_l2_per_row(&expert_history.i((.., history - 1, ..))?, target_emb)?;
+
+    let mut rows = Vec::with_capacity(batch);
+    for idx in 0..batch {
+        rows.push(ClosedLoopRowMetric {
+            start_score: start_cost[idx],
+            selected_final_score: planned_final[idx],
+            selected_min_score: planned_min[idx],
+            expert_final_score: expert_final[idx],
+            expert_min_score: expert_min[idx],
+            first_action_l2: (first_action_l2_sum[idx] / steps as f64) as f32,
+            plan_ms: (plan_ms_sum[idx] / steps as f64) as f32,
+        });
+    }
+    Ok(rows)
+}
+
+fn roll_latent_one_step(
+    model: &WorldModel,
+    history_emb: &Tensor,
+    action_prefix: &Tensor,
+    action: &Tensor,
+    action_mean: &Tensor,
+    action_std: &Tensor,
+) -> anyhow::Result<Tensor> {
+    let (_, history, _) = history_emb.dims3()?;
+    let next_action = action.unsqueeze(1)?;
+    let actions = Tensor::cat(&[action_prefix, &next_action], 1)?.unsqueeze(1)?;
+    let normalized_actions = actions
+        .broadcast_sub(action_mean)?
+        .broadcast_div(action_std)?;
+    let rollout = model.rollout_embeddings_with_history(
+        &history_emb.unsqueeze(1)?,
+        &normalized_actions,
+        history,
+    )?;
+    let next = rollout.i((.., 0, history, ..))?;
+    shift_embedding_history(history_emb, &next)
+}
+
+fn shift_embedding_history(history_emb: &Tensor, next: &Tensor) -> anyhow::Result<Tensor> {
+    let history = history_emb.dim(1)?;
+    let next = next.unsqueeze(1)?;
+    if history == 1 {
+        return Ok(next);
+    }
+    let tail = history_emb.narrow(1, 1, history - 1)?;
+    Ok(Tensor::cat(&[&tail, &next], 1)?)
+}
+
+fn shift_action_prefix(action_prefix: &Tensor, action: &Tensor) -> anyhow::Result<Tensor> {
+    let prefix_len = action_prefix.dim(1)?;
+    if prefix_len == 0 {
+        return Ok(action_prefix.clone());
+    }
+    let next = action.unsqueeze(1)?;
+    if prefix_len == 1 {
+        return Ok(next);
+    }
+    let tail = action_prefix.narrow(1, 1, prefix_len - 1)?;
+    Ok(Tensor::cat(&[&tail, &next], 1)?)
+}
+
+fn squared_l2_per_row(lhs: &Tensor, rhs: &Tensor) -> anyhow::Result<Vec<f32>> {
+    Ok((lhs - rhs)?
+        .sqr()?
+        .sum(D::Minus1)?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?)
 }
 
 fn best_scores_per_row(scores: &Tensor) -> anyhow::Result<Vec<f32>> {
@@ -568,16 +1020,17 @@ fn action_l2_per_row(pred: &Tensor, actual: &Tensor) -> anyhow::Result<Vec<f32>>
     Ok(out)
 }
 
-fn saturation_per_row(actions: &Tensor) -> anyhow::Result<Vec<bool>> {
+fn saturation_per_row(actions: &Tensor, bounds: &ActionBounds) -> anyhow::Result<Vec<bool>> {
     let actions = actions.to_dtype(DType::F32)?.to_vec2::<f32>()?;
     Ok(actions
         .into_iter()
         .map(|row| {
-            row[0].abs() >= 0.98
-                || row[1].abs() >= 0.98
-                || row[2] <= 0.02
-                || row[2] >= 0.98
-                || row[3].abs() >= 0.98
+            row.iter()
+                .zip(bounds.low.iter().zip(bounds.high.iter()))
+                .any(|(value, (low, high))| {
+                    let margin = (high - low).abs() * 0.02;
+                    *value <= *low + margin || *value >= *high - margin
+                })
         })
         .collect())
 }
@@ -588,11 +1041,14 @@ fn report_batch_count(rows: usize, chunk_size: usize) -> usize {
 
 fn print_report(report: &PlannerEvalReport) {
     println!(
-        "planner_eval model={} rows={} source={} history={} horizons={:?} elapsed={:.3}s plan_sec={:.3}s plan_batches_per_sec={:.2}",
+        "planner_eval model={} rows={} source={} history={} action_space={:?} objective={:?} warm_start={:?} horizons={:?} elapsed={:.3}s plan_sec={:.3}s plan_batches_per_sec={:.2}",
         report.model_dir.display(),
         report.rows_evaluated,
         report.row_source,
         report.history_size,
+        report.planner_action_space,
+        report.planner_objective,
+        report.warm_start,
         report
             .horizons
             .iter()
@@ -630,6 +1086,66 @@ fn print_report(report: &PlannerEvalReport) {
             metric.mean_plan_ms,
         );
     }
+    if !report.latent_closed_loop.is_empty() {
+        println!(
+            "{:>8} {:>6} {:>7} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>10}",
+            "latent",
+            "steps",
+            "count",
+            "start",
+            "sel_final",
+            "sel_min",
+            "exp_final",
+            "exp_min",
+            "act_l2",
+            "plan_ms",
+        );
+        for metric in &report.latent_closed_loop {
+            println!(
+                "{:>8} {:>6} {:>7} {:>11.4} {:>11.4} {:>11.4} {:>11.4} {:>11.4} {:>11.4} {:>10.3}",
+                metric.horizon,
+                metric.steps,
+                metric.count,
+                metric.mean_start_score,
+                metric.mean_selected_final_score,
+                metric.mean_selected_min_score,
+                metric.mean_expert_final_score,
+                metric.mean_expert_min_score,
+                metric.mean_first_action_l2,
+                metric.mean_plan_ms,
+            );
+        }
+    }
+    if !report.icem_trace.is_empty() {
+        println!(
+            "{:>8} {:>4} {:>7} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "trace",
+            "iter",
+            "count",
+            "mean_in",
+            "best_cand",
+            "elite_mean",
+            "mean_out",
+            "expert",
+            "out/best",
+            "out/expert",
+        );
+        for metric in &report.icem_trace {
+            println!(
+                "{:>8} {:>4} {:>7} {:>11.4} {:>11.4} {:>11.4} {:>11.4} {:>11.4} {:>11.3} {:>11.3}",
+                metric.horizon,
+                metric.iteration,
+                metric.count,
+                metric.mean_input_score,
+                metric.best_candidate_score,
+                metric.elite_mean_score,
+                metric.mean_output_score,
+                metric.expert_score,
+                metric.mean_output_score / metric.best_candidate_score.max(1e-9),
+                metric.mean_output_score / metric.expert_score.max(1e-9),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -656,6 +1172,43 @@ struct HorizonAccum {
     first_action_l2: f64,
     saturated: usize,
     plan_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClosedLoopRowMetric {
+    start_score: f32,
+    selected_final_score: f32,
+    selected_min_score: f32,
+    expert_final_score: f32,
+    expert_min_score: f32,
+    first_action_l2: f32,
+    plan_ms: f32,
+}
+
+#[derive(Debug)]
+struct ClosedLoopAccum {
+    horizon: usize,
+    steps: usize,
+    count: usize,
+    start_score: f64,
+    selected_final_score: f64,
+    selected_min_score: f64,
+    expert_final_score: f64,
+    expert_min_score: f64,
+    first_action_l2: f64,
+    plan_ms: f64,
+}
+
+#[derive(Debug)]
+struct TraceAccum {
+    horizon: usize,
+    iteration: usize,
+    count: usize,
+    mean_input_score: f64,
+    best_candidate_score: f64,
+    elite_mean_score: f64,
+    mean_output_score: f64,
+    expert_score: f64,
 }
 
 impl HorizonAccum {
@@ -703,6 +1256,101 @@ impl HorizonAccum {
     }
 }
 
+impl ClosedLoopAccum {
+    fn new(horizon: usize, steps: usize) -> Self {
+        Self {
+            horizon,
+            steps,
+            count: 0,
+            start_score: 0.0,
+            selected_final_score: 0.0,
+            selected_min_score: 0.0,
+            expert_final_score: 0.0,
+            expert_min_score: 0.0,
+            first_action_l2: 0.0,
+            plan_ms: 0.0,
+        }
+    }
+
+    fn push(&mut self, row: ClosedLoopRowMetric) {
+        self.count += 1;
+        self.start_score += f64::from(row.start_score);
+        self.selected_final_score += f64::from(row.selected_final_score);
+        self.selected_min_score += f64::from(row.selected_min_score);
+        self.expert_final_score += f64::from(row.expert_final_score);
+        self.expert_min_score += f64::from(row.expert_min_score);
+        self.first_action_l2 += f64::from(row.first_action_l2);
+        self.plan_ms += f64::from(row.plan_ms);
+    }
+
+    fn finish(self) -> LatentClosedLoopMetric {
+        let count = self.count.max(1) as f64;
+        LatentClosedLoopMetric {
+            horizon: self.horizon,
+            steps: self.steps,
+            count: self.count,
+            mean_start_score: (self.start_score / count) as f32,
+            mean_selected_final_score: (self.selected_final_score / count) as f32,
+            mean_selected_min_score: (self.selected_min_score / count) as f32,
+            mean_expert_final_score: (self.expert_final_score / count) as f32,
+            mean_expert_min_score: (self.expert_min_score / count) as f32,
+            mean_first_action_l2: (self.first_action_l2 / count) as f32,
+            mean_plan_ms: (self.plan_ms / count) as f32,
+        }
+    }
+}
+
+impl TraceAccum {
+    fn new(horizon: usize, iteration: usize) -> Self {
+        Self {
+            horizon,
+            iteration,
+            count: 0,
+            mean_input_score: 0.0,
+            best_candidate_score: 0.0,
+            elite_mean_score: 0.0,
+            mean_output_score: 0.0,
+            expert_score: 0.0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        mean_input: &Tensor,
+        best_candidate: &Tensor,
+        elite_mean: &Tensor,
+        mean_output: &Tensor,
+        expert: &Tensor,
+    ) -> anyhow::Result<()> {
+        let (sum, count) = score_sum(mean_input)?;
+        self.count += count;
+        self.mean_input_score += sum;
+        let (sum, _) = score_sum(best_candidate)?;
+        self.best_candidate_score += sum;
+        let (sum, _) = score_sum(elite_mean)?;
+        self.elite_mean_score += sum;
+        let (sum, _) = score_sum(mean_output)?;
+        self.mean_output_score += sum;
+        let (sum, _) = score_sum(expert)?;
+        self.expert_score += sum;
+        Ok(())
+    }
+
+    fn finish(self) -> IcemTraceMetric {
+        let count = self.count.max(1) as f64;
+        IcemTraceMetric {
+            horizon: self.horizon,
+            iteration: self.iteration,
+            count: self.count,
+            mean_input_score: (self.mean_input_score / count) as f32,
+            best_candidate_score: (self.best_candidate_score / count) as f32,
+            elite_mean_score: (self.elite_mean_score / count) as f32,
+            mean_output_score: (self.mean_output_score / count) as f32,
+            expert_score: (self.expert_score / count) as f32,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct PlannerEvalReport {
     model_dir: PathBuf,
@@ -722,10 +1370,18 @@ struct PlannerEvalReport {
     planner_iterations: usize,
     planner_init_std: f32,
     planner_min_std: f32,
+    planner_action_space: PlannerActionSpace,
+    warm_start: WarmStartMode,
+    closed_loop_steps: usize,
+    trace_icem: bool,
+    planner_objective: PlannerObjective,
     elapsed_sec: f64,
     encode_sec: f64,
     plan_sec: f64,
+    closed_loop_sec: f64,
     plan_batches_per_sec: f64,
+    latent_closed_loop: Vec<LatentClosedLoopMetric>,
+    icem_trace: Vec<IcemTraceMetric>,
 }
 
 #[derive(Debug, Serialize)]
@@ -740,4 +1396,30 @@ struct HorizonPlannerMetric {
     mean_first_action_l2: f32,
     saturation_rate: f32,
     mean_plan_ms: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct LatentClosedLoopMetric {
+    horizon: usize,
+    steps: usize,
+    count: usize,
+    mean_start_score: f32,
+    mean_selected_final_score: f32,
+    mean_selected_min_score: f32,
+    mean_expert_final_score: f32,
+    mean_expert_min_score: f32,
+    mean_first_action_l2: f32,
+    mean_plan_ms: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct IcemTraceMetric {
+    horizon: usize,
+    iteration: usize,
+    count: usize,
+    mean_input_score: f32,
+    best_candidate_score: f32,
+    elite_mean_score: f32,
+    mean_output_score: f32,
+    expert_score: f32,
 }

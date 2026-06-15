@@ -247,6 +247,7 @@ pub struct IcemConfig {
     pub action_bounds: ActionBounds,
     pub init_std: f32,
     pub min_std: f32,
+    pub return_mean: bool,
     pub deadline: Option<Duration>,
     pub deadline_action: Option<Vec<f32>>,
     pub seed: Option<u64>,
@@ -266,6 +267,7 @@ impl IcemConfig {
             action_bounds: ActionBounds::symmetric(action_dim, 1.0),
             init_std: 1.0,
             min_std: 1e-3,
+            return_mean: true,
             deadline: None,
             deadline_action: None,
             seed: None,
@@ -355,6 +357,26 @@ pub struct PlanDeviceResult {
     pub deadline_reached: bool,
     pub deadline_outcome: PlanDeadlineOutcome,
     pub used_host_elite_selection: bool,
+}
+
+#[derive(Debug)]
+pub struct IcemTraceDeviceStep {
+    pub iteration: usize,
+    pub mean_score: Tensor,
+    pub best_candidate_score: Tensor,
+    pub elite_mean_score: Tensor,
+    pub updated_mean_score: Tensor,
+}
+
+#[derive(Debug)]
+pub struct IcemTraceDeviceResult {
+    pub steps: Vec<IcemTraceDeviceStep>,
+    pub first_action: Tensor,
+    pub sequence: Tensor,
+    pub scores: Tensor,
+    pub best_indices: Tensor,
+    pub iterations_completed: usize,
+    pub elapsed: Duration,
 }
 
 impl PlanDeviceResult {
@@ -701,6 +723,7 @@ impl IcemPlanner {
         let (low, high) = self.workspace.bounds(&cfg.action_bounds, dtype, device)?;
         let mut carried_elites = None;
         let mut last_scores = None;
+        let mut last_candidates = None;
         let mut iterations_completed = 0;
         let mut deadline_reached = false;
 
@@ -762,13 +785,18 @@ impl IcemPlanner {
             };
 
             last_scores = Some(scores);
+            last_candidates = Some(candidates);
             iterations_completed += 1;
         }
 
         let scores = last_scores
             .ok_or_else(|| candle::Error::Msg("iCEM did not produce scores".to_string()))?;
+        let candidates = last_candidates
+            .ok_or_else(|| candle::Error::Msg("iCEM did not produce candidates".to_string()))?;
         let best_index_tensor = lowest_score_indices(&scores, 1)?;
-        let sequence = mean;
+        let best_sequence =
+            gather_candidate_sequences(&candidates, &best_index_tensor)?.squeeze(1)?;
+        let sequence = if cfg.return_mean { mean } else { best_sequence };
         self.warm_start = Some(shift_sequence_for_warm_start(&sequence)?);
         let first_action = sequence.i((.., 0, ..))?;
         let elapsed = start.elapsed();
@@ -783,6 +811,118 @@ impl IcemPlanner {
             deadline_reached,
             deadline_outcome: PlanDeadlineOutcome::None,
             used_host_elite_selection: false,
+        })
+    }
+
+    pub fn trace_device<S: CandidateScorer>(
+        &mut self,
+        scorer: &S,
+    ) -> Result<IcemTraceDeviceResult> {
+        self.config.validate()?;
+        let start = Instant::now();
+        let device = scorer.device();
+        let dtype = scorer.dtype();
+        let cfg = &self.config;
+        let batch = scorer.batch_size().unwrap_or(1);
+        let mut sampler = self.rng.begin_plan(
+            device,
+            cfg.seed,
+            normal_draw_reservation(
+                batch,
+                cfg.samples,
+                cfg.horizon,
+                cfg.action_dim,
+                cfg.iterations,
+            )?,
+        )?;
+
+        let mut mean = self.initial_mean(batch, dtype, device)?;
+        let mut std = self.workspace.sequence(
+            batch,
+            cfg.horizon,
+            cfg.action_dim,
+            dtype,
+            device,
+            cfg.init_std,
+        )?;
+        let (low, high) = self.workspace.bounds(&cfg.action_bounds, dtype, device)?;
+        let mut carried_elites = None;
+        let mut last_scores = None;
+        let mut last_candidates = None;
+        let mut steps = Vec::with_capacity(cfg.iterations);
+        let mut iterations_completed = 0;
+
+        for iter_idx in 0..cfg.iterations {
+            let mean_score = score_sequence(scorer, &mean)?;
+            let sampled = sample_candidates_with_temporal_noise(
+                &mean,
+                &std,
+                cfg.samples,
+                &low,
+                &high,
+                dtype,
+                device,
+                &mut sampler,
+                cfg.noise_beta,
+            )?;
+            let candidates = match carried_elites.as_ref() {
+                Some(elites) => inject_carried_elites(&sampled, elites, cfg.keep_elites)?,
+                None => sampled,
+            };
+            let candidate_count = candidates.dim(1)?;
+            let scores = scorer.score_candidates(&candidates)?;
+            validate_scores_shape(&scores, batch, candidate_count)?;
+            let best_candidate_score = scores.min_keepdim(1)?.squeeze(1)?;
+
+            let elites = select_elites(&candidates, &scores, cfg.elites)?;
+            let elite_mean = elites.mean(1)?;
+            let elite_mean_score = score_sequence(scorer, &elite_mean)?;
+            let elite_std = enforce_min_std(&elites.var(1)?.sqrt()?, cfg.min_std)?;
+            let updated_mean = momentum_update(&mean, &elite_mean, cfg.alpha)?;
+            let updated_mean_score = score_sequence(scorer, &updated_mean)?;
+            let updated_std =
+                enforce_min_std(&momentum_update(&std, &elite_std, cfg.alpha)?, cfg.min_std)?;
+
+            carried_elites = if cfg.keep_elites == 0 {
+                None
+            } else {
+                Some(elites.narrow(1, 0, cfg.keep_elites)?)
+            };
+            mean = updated_mean;
+            std = updated_std;
+            last_scores = Some(scores);
+            last_candidates = Some(candidates);
+            iterations_completed += 1;
+            steps.push(IcemTraceDeviceStep {
+                iteration: iter_idx,
+                mean_score,
+                best_candidate_score,
+                elite_mean_score,
+                updated_mean_score,
+            });
+        }
+
+        let scores = last_scores
+            .ok_or_else(|| candle::Error::Msg("iCEM trace did not produce scores".to_string()))?;
+        let candidates = last_candidates.ok_or_else(|| {
+            candle::Error::Msg("iCEM trace did not produce candidates".to_string())
+        })?;
+        let best_index_tensor = lowest_score_indices(&scores, 1)?;
+        let best_sequence =
+            gather_candidate_sequences(&candidates, &best_index_tensor)?.squeeze(1)?;
+        let sequence = if cfg.return_mean { mean } else { best_sequence };
+        self.warm_start = Some(shift_sequence_for_warm_start(&sequence)?);
+        let first_action = sequence.i((.., 0, ..))?;
+        let elapsed = start.elapsed();
+
+        Ok(IcemTraceDeviceResult {
+            steps,
+            first_action,
+            sequence,
+            scores,
+            best_indices: best_index_tensor,
+            iterations_completed,
+            elapsed,
         })
     }
 
@@ -823,6 +963,10 @@ impl IcemPlanner {
             None => Ok(None),
         }
     }
+}
+
+fn score_sequence<S: CandidateScorer>(scorer: &S, sequence: &Tensor) -> Result<Tensor> {
+    scorer.score_candidates(&sequence.unsqueeze(1)?)?.squeeze(1)
 }
 
 fn deadline_elapsed(start: Instant, deadline: Option<Duration>) -> bool {
@@ -1809,6 +1953,55 @@ mod tests {
 
         assert_eq!(best_indices_from_tensor(&result.best_indices)?, &[1]);
         assert_eq!(
+            result.sequence.to_vec3::<f32>()?,
+            warm_start.to_vec3::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn icem_can_return_best_sample_sequence() -> Result<()> {
+        struct FixedScoreScorer<'a> {
+            device: &'a Device,
+        }
+
+        impl CandidateScorer for FixedScoreScorer<'_> {
+            fn device(&self) -> &Device {
+                self.device
+            }
+
+            fn dtype(&self) -> DType {
+                DType::F32
+            }
+
+            fn batch_size(&self) -> Option<usize> {
+                Some(1)
+            }
+
+            fn score_candidates(&self, action_candidates: &Tensor) -> Result<Tensor> {
+                let samples = action_candidates.dim(1)?;
+                let mut scores = (0..samples).map(|idx| idx as f32).collect::<Vec<_>>();
+                scores[0] = 100.0;
+                Tensor::from_vec(scores, (1, samples), self.device)
+            }
+        }
+
+        let device = Device::new_cuda(0)?;
+        let mut cfg = IcemConfig::new(2, 4, 2, 1);
+        cfg.iterations = 1;
+        cfg.keep_elites = 0;
+        cfg.alpha = 1.0;
+        cfg.init_std = 0.5;
+        cfg.seed = Some(123);
+        cfg.return_mean = false;
+        let mut planner = IcemPlanner::new(cfg);
+        let warm_start = Tensor::new(&[[[0.25f32], [-0.5]]], &device)?;
+        planner.set_warm_start_sequence(warm_start.clone());
+
+        let result = planner.plan_device(&FixedScoreScorer { device: &device })?;
+
+        assert_eq!(best_indices_from_tensor(&result.best_indices)?, &[1]);
+        assert_ne!(
             result.sequence.to_vec3::<f32>()?,
             warm_start.to_vec3::<f32>()?
         );
