@@ -88,29 +88,31 @@ fn main() -> anyhow::Result<()> {
         best_total = regression_total;
     }
 
-    let sign_sets = [
-        (-1.0, -1.0, 1.0),
-        (1.0, 1.0, -1.0),
-        (-1.0, 1.0, 1.0),
-        (1.0, -1.0, 1.0),
-        (-1.0, -1.0, -1.0),
-        (1.0, 1.0, 1.0),
-        (-1.0, 1.0, -1.0),
-        (1.0, -1.0, -1.0),
-    ];
-    for (roll, pitch, yaw) in sign_sets {
-        let mut cfg = best;
-        cfg.roll_rate_sign = roll;
-        cfg.pitch_rate_sign = pitch;
-        cfg.yaw_rate_sign = yaw;
-        let total = fit_total(&cfg, &frames, &windows, args.window_steps, replay.as_ref());
-        if total < best_total {
-            println!(
-                "sign search improved total {:.6} -> {:.6}",
-                best_total, total
-            );
-            best = cfg;
-            best_total = total;
+    if args.search_signs {
+        let sign_sets = [
+            (-1.0, -1.0, 1.0),
+            (1.0, 1.0, -1.0),
+            (-1.0, 1.0, 1.0),
+            (1.0, -1.0, 1.0),
+            (-1.0, -1.0, -1.0),
+            (1.0, 1.0, 1.0),
+            (-1.0, 1.0, -1.0),
+            (1.0, -1.0, -1.0),
+        ];
+        for (roll, pitch, yaw) in sign_sets {
+            let mut cfg = best;
+            cfg.roll_rate_sign = roll;
+            cfg.pitch_rate_sign = pitch;
+            cfg.yaw_rate_sign = yaw;
+            let total = fit_total(&cfg, &frames, &windows, args.window_steps, replay.as_ref());
+            if total < best_total {
+                println!(
+                    "sign search improved total {:.6} -> {:.6}",
+                    best_total, total
+                );
+                best = cfg;
+                best_total = total;
+            }
         }
     }
 
@@ -279,6 +281,7 @@ struct Args {
     gate_episode: Option<i64>,
     gate_order: Option<Vec<usize>>,
     gate_radius: f32,
+    search_signs: bool,
 }
 
 impl Args {
@@ -296,6 +299,7 @@ impl Args {
             gate_episode: None,
             gate_order: None,
             gate_radius: 0.85,
+            search_signs: false,
         };
         let mut iter = env::args().skip(1);
         while let Some(arg) = iter.next() {
@@ -319,6 +323,7 @@ impl Args {
                 "--gate-episode" => args.gate_episode = Some(next_parse(&mut iter, &arg)?),
                 "--gate-order" => args.gate_order = Some(parse_gate_order(&mut iter, &arg)?),
                 "--gate-radius" => args.gate_radius = next_parse(&mut iter, &arg)?,
+                "--search-signs" => args.search_signs = true,
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -393,6 +398,7 @@ fn print_help() {
          Add --replay-start-row and --replay-rows to rank candidates by one long\n\
          oracle replay segment instead of the sampled short-window score.\n\
          Optional gate scoring: --gates <path> --gate-episode <idx> --gate-order <1,4,3,2> --gate-radius <m>.\n\
+         Sign flips are not searched unless --search-signs is passed.\n\
          This does not train or modify LeWM."
     );
 }

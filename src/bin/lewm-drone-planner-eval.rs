@@ -63,6 +63,10 @@ struct Args {
     #[arg(long, default_value = "all")]
     row_source: String,
 
+    /// Comma-separated dataset rows to evaluate. Overrides --row-source, --rows, and shuffle.
+    #[arg(long)]
+    row_list: Option<String>,
+
     #[arg(long, default_value_t = 64)]
     planner_samples: usize,
 
@@ -168,11 +172,16 @@ fn main() -> anyhow::Result<()> {
     let run_normalization: DroneNormalization = read_json(&normalization_path)?;
     ensure_normalization_matches(&run_normalization, &dataset.metadata().normalization)?;
 
-    let mut rows = rows_for_source(&dataset, &args.row_source)?;
-    shuffle(&mut rows, args.seed);
-    if args.rows > 0 {
-        rows.truncate(args.rows.min(rows.len()));
-    }
+    let rows = if let Some(row_list) = args.row_list.as_deref() {
+        parse_row_list(row_list)?
+    } else {
+        let mut rows = rows_for_source(&dataset, &args.row_source)?;
+        shuffle(&mut rows, args.seed);
+        if args.rows > 0 {
+            rows.truncate(args.rows.min(rows.len()));
+        }
+        rows
+    };
     ensure!(!rows.is_empty(), "no rows selected for planner eval");
     let mut shuffled_rows = rows.clone();
     shuffle(&mut shuffled_rows, args.seed ^ 0xBADC_0FFE_E0DD_F00D);
@@ -635,6 +644,20 @@ fn parse_horizons(value: &str) -> anyhow::Result<Vec<usize>> {
         "--horizons must be positive"
     );
     Ok(horizons)
+}
+
+fn parse_row_list(value: &str) -> anyhow::Result<Vec<usize>> {
+    let rows = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<usize>()
+                .with_context(|| format!("invalid row `{part}`"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure!(!rows.is_empty(), "--row-list cannot be empty");
+    Ok(rows)
 }
 
 fn rows_for_source(dataset: &DroneRacingDataset, source: &str) -> anyhow::Result<Vec<usize>> {
