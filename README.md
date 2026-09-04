@@ -28,7 +28,11 @@ scripted animation captures.
 
 | Randomized circle | Randomized figure-eight |
 | --- | --- |
-| ![Trained SkyJEPA controlling a randomized UAV on a circle](docs/skyjepa-circle.png) | ![Trained SkyJEPA controlling a randomized UAV on a figure-eight](docs/skyjepa-figure-eight.png) |
+| ![Trained SkyJEPA controlling a randomized UAV on a circle](docs/skyjepa-circle.png) | [![Trained SkyJEPA controlling a randomized UAV on a figure-eight; click to play the video](docs/skyjepa-figure-eight.png)](docs/skyjepa-trained-figure-eight.mp4) |
+
+**Video:** [watch the 20-second trained SkyJEPA figure-eight flight](docs/skyjepa-trained-figure-eight.mp4)
+at normal simulation speed. Yellow is executed, cyan is reference, magenta is
+predicted, and green shows rotor force.
 
 The model in those captures was trained locally on an RTX 4090 from 2,000
 ten-second trajectories across 100 randomized domains (402,000 state/action
