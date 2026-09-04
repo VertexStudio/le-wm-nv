@@ -39,6 +39,15 @@ struct Args {
     #[arg(long, default_value_t = 1e-3)]
     min_action_std: f64,
 
+    /// Minimum rotor-about-collective standard deviation. This prevents
+    /// domain-dependent hover thrust from masquerading as control coverage.
+    #[arg(long, default_value_t = 0.05)]
+    min_differential_action_std: f64,
+
+    /// Minimum consecutive within-episode command-delta standard deviation.
+    #[arg(long, default_value_t = 0.005)]
+    min_action_delta_std: f64,
+
     /// Emit a failed report without returning a non-zero exit status.
     #[arg(long)]
     allow_fail: bool,
@@ -65,6 +74,8 @@ struct AuditReport {
     high_command_fraction: f64,
     state: ChannelStats,
     action: ChannelStats,
+    action_differential: ChannelStats,
+    action_transition_delta: ChannelStats,
     reference_state: Option<ChannelStats>,
     motor_force: Option<ChannelStats>,
     failures: Vec<String>,
@@ -217,6 +228,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut state_stats = StatsAccumulator::new(SKYJEPA_STATE_DIM);
     let mut action_stats = StatsAccumulator::new(SKYJEPA_ACTION_DIM);
+    let mut differential_action_stats = StatsAccumulator::new(SKYJEPA_ACTION_DIM);
+    let mut action_delta_stats = StatsAccumulator::new(SKYJEPA_ACTION_DIM);
     let mut reference_stats = references
         .as_ref()
         .map(|_| StatsAccumulator::new(SKYJEPA_STATE_DIM));
@@ -239,6 +252,21 @@ fn main() -> anyhow::Result<()> {
         let action = &actions[row * SKYJEPA_ACTION_DIM..(row + 1) * SKYJEPA_ACTION_DIM];
         state_stats.push(state);
         action_stats.push(action);
+        let collective = action.iter().sum::<f32>() / SKYJEPA_ACTION_DIM as f32;
+        let differential = action
+            .iter()
+            .map(|value| *value - collective)
+            .collect::<Vec<_>>();
+        differential_action_stats.push(&differential);
+        if row > 0 && episodes[row] == episodes[row - 1] {
+            let previous = &actions[(row - 1) * SKYJEPA_ACTION_DIM..row * SKYJEPA_ACTION_DIM];
+            let delta = action
+                .iter()
+                .zip(previous)
+                .map(|(current, previous)| current - previous)
+                .collect::<Vec<_>>();
+            action_delta_stats.push(&delta);
+        }
         max_dt_error = max_dt_error.max((f64::from(dt[row]) - expected_dt).abs());
         let rotation: [f32; 9] = state[6..15].try_into().expect("rotation has nine values");
         let (orthogonality, determinant) = rotation_quality(rotation);
@@ -272,6 +300,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let action = action_stats.finish();
+    let action_differential = differential_action_stats.finish();
+    let action_transition_delta = action_delta_stats.finish();
     let position_tracking_rmse = references
         .as_ref()
         .map(|_| (tracking_position_sq / rows as f64).sqrt());
@@ -329,6 +359,22 @@ fn main() -> anyhow::Result<()> {
             ));
         }
     }
+    for (idx, std) in action_differential.std.iter().enumerate() {
+        if *std < args.min_differential_action_std {
+            failures.push(format!(
+                "differential action channel {idx} std {std:.3e} is below {:.3e}",
+                args.min_differential_action_std
+            ));
+        }
+    }
+    for (idx, std) in action_transition_delta.std.iter().enumerate() {
+        if *std < args.min_action_delta_std {
+            failures.push(format!(
+                "action delta channel {idx} std {std:.3e} is below {:.3e}",
+                args.min_action_delta_std
+            ));
+        }
+    }
 
     let report = AuditReport {
         passed: failures.is_empty(),
@@ -350,6 +396,8 @@ fn main() -> anyhow::Result<()> {
         high_command_fraction: high_fraction,
         state: state_stats.finish(),
         action,
+        action_differential,
+        action_transition_delta,
         reference_state: reference_stats.map(StatsAccumulator::finish),
         motor_force: motor_stats.map(StatsAccumulator::finish),
         failures,
@@ -392,6 +440,14 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     ensure!(
         args.min_action_std.is_finite() && args.min_action_std >= 0.0,
         "min-action-std must be non-negative"
+    );
+    ensure!(
+        args.min_differential_action_std.is_finite() && args.min_differential_action_std >= 0.0,
+        "min-differential-action-std must be non-negative"
+    );
+    ensure!(
+        args.min_action_delta_std.is_finite() && args.min_action_delta_std >= 0.0,
+        "min-action-delta-std must be non-negative"
     );
     Ok(())
 }

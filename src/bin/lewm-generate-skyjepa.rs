@@ -5,7 +5,7 @@ use clap::Parser;
 use hdf5::File;
 use le_wm_nv::{
     data::{
-        drone_racing::{cross3, mat3_mul_vec3},
+        drone_racing::{cross3, mat3_from_rotvec, mat3_mul, mat3_mul_vec3},
         skyjepa::{
             SKYJEPA_ACTION_DIM, SKYJEPA_SCHEMA_VERSION, SKYJEPA_STATE_DIM, SkyJepaActionSpace,
             SkyJepaDatasetMetadata,
@@ -218,22 +218,36 @@ fn generate_episode(episode: usize, domain: SkyJepaDomain, args: &Args) -> anyho
     let substeps = args.simulation_rate_hz / args.sample_rate_hz;
     let transitions = (args.duration_seconds * args.sample_rate_hz as f32).round() as usize;
     let samples = transitions + 1;
-    let trajectory =
-        ReferenceTrajectory::sample(mix_seed(args.seed ^ 0x0053_4b59_4a45_5041, episode as u64));
+    let trajectory = ReferenceTrajectory::sample(
+        mix_seed(args.seed ^ 0x0053_4b59_4a45_5041, episode as u64),
+        episode.is_multiple_of(10),
+    );
     let initial_reference = trajectory.at(0.0);
     let initial_acceleration = [
         initial_reference.acceleration[0],
         initial_reference.acceleration[1],
         initial_reference.acceleration[2] + domain.gravity,
     ];
+    let mut initial_rng =
+        SplitMix64::new(mix_seed(args.seed ^ 0x5245_434f_5645_5259, episode as u64));
+    let desired_initial_rotation = desired_rotation(
+        normalize3(initial_acceleration, [0.0, 0.0, 1.0]),
+        initial_reference.yaw,
+    );
     let initial_state = SkyJepaRotorState {
-        position: initial_reference.position,
-        velocity: initial_reference.velocity,
-        rotation_world_from_body: desired_rotation(normalize3(
-            initial_acceleration,
-            [0.0, 0.0, 1.0],
-        )),
-        ..SkyJepaRotorState::hover()
+        position: [0, 1, 2]
+            .map(|axis| initial_reference.position[axis] + initial_rng.range(-0.20, 0.20)),
+        velocity: [0, 1, 2]
+            .map(|axis| initial_reference.velocity[axis] + initial_rng.range(-0.25, 0.25)),
+        rotation_world_from_body: mat3_mul(
+            desired_initial_rotation,
+            mat3_from_rotvec([
+                initial_rng.range(-0.12, 0.12),
+                initial_rng.range(-0.12, 0.12),
+                initial_rng.range(-0.18, 0.18),
+            ]),
+        ),
+        angular_velocity: [0, 1, 2].map(|_| initial_rng.range(-0.20, 0.20)),
     };
     let mut plant = SkyJepaRotorPlant::new(domain, initial_state)?;
     let mut result = Episode {
@@ -250,17 +264,20 @@ fn generate_episode(episode: usize, domain: SkyJepaDomain, args: &Args) -> anyho
     for step in 0..samples {
         let time = step as f32 * sample_dt;
         let reference = trajectory.at(time);
+        let common_excitation = 0.04 * (time * 1.07 + episode as f32 * 0.11).sin();
         for (rotor, value) in excitation.iter_mut().enumerate() {
-            *value = 0.88 * *value
-                + 0.12
-                    * (0.015 * (time * (1.3 + 0.37 * rotor as f32) + episode as f32 * 0.17).sin());
+            let phase = episode as f32 * 0.17 + rotor as f32 * 1.31;
+            let target = common_excitation
+                + 0.035 * (time * (1.3 + 0.37 * rotor as f32) + phase).sin()
+                + 0.020 * (time * (2.7 + 0.23 * rotor as f32) - phase).sin();
+            *value = 0.88 * *value + 0.12 * target;
         }
         let action = tracking_action(plant.state(), reference, domain, excitation);
         result.states.extend_from_slice(&plant.state().as_state18());
         result.actions.extend_from_slice(&action);
         result
             .reference_states
-            .extend_from_slice(&reference.as_state18());
+            .extend_from_slice(&reference.as_state18(domain.gravity));
         result.motor_forces.extend_from_slice(&plant.motor_forces());
         if step < transitions {
             for _ in 0..substeps {
@@ -284,16 +301,26 @@ struct ReferencePoint {
     position: [f32; 3],
     velocity: [f32; 3],
     acceleration: [f32; 3],
+    yaw: f32,
 }
 
 impl ReferencePoint {
-    fn as_state18(self) -> [f32; SKYJEPA_STATE_DIM] {
+    fn as_state18(self, gravity: f32) -> [f32; SKYJEPA_STATE_DIM] {
         let mut state = [0.0; SKYJEPA_STATE_DIM];
         state[0..3].copy_from_slice(&self.position);
         state[3..6].copy_from_slice(&self.velocity);
-        state[6] = 1.0;
-        state[10] = 1.0;
-        state[14] = 1.0;
+        let rotation = desired_rotation(
+            normalize3(
+                [
+                    self.acceleration[0],
+                    self.acceleration[1],
+                    self.acceleration[2] + gravity,
+                ],
+                [0.0, 0.0, 1.0],
+            ),
+            self.yaw,
+        );
+        state[6..15].copy_from_slice(&rotation);
         state
     }
 }
@@ -303,10 +330,14 @@ struct ReferenceTrajectory {
     amplitude: [[f32; 3]; 3],
     omega: [[f32; 3]; 3],
     phase: [[f32; 3]; 3],
+    yaw_center: f32,
+    yaw_amplitude: f32,
+    yaw_omega: f32,
+    yaw_phase: f32,
 }
 
 impl ReferenceTrajectory {
-    fn sample(seed: u64) -> Self {
+    fn sample(seed: u64, hover: bool) -> Self {
         let mut rng = SplitMix64::new(seed);
         let periods_seconds = [[3.5, 5.5, 8.0], [4.0, 6.5, 9.0], [4.5, 7.0, 10.0]];
         let mut amplitude = [[0.0; 3]; 3];
@@ -314,7 +345,13 @@ impl ReferenceTrajectory {
         let mut phase = [[0.0; 3]; 3];
         for axis in 0..3 {
             for component in 0..3 {
-                let scale = if axis == 2 { 0.15 } else { 0.45 };
+                let scale = if hover {
+                    0.0
+                } else if axis == 2 {
+                    0.15
+                } else {
+                    0.45
+                };
                 amplitude[axis][component] = rng.range(0.35, 1.0) * scale;
                 let seconds = periods_seconds[axis][component];
                 omega[axis][component] = 2.0 * std::f32::consts::PI / seconds;
@@ -325,11 +362,15 @@ impl ReferenceTrajectory {
             center: [
                 rng.range(-2.0, 2.0),
                 rng.range(-2.0, 2.0),
-                rng.range(1.5, 3.0),
+                rng.range(0.9, 3.0),
             ],
             amplitude,
             omega,
             phase,
+            yaw_center: rng.range(-std::f32::consts::PI, std::f32::consts::PI),
+            yaw_amplitude: if hover { 0.0 } else { rng.range(0.25, 0.75) },
+            yaw_omega: 2.0 * std::f32::consts::PI / rng.range(5.0, 9.0),
+            yaw_phase: rng.range(0.0, 2.0 * std::f32::consts::PI),
         }
     }
 
@@ -353,6 +394,8 @@ impl ReferenceTrajectory {
             position,
             velocity,
             acceleration,
+            yaw: self.yaw_center
+                + self.yaw_amplitude * (self.yaw_omega * time + self.yaw_phase).sin(),
         }
     }
 }
@@ -372,8 +415,10 @@ fn tracking_action(
     let acceleration_norm = norm(desired_acceleration).max(1e-4);
     let desired_up = desired_acceleration.map(|value| value / acceleration_norm);
     let current_up = mat3_mul_vec3(state.rotation_world_from_body, [0.0, 0.0, 1.0]);
-    let attitude_error =
-        attitude_error_body(desired_rotation(desired_up), state.rotation_world_from_body);
+    let attitude_error = attitude_error_body(
+        desired_rotation(desired_up, reference.yaw),
+        state.rotation_world_from_body,
+    );
     let torque = [0, 1, 2].map(|axis| {
         -domain.inertia[axis] * (25.0 * attitude_error[axis] + 8.0 * state.angular_velocity[axis])
     });
@@ -413,12 +458,11 @@ fn dot3(lhs: [f32; 3], rhs: [f32; 3]) -> f32 {
     lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2]
 }
 
-fn desired_rotation(body_up: [f32; 3]) -> [f32; 9] {
-    let heading = if body_up[0].abs() < 0.9 {
-        [1.0, 0.0, 0.0]
-    } else {
-        [0.0, 1.0, 0.0]
-    };
+fn desired_rotation(body_up: [f32; 3], yaw: f32) -> [f32; 9] {
+    let mut heading = [yaw.cos(), yaw.sin(), 0.0];
+    if dot3(body_up, heading).abs() > 0.95 {
+        heading = [-yaw.sin(), yaw.cos(), 0.0];
+    }
     let body_y = normalize3(cross3(body_up, heading), [0.0, 1.0, 0.0]);
     let body_x = normalize3(cross3(body_y, body_up), heading);
     [
