@@ -17,3 +17,4 @@ pub mod planner;
 pub mod preprocess;
 pub mod runtime;
 pub mod session;
+pub mod skyjepa_sim;

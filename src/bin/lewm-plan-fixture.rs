@@ -162,7 +162,7 @@ fn main() -> anyhow::Result<()> {
         cfg.noise_std = args.noise_std;
         cfg.temperature = args.temperature;
         cfg.seed = args.seed;
-        let planner = MppiPlanner::new(cfg);
+        let mut planner = MppiPlanner::new(cfg);
         rows.push(plan_summary(
             "mppi",
             planner.plan(&scorer)?,

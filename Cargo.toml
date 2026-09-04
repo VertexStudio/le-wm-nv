@@ -18,6 +18,7 @@ serde_json = "1.0.150"
 ndarray = "0.17.2"
 csv = "1.4.0"
 walkdir = "2.5.0"
+rayon = "1.12.0"
 
 candle = { package = "candle-core", version = "0.10.2", features = ["cuda", "cudnn"] }
 candle-nn = { package = "candle-nn", version = "0.10.2", features = ["cuda", "cudnn"] }
@@ -66,6 +67,22 @@ path = "src/bin/lewm-drone-import.rs"
 [[bin]]
 name = "lewm-train-drone"
 path = "src/bin/lewm-train-drone.rs"
+
+[[bin]]
+name = "lewm-train-skyjepa"
+path = "src/bin/lewm-train-skyjepa.rs"
+
+[[bin]]
+name = "lewm-eval-skyjepa"
+path = "src/bin/lewm-eval-skyjepa.rs"
+
+[[bin]]
+name = "lewm-generate-skyjepa"
+path = "src/bin/lewm-generate-skyjepa.rs"
+
+[[bin]]
+name = "lewm-sim-skyjepa"
+path = "src/bin/lewm-sim-skyjepa.rs"
 
 [[bin]]
 name = "lewm-drone-dynamics-stats"

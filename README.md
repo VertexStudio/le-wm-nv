@@ -1,18 +1,20 @@
 # le-wm-nv
 
-NVIDIA/CUDA-first LeWM training and inference runtime.
+NVIDIA/CUDA-first LeWM and SkyJEPA training, inference, and control runtime.
 
 ![le-wm-nv CUDA runtime architecture](docs/le-wm-nv.png)
 
-This repo is focused on one model family: LeWM world models from
-`stable-worldmodel`. It started with image LeWM checkpoints and now also
-supports repo-native modular observation encoders for non-vision state models.
+This repo supports two model families. LeWM remains the upstream-compatible
+image/vector baseline from `stable-worldmodel`. SkyJEPA is a separate,
+repo-native state/action world model for long-horizon quadrotor dynamics and
+metric MPPI control. SkyJEPA does not replace or remove LeWM.
 The runtime target is Linux with NVIDIA hardware, CUDA, cuDNN, nvJPEG,
 NVDECODE, and Candle CUDA tensors. The hot paths are:
 
 ```text
 image/video observation -> CUDA preprocess -> LeWM encode -> candidate rollout -> cost -> action
 vector/state observation -> normalize -> LeWM encode -> candidate rollout -> cost -> action
+UAV state18/action4 -> SkyJEPA TCN/GRU -> physics prober -> metric MPPI -> rotor forces
 ```
 
 ## Mandate
@@ -39,9 +41,11 @@ plausible: collect logs, train, run fixed validation probes, and load the model
 before the vehicle starts the real task. This is a world-model claim, not a
 claim about vision, navigation, or full autonomy.
 
-Validation claims must stay inside the logged data distribution. Current
-trainers produce LeWM checkpoints; task-specific evaluators should be added as
-first-class current code before making control or dynamics-quality claims.
+Validation claims must stay inside the logged data distribution. Trainers
+produce model-family-specific checkpoints; task-specific evaluators must back
+control or dynamics-quality claims. SkyJEPA includes per-horizon open-loop
+metrics and a closed-loop simulator, while LeWM keeps its existing parity and
+drone evaluation paths.
 
 ## Capabilities
 
@@ -55,6 +59,11 @@ first-class current code before making control or dynamics-quality claims.
 - LeWM training surface: upstream-style predicted embedding loss plus SIGReg,
   batch-loss API, AdamW training CLIs, PushT HDF5 dataset streaming, drone
   vector-observation dataset training, and safetensors save/reload.
+- Native SkyJEPA surface: full UAV state18/rotor-force action4 schema,
+  causal-TCN encoders, recursive GRU latent dynamics, SIGReg, frozen
+  physics-inspired prober, differentiable SO(3) integration, batched MPPI,
+  domain-randomized data generation, horizon evaluation, and closed-loop
+  simulation.
 - Python bootstrap tooling: official `stable-worldmodel[train]` package via
   `uv`, checkpoint conversion, PushT batch export, Python parity fixture export,
   and Python-vs-Rust image-planning benchmark scripts.
@@ -62,6 +71,8 @@ first-class current code before making control or dynamics-quality claims.
 
 The audited upstream `stable-worldmodel` commit is tracked in
 [docs/upstream-stable-worldmodel.md](docs/upstream-stable-worldmodel.md).
+The SkyJEPA implementation and paper/code assumptions are tracked in
+[docs/skyjepa.md](docs/skyjepa.md).
 
 ## LeWM Runtime Extensions
 

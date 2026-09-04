@@ -183,6 +183,9 @@ pub struct MppiConfig {
     pub action_dim: usize,
     pub action_bounds: ActionBounds,
     pub noise_std: f32,
+    /// Optional per-action sampling scales. When set, this takes precedence
+    /// over the scalar `noise_std` and must match `action_dim`.
+    pub noise_std_per_action: Option<Vec<f32>>,
     pub temperature: f32,
     pub deadline: Option<Duration>,
     pub deadline_action: Option<Vec<f32>>,
@@ -198,6 +201,7 @@ impl MppiConfig {
             action_dim,
             action_bounds: ActionBounds::symmetric(action_dim, 1.0),
             noise_std: 1.0,
+            noise_std_per_action: None,
             temperature: 1.0,
             deadline: None,
             deadline_action: None,
@@ -220,6 +224,21 @@ impl MppiConfig {
         }
         if !self.noise_std.is_finite() || self.noise_std <= 0.0 {
             candle::bail!("MPPI noise_std must be finite and greater than zero");
+        }
+        if let Some(noise) = self.noise_std_per_action.as_ref() {
+            if noise.len() != self.action_dim {
+                candle::bail!(
+                    "MPPI per-action noise length {} must match action_dim {}",
+                    noise.len(),
+                    self.action_dim
+                );
+            }
+            if noise
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            {
+                candle::bail!("MPPI per-action noise values must be finite and greater than zero");
+            }
         }
         if !self.temperature.is_finite() || self.temperature <= 0.0 {
             candle::bail!("MPPI temperature must be finite and greater than zero");
@@ -525,6 +544,7 @@ impl CemPlanner {
 #[derive(Debug, Clone)]
 pub struct MppiPlanner {
     config: MppiConfig,
+    warm_start: Option<Tensor>,
     rng: PlannerRng,
     workspace: PlannerWorkspace,
 }
@@ -533,6 +553,7 @@ impl MppiPlanner {
     pub fn new(config: MppiConfig) -> Self {
         Self {
             config,
+            warm_start: None,
             rng: PlannerRng::new(),
             workspace: PlannerWorkspace::new(),
         }
@@ -540,6 +561,18 @@ impl MppiPlanner {
 
     pub fn config(&self) -> &MppiConfig {
         &self.config
+    }
+
+    pub fn warm_start_sequence(&self) -> Option<&Tensor> {
+        self.warm_start.as_ref()
+    }
+
+    pub fn clear_warm_start(&mut self) {
+        self.warm_start = None;
+    }
+
+    pub fn set_warm_start_sequence(&mut self, sequence: Tensor) {
+        self.warm_start = Some(sequence);
     }
 
     pub fn reset_rng_sequence(&self) {
@@ -550,11 +583,11 @@ impl MppiPlanner {
         self.rng.offset()
     }
 
-    pub fn plan<S: CandidateScorer>(&self, scorer: &S) -> Result<PlanResult> {
+    pub fn plan<S: CandidateScorer>(&mut self, scorer: &S) -> Result<PlanResult> {
         self.plan_device(scorer)?.materialize()
     }
 
-    pub fn plan_device<S: CandidateScorer>(&self, scorer: &S) -> Result<PlanDeviceResult> {
+    pub fn plan_device<S: CandidateScorer>(&mut self, scorer: &S) -> Result<PlanDeviceResult> {
         self.config.validate()?;
         let start = Instant::now();
         let device = scorer.device();
@@ -573,17 +606,20 @@ impl MppiPlanner {
             )?,
         )?;
 
-        let mut mean =
-            self.workspace
-                .sequence(batch, cfg.horizon, cfg.action_dim, dtype, device, 0.0)?;
-        let std = self.workspace.sequence(
-            batch,
-            cfg.horizon,
-            cfg.action_dim,
-            dtype,
-            device,
-            cfg.noise_std,
-        )?;
+        let mut mean = self.initial_mean(batch, dtype, device)?;
+        let std = match cfg.noise_std_per_action.as_ref() {
+            Some(values) => Tensor::from_vec(values.clone(), (1, 1, cfg.action_dim), device)?
+                .to_dtype(dtype)?
+                .broadcast_as((batch, cfg.horizon, cfg.action_dim))?,
+            None => self.workspace.sequence(
+                batch,
+                cfg.horizon,
+                cfg.action_dim,
+                dtype,
+                device,
+                cfg.noise_std,
+            )?,
+        };
         let (low, high) = self.workspace.bounds(&cfg.action_bounds, dtype, device)?;
         let mut last_scores = None;
         let mut iterations_completed = 0;
@@ -593,6 +629,15 @@ impl MppiPlanner {
             if deadline_elapsed(start, cfg.deadline) {
                 deadline_reached = true;
                 if iter_idx == 0 {
+                    if let Some(sequence) = self.deadline_warm_start(batch, dtype, device)? {
+                        return deadline_plan_result(
+                            sequence,
+                            dtype,
+                            device,
+                            start,
+                            PlanDeadlineOutcome::WarmStart,
+                        );
+                    }
                     return configured_deadline_result(
                         cfg.deadline_action.as_deref(),
                         batch,
@@ -629,6 +674,7 @@ impl MppiPlanner {
             .ok_or_else(|| candle::Error::Msg("MPPI did not produce scores".to_string()))?;
         let best_index_tensor = lowest_score_indices(&scores, 1)?;
         let sequence = mean;
+        self.warm_start = Some(shift_sequence_for_warm_start(&sequence)?);
         let first_action = sequence.i((.., 0, ..))?;
         let elapsed = start.elapsed();
 
@@ -643,6 +689,43 @@ impl MppiPlanner {
             deadline_outcome: PlanDeadlineOutcome::None,
             used_host_elite_selection: false,
         })
+    }
+
+    fn initial_mean(&self, batch: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+        let cfg = &self.config;
+        match self.warm_start.as_ref() {
+            Some(sequence) if sequence.dims() == [batch, cfg.horizon, cfg.action_dim] => {
+                sequence.to_device(device)?.to_dtype(dtype)
+            }
+            Some(sequence) => candle::bail!(
+                "MPPI warm-start shape {:?} does not match expected {:?}",
+                sequence.dims(),
+                [batch, cfg.horizon, cfg.action_dim]
+            ),
+            None => self
+                .workspace
+                .sequence(batch, cfg.horizon, cfg.action_dim, dtype, device, 0.0),
+        }
+    }
+
+    fn deadline_warm_start(
+        &self,
+        batch: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        let cfg = &self.config;
+        match self.warm_start.as_ref() {
+            Some(sequence) if sequence.dims() == [batch, cfg.horizon, cfg.action_dim] => {
+                Ok(Some(sequence.to_device(device)?.to_dtype(dtype)?))
+            }
+            Some(sequence) => candle::bail!(
+                "MPPI warm-start shape {:?} does not match expected {:?}",
+                sequence.dims(),
+                [batch, cfg.horizon, cfg.action_dim]
+            ),
+            None => Ok(None),
+        }
     }
 }
 
@@ -2004,6 +2087,51 @@ mod tests {
         assert_ne!(
             result.sequence.to_vec3::<f32>()?,
             warm_start.to_vec3::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mppi_uses_per_action_noise_and_shifts_warm_start() -> Result<()> {
+        struct SumScorer<'a> {
+            device: &'a Device,
+        }
+
+        impl CandidateScorer for SumScorer<'_> {
+            fn device(&self) -> &Device {
+                self.device
+            }
+
+            fn dtype(&self) -> DType {
+                DType::F32
+            }
+
+            fn batch_size(&self) -> Option<usize> {
+                Some(1)
+            }
+
+            fn score_candidates(&self, action_candidates: &Tensor) -> Result<Tensor> {
+                action_candidates.sqr()?.sum((2, 3))
+            }
+        }
+
+        let device = Device::new_cuda(0)?;
+        let mut cfg = MppiConfig::new(3, 1, 2);
+        cfg.noise_std_per_action = Some(vec![0.6, 0.1]);
+        cfg.seed = Some(9);
+        let mut planner = MppiPlanner::new(cfg);
+        let initial = Tensor::new(&[[[0.1f32, 0.2], [0.3, 0.4], [0.5, 0.6]]], &device)?;
+        planner.set_warm_start_sequence(initial.clone());
+
+        let result = planner.plan_device(&SumScorer { device: &device })?;
+
+        assert_eq!(result.sequence.to_vec3::<f32>()?, initial.to_vec3::<f32>()?);
+        assert_eq!(
+            planner
+                .warm_start_sequence()
+                .expect("warm start")
+                .to_vec3::<f32>()?,
+            vec![vec![vec![0.3, 0.4], vec![0.5, 0.6], vec![0.5, 0.6]]]
         );
         Ok(())
     }

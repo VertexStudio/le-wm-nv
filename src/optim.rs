@@ -57,6 +57,42 @@ impl StatefulAdamW {
         self.step(&grads)
     }
 
+    /// Backpropagates, applies global L2 gradient clipping on-device, and
+    /// performs one AdamW update. The returned norm is the pre-clipping norm.
+    pub fn backward_step_clipped(&mut self, loss: &Tensor, max_norm: f64) -> Result<f32> {
+        if !max_norm.is_finite() || max_norm <= 0.0 {
+            candle::bail!("gradient max_norm must be finite and positive");
+        }
+        let mut grads = loss.backward()?;
+        let mut norm_sq: Option<Tensor> = None;
+        for var in &self.vars {
+            if let Some(grad) = grads.get(var.var.as_tensor()) {
+                let value = grad.sqr()?.sum_all()?;
+                norm_sq = Some(match norm_sq {
+                    Some(total) => (total + value)?,
+                    None => value,
+                });
+            }
+        }
+        let norm = norm_sq
+            .ok_or_else(|| candle::Error::Msg("loss produced no trainable gradients".to_string()))?
+            .sqrt()?
+            .to_scalar::<f32>()?;
+        if !norm.is_finite() {
+            candle::bail!("gradient norm is non-finite");
+        }
+        if f64::from(norm) > max_norm {
+            let scale = max_norm / f64::from(norm).max(1e-12);
+            for var in &self.vars {
+                if let Some(grad) = grads.remove(var.var.as_tensor()) {
+                    grads.insert(var.var.as_tensor(), (grad * scale)?);
+                }
+            }
+        }
+        self.step(&grads)?;
+        Ok(norm)
+    }
+
     pub fn step(&mut self, grads: &candle::backprop::GradStore) -> Result<()> {
         self.step_t += 1;
         let lr = self.params.lr;
