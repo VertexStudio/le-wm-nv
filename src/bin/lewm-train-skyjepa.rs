@@ -274,6 +274,7 @@ fn main() -> anyhow::Result<()> {
     atomic_write_json(&output_dir.join("dataset-config.json"), &dataset_cfg)?;
 
     let device = args.device.resolve()?;
+    device.set_seed(args.seed)?;
     let dtype = DType::F32;
     let mut latent_vars = VarMap::new();
     let model = SkyJepaModel::new(
@@ -300,6 +301,10 @@ fn main() -> anyhow::Result<()> {
         latent_vars
             .load(&checkpoint)
             .with_context(|| format!("failed to load {}", checkpoint.display()))?;
+        let packaged_checkpoint = output_dir.join("latent.safetensors");
+        if checkpoint != packaged_checkpoint {
+            atomic_copy(&checkpoint, &packaged_checkpoint)?;
+        }
     } else {
         if args.resume {
             let checkpoint = output_dir.join("latent-latest.safetensors");
@@ -331,6 +336,7 @@ fn main() -> anyhow::Result<()> {
         prober_cfg.kinematics.hover_throttle = args.hover_throttle;
         prober_cfg.kinematics.action_space = dataset_cfg.action_space;
         atomic_write_json(&output_dir.join("prober-config.json"), &prober_cfg)?;
+        device.set_seed(args.seed ^ 0x5052_4f42_4552_5f53)?;
         let mut prober_vars = VarMap::new();
         let prober = SkyJepaProber::new(
             prober_cfg,
