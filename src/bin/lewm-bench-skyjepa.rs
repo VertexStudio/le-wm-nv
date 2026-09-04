@@ -77,6 +77,9 @@ struct ScenarioResult {
     p50_plan_ms: f64,
     p95_plan_ms: f64,
     maximum_plan_ms: f64,
+    trim_scale: f32,
+    mean_model_correction_l2: f64,
+    maximum_model_correction_l2: f64,
     low_action_fraction: f64,
     high_action_fraction: f64,
     ground_contact: bool,
@@ -143,7 +146,6 @@ fn main() -> anyhow::Result<()> {
     let mut all_plan_times = Vec::new();
     for reference in references {
         for (randomized, seed, domain) in domains.iter().copied() {
-            controller.reset(initial_state)?;
             let result = run_scenario(
                 &args,
                 &mut controller,
@@ -244,6 +246,7 @@ fn run_scenario(
     aggregate_plan_times: &mut Vec<f64>,
 ) -> anyhow::Result<ScenarioResult> {
     let mut plant = SkyJepaRotorPlant::new(domain, SkyJepaRotorState::hover())?;
+    controller.reset_with_action(plant.state(), plant.nominal_hover_action())?;
     let dt = controller.dt();
     let steps = (args.duration_seconds / dt).round() as usize;
     let substeps = (args.simulation_rate_hz as f32 * dt).round() as usize;
@@ -253,6 +256,8 @@ fn run_scenario(
     let mut plan_times = Vec::with_capacity(steps);
     let mut low_actions = 0usize;
     let mut high_actions = 0usize;
+    let mut correction_sum = 0.0f64;
+    let mut maximum_correction = 0.0f64;
     let mut ground_contact = false;
     let mut finite = true;
     let maximum_force = domain.mass * domain.gravity * domain.max_thrust_weight / 4.0;
@@ -267,6 +272,14 @@ fn run_scenario(
             args.period_seconds,
         );
         let plan = controller.plan(&references)?;
+        let correction = plan
+            .action_correction
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        correction_sum += correction;
+        maximum_correction = maximum_correction.max(correction);
         plan_times.push(plan.plan_ms);
         aggregate_plan_times.push(plan.plan_ms);
         for action in plan.action {
@@ -322,6 +335,9 @@ fn run_scenario(
         p50_plan_ms: p50,
         p95_plan_ms: p95,
         maximum_plan_ms: maximum_plan,
+        trim_scale: controller.trim_scale(),
+        mean_model_correction_l2: correction_sum / steps as f64,
+        maximum_model_correction_l2: maximum_correction,
         low_action_fraction: low_actions as f64 / action_count,
         high_action_fraction: high_actions as f64 / action_count,
         ground_contact,

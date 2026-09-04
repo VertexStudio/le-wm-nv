@@ -47,11 +47,11 @@ fn main() -> anyhow::Result<()> {
     let state = SimState::new(
         domain,
         initial_state,
-        &controller,
         cold_warmup_ms,
         args.scenario,
         args.domain_seed,
     )?;
+    controller.reset_with_action(initial_state, state.plant.nominal_hover_action())?;
     let mut app = App::new();
     app.insert_resource(args)
         .insert_resource(state)
@@ -215,6 +215,8 @@ struct SimState {
     plant: SkyJepaRotorPlant,
     initial_state: SkyJepaRotorState,
     action: [f32; ACTION_DIM],
+    prior_action: [f32; ACTION_DIM],
+    model_correction_l2: f32,
     time: f32,
     wall_accumulator: f32,
     paused: bool,
@@ -237,14 +239,16 @@ impl SimState {
     fn new(
         domain: SkyJepaDomain,
         initial_state: SkyJepaRotorState,
-        controller: &SkyJepaControllerSession,
         cold_warmup_ms: f64,
         scenario: SkyJepaReferenceKind,
         domain_seed: u64,
     ) -> anyhow::Result<Self> {
         let plant = SkyJepaRotorPlant::new(domain, initial_state)?;
+        let hover_action = plant.nominal_hover_action();
         Ok(Self {
-            action: controller.hover_action(),
+            action: hover_action,
+            prior_action: hover_action,
+            model_correction_l2: 0.0,
             plant,
             initial_state,
             time: 0.0,
@@ -269,8 +273,10 @@ impl SimState {
     fn reset(&mut self, controller: &mut SkyJepaControllerSession) -> anyhow::Result<()> {
         let domain = self.plant.domain();
         self.plant = SkyJepaRotorPlant::new(domain, self.initial_state)?;
-        controller.reset(self.initial_state)?;
-        self.action = controller.hover_action();
+        self.action = self.plant.nominal_hover_action();
+        self.prior_action = self.action;
+        self.model_correction_l2 = 0.0;
+        controller.reset_with_action(self.initial_state, self.action)?;
         self.time = 0.0;
         self.wall_accumulator = 0.0;
         self.trail.clear();
@@ -461,6 +467,13 @@ fn step_control(
             match controller.plan_with_prediction(&references) {
                 Ok(plan) => {
                     state.action = plan.action;
+                    state.prior_action = plan.prior_action;
+                    state.model_correction_l2 = plan
+                        .action_correction
+                        .iter()
+                        .map(|value| value * value)
+                        .sum::<f32>()
+                        .sqrt();
                     state.prediction = plan.predicted_states;
                     state.best_score = plan.best_candidate_score;
                     state.plan_times_ms.push_back(plan.plan_ms);
@@ -475,7 +488,9 @@ fn step_control(
                 }
             }
         } else {
-            state.action = controller.hover_action();
+            state.action = state.plant.nominal_hover_action();
+            state.prior_action = state.action;
+            state.model_correction_l2 = 0.0;
             state.prediction.clear();
         }
         state.reference = references;
@@ -567,7 +582,7 @@ fn update_telemetry(
     **text = format!(
         "SkyJEPA {} controller={} scenario={} t={:.2}s step={}\n\
          position=[{:.2} {:.2} {:.2}] error={:.3}m max={:.3}m\n\
-         rotor-force=[{:.2} {:.2} {:.2} {:.2}] score={:.3}\n\
+         rotor-force=[{:.2} {:.2} {:.2} {:.2}] prior=[{:.2} {:.2} {:.2} {:.2}] model-delta={:.3} score={:.3}\n\
          MPPI samples={} horizon={} p50={:.2}ms p95={:.2}ms cold={:.1}ms\n\
          domain seed={} mass={:.3}kg inertia=[{:.4} {:.4} {:.4}] lag={:.3}s drag=[{:.2} {:.2} {:.2}]\n\
          Space pause | L controller | Backspace reset | R new domain | 1/2/3 reference{}",
@@ -585,6 +600,11 @@ fn update_telemetry(
         state.action[1],
         state.action[2],
         state.action[3],
+        state.prior_action[0],
+        state.prior_action[1],
+        state.prior_action[2],
+        state.prior_action[3],
+        state.model_correction_l2,
         state.best_score,
         controller.samples(),
         controller.horizon(),

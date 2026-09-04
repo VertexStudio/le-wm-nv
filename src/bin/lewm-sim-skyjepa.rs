@@ -37,6 +37,9 @@ struct Args {
     #[arg(long, default_value_t = 8.0)]
     period_seconds: f32,
 
+    #[arg(long, default_value = "circle")]
+    reference: SkyJepaReferenceKind,
+
     /// Enable one held-out randomized plant domain.
     #[arg(long)]
     randomize_domain: bool,
@@ -53,6 +56,7 @@ struct Args {
 
 #[derive(Debug, Serialize)]
 struct SimulationReport {
+    reference: SkyJepaReferenceKind,
     control_steps: usize,
     samples: usize,
     horizon: usize,
@@ -70,6 +74,15 @@ struct SimulationReport {
     max_plan_ms: f64,
     achieved_control_hz: f64,
     elapsed_seconds: f64,
+    trim_scale: f32,
+    mean_model_correction_l2: f64,
+    maximum_model_correction_l2: f64,
+    first_action: [f32; 4],
+    first_prior_action: [f32; 4],
+    mean_action: [f64; 4],
+    final_action: [f32; 4],
+    final_state: SkyJepaRotorState,
+    first_predicted_states: Vec<[f32; 18]>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -103,8 +116,15 @@ fn main() -> anyhow::Result<()> {
     let mut total_plan_seconds = 0.0f64;
     let mut max_plan_seconds = 0.0f64;
     let mut plan_times = Vec::with_capacity(args.control_steps);
+    let mut action_sum = [0.0f64; 4];
+    let mut first_action = [0.0; 4];
+    let mut first_prior_action = [0.0; 4];
+    let mut final_action = [0.0; 4];
+    let mut first_predicted_states = Vec::new();
+    let mut correction_sum = 0.0f64;
+    let mut maximum_correction = 0.0f64;
     let warmup_reference = skyjepa_reference_horizon(
-        SkyJepaReferenceKind::Circle,
+        args.reference,
         0.0,
         dt,
         args.horizon,
@@ -112,29 +132,51 @@ fn main() -> anyhow::Result<()> {
         args.period_seconds,
     );
     let cold_warmup_ms = controller.warm_up(plant.state(), &warmup_reference)?;
+    controller.reset_with_action(plant.state(), plant.nominal_hover_action())?;
 
     for step in 0..args.control_steps {
         let time = step as f32 * dt;
         let references = skyjepa_reference_horizon(
-            SkyJepaReferenceKind::Circle,
+            args.reference,
             time,
             dt,
             args.horizon,
             args.radius_m,
             args.period_seconds,
         );
-        let plan = controller.plan(&references)?;
+        let plan = if step == 0 {
+            controller.plan_with_prediction(&references)?
+        } else {
+            controller.plan(&references)?
+        };
         let plan_seconds = plan.plan_ms / 1e3;
         total_plan_seconds += plan_seconds;
         max_plan_seconds = max_plan_seconds.max(plan_seconds);
         plan_times.push(plan_seconds);
         let action = plan.action;
+        let correction = plan
+            .action_correction
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        correction_sum += correction;
+        maximum_correction = maximum_correction.max(correction);
+        if step == 0 {
+            first_action = action;
+            first_prior_action = plan.prior_action;
+            first_predicted_states = plan.predicted_states;
+        }
+        final_action = action;
+        for (sum, value) in action_sum.iter_mut().zip(action) {
+            *sum += f64::from(value);
+        }
         for _ in 0..sim_substeps {
             plant.step(action, sim_dt);
         }
         controller.commit_observation(plant.state(), action);
         let reference = skyjepa_reference_state(
-            SkyJepaReferenceKind::Circle,
+            args.reference,
             time + dt,
             args.radius_m,
             args.period_seconds,
@@ -164,6 +206,7 @@ fn main() -> anyhow::Result<()> {
         sorted_plan_times[index]
     };
     let report = SimulationReport {
+        reference: args.reference,
         control_steps: args.control_steps,
         samples: args.samples,
         horizon: args.horizon,
@@ -181,6 +224,15 @@ fn main() -> anyhow::Result<()> {
         max_plan_ms: max_plan_seconds * 1e3,
         achieved_control_hz: 1.0 / steady_mean_plan_seconds,
         elapsed_seconds: started.elapsed().as_secs_f64(),
+        trim_scale: controller.trim_scale(),
+        mean_model_correction_l2: correction_sum / args.control_steps as f64,
+        maximum_model_correction_l2: maximum_correction,
+        first_action,
+        first_prior_action,
+        mean_action: action_sum.map(|value| value / args.control_steps as f64),
+        final_action,
+        final_state: plant.state(),
+        first_predicted_states,
     };
     let json = serde_json::to_string_pretty(&report)?;
     if let Some(output) = args.output {
