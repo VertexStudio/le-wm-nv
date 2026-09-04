@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
+    io::{BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -8,12 +9,41 @@ use anyhow::{Context, ensure};
 use candle::{DType, Device, Tensor};
 use hdf5::File;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::drone_racing::{DroneRacingMetadata, RunningStats, mat3_mul_vec3};
 
 pub const SKYJEPA_STATE_DIM: usize = 18;
 pub const SKYJEPA_ACTION_DIM: usize = 4;
 pub const SKYJEPA_SCHEMA_VERSION: u32 = 1;
+
+/// Content fingerprint for the canonical files that define one generated
+/// SkyJEPA artifact. Audit reports and training manifests use the same routine
+/// so a dataset changed after audit is rejected before training.
+pub fn skyjepa_artifact_fingerprint(root: impl AsRef<Path>) -> anyhow::Result<String> {
+    let root = root.as_ref();
+    let paths = [
+        root.join("metadata.json"),
+        root.join("data.h5"),
+        root.join("domains.json"),
+    ];
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for path in paths {
+        digest.update(path.file_name().unwrap_or_default().as_encoded_bytes());
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to open {} for hashing", path.display()))?;
+        let mut reader = BufReader::new(file);
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +67,22 @@ pub struct SkyJepaDatasetMetadata {
     pub action_space: SkyJepaActionSpace,
     #[serde(default)]
     pub generator: Option<String>,
+    /// Seed used for domain and trajectory generation when this is a synthetic
+    /// canonical dataset. Legacy/imported datasets leave this unset.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Number of independently randomized dynamics domains represented by the
+    /// dataset, when known.
+    #[serde(default)]
+    pub domains: Option<usize>,
+    /// Whether `data.h5` contains the optional `reference_state [N,18]`
+    /// diagnostic dataset.
+    #[serde(default)]
+    pub has_reference_state: bool,
+    /// Whether `data.h5` contains the optional `motor_force [N,4]`
+    /// diagnostic dataset.
+    #[serde(default)]
+    pub has_motor_force: bool,
 }
 
 impl SkyJepaDatasetMetadata {
@@ -166,6 +212,20 @@ pub struct SkyJepaDroneDataset {
 
 impl SkyJepaDroneDataset {
     pub fn open(root: impl AsRef<Path>, config: SkyJepaDatasetConfig) -> anyhow::Result<Self> {
+        Self::open_with_normalization(root, config, None)
+    }
+
+    /// Opens a dataset using either training-split statistics computed from
+    /// this artifact or an externally supplied training normalization.
+    ///
+    /// Supplying the checkpoint normalization is required when evaluating a
+    /// separately generated OOD artifact; recomputing statistics on that
+    /// artifact would leak test-distribution information into model inputs.
+    pub fn open_with_normalization(
+        root: impl AsRef<Path>,
+        config: SkyJepaDatasetConfig,
+        fixed_normalization: Option<SkyJepaNormalization>,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
         let root = root.as_ref();
         let metadata_path = root.join("metadata.json");
@@ -244,8 +304,13 @@ impl SkyJepaDroneDataset {
             .into_iter()
             .collect::<Vec<_>>();
         let splits = split_episodes(&episodes)?;
-        let normalization =
-            compute_normalization(&states_raw, &actions_raw, &episode_idx, &splits.train)?;
+        let normalization = match fixed_normalization {
+            Some(normalization) => {
+                validate_normalization(&normalization)?;
+                normalization
+            }
+            None => compute_normalization(&states_raw, &actions_raw, &episode_idx, &splits.train)?,
+        };
         let states_normalized = if config.normalize_states {
             normalize_rows(&states_raw, SKYJEPA_STATE_DIM, &normalization.state)
         } else {
@@ -519,6 +584,32 @@ fn compute_normalization(
         state: state_stats.finish()?,
         action: action_stats.finish()?,
     })
+}
+
+fn validate_normalization(normalization: &SkyJepaNormalization) -> anyhow::Result<()> {
+    for (name, stats, expected_dim) in [
+        ("state", &normalization.state, SKYJEPA_STATE_DIM),
+        ("action", &normalization.action, SKYJEPA_ACTION_DIM),
+    ] {
+        ensure!(
+            stats.mean.len() == expected_dim && stats.std.len() == expected_dim,
+            "fixed {name} normalization has mean/std dimensions {}/{}; expected {expected_dim}",
+            stats.mean.len(),
+            stats.std.len()
+        );
+        ensure!(
+            stats.mean.iter().all(|value| value.is_finite()),
+            "fixed {name} normalization mean contains non-finite values"
+        );
+        ensure!(
+            stats
+                .std
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0),
+            "fixed {name} normalization std must be finite and positive"
+        );
+    }
+    Ok(())
 }
 
 fn normalize_rows(values: &[f32], dim: usize, stats: &RunningStats) -> Vec<f32> {

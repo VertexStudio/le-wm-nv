@@ -19,6 +19,7 @@ ndarray = "0.17.2"
 csv = "1.4.0"
 walkdir = "2.5.0"
 rayon = "1.12.0"
+sha2 = "0.10.9"
 
 candle = { package = "candle-core", version = "0.10.2", features = ["cuda", "cudnn"] }
 candle-nn = { package = "candle-nn", version = "0.10.2", features = ["cuda", "cudnn"] }
@@ -79,6 +80,10 @@ path = "src/bin/lewm-eval-skyjepa.rs"
 [[bin]]
 name = "lewm-generate-skyjepa"
 path = "src/bin/lewm-generate-skyjepa.rs"
+
+[[bin]]
+name = "lewm-audit-skyjepa"
+path = "src/bin/lewm-audit-skyjepa.rs"
 
 [[bin]]
 name = "lewm-sim-skyjepa"

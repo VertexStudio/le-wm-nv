@@ -7,10 +7,10 @@ use std::{
 use candle::{DType, Device, Result};
 use hdf5::File;
 use le_wm_nv::data::{
-    drone_racing::ImportedDroneData,
+    drone_racing::{ImportedDroneData, RunningStats},
     skyjepa::{
         SKYJEPA_SCHEMA_VERSION, SKYJEPA_STATE_DIM, SkyJepaActionSpace, SkyJepaDatasetConfig,
-        SkyJepaDatasetMetadata, SkyJepaDroneDataset,
+        SkyJepaDatasetMetadata, SkyJepaDroneDataset, SkyJepaNormalization,
     },
 };
 
@@ -139,6 +139,10 @@ fn opens_canonical_rotor_force_schema() -> Result<()> {
         action_dim: 4,
         action_space: SkyJepaActionSpace::RotorForces,
         generator: Some("test".into()),
+        seed: Some(7),
+        domains: Some(3),
+        has_reference_state: false,
+        has_motor_force: false,
     };
     fs::write(
         root.join("metadata.json"),
@@ -164,6 +168,38 @@ fn opens_canonical_rotor_force_schema() -> Result<()> {
         .batch(&dataset.train_rows()[..2], DType::F32, &Device::Cpu)
         .unwrap();
     assert_eq!(batch.metric_actions.to_vec3::<f32>()?[0][0], [3.2; 4]);
+
+    let fixed = SkyJepaNormalization {
+        state: RunningStats {
+            mean: vec![1.0; 18],
+            std: vec![2.0; 18],
+        },
+        action: RunningStats {
+            mean: vec![3.0; 4],
+            std: vec![0.5; 4],
+        },
+    };
+    let fixed_dataset = SkyJepaDroneDataset::open_with_normalization(
+        &root,
+        SkyJepaDatasetConfig {
+            batch_size: 2,
+            history_steps: 2,
+            rollout_steps: 2,
+            model_rate_hz: 20,
+            normalize_states: true,
+            normalize_actions: true,
+            action_space: SkyJepaActionSpace::RotorForces,
+        },
+        Some(fixed),
+    )
+    .unwrap();
+    let fixed_batch = fixed_dataset
+        .batch(&fixed_dataset.train_rows()[..1], DType::F32, &Device::Cpu)
+        .unwrap();
+    for value in &fixed_batch.actions.to_vec3::<f32>()?[0][0] {
+        assert!((*value - 0.4).abs() < 1e-6);
+    }
+    assert!((fixed_batch.states.to_vec3::<f32>()?[0][0][2] - 0.0).abs() < 1e-6);
     fs::remove_dir_all(root).ok();
     Ok(())
 }
