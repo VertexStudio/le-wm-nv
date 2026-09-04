@@ -16,6 +16,7 @@ use crate::{
     },
     planner::{ActionBounds, MppiConfig, MppiPlanner},
     skyjepa_sim::{SkyJepaDomain, SkyJepaRotorState},
+    skyjepa_task::skyjepa_geometric_action_prior,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -51,6 +52,8 @@ impl Default for SkyJepaSessionConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct SkyJepaControllerPlan {
     pub action: [f32; SKYJEPA_ACTION_DIM],
+    pub prior_action: [f32; SKYJEPA_ACTION_DIM],
+    pub action_correction: [f32; SKYJEPA_ACTION_DIM],
     pub action_sequence: Vec<[f32; SKYJEPA_ACTION_DIM]>,
     pub predicted_states: Vec<[f32; SKYJEPA_STATE_DIM]>,
     pub best_candidate_score: f32,
@@ -74,6 +77,7 @@ pub struct SkyJepaControllerSession {
     state_history: VecDeque<[f32; SKYJEPA_STATE_DIM]>,
     action_history: VecDeque<[f32; SKYJEPA_ACTION_DIM]>,
     hover_action: [f32; SKYJEPA_ACTION_DIM],
+    trim_scale: f32,
 }
 
 impl SkyJepaControllerSession {
@@ -141,22 +145,43 @@ impl SkyJepaControllerSession {
             state_history: VecDeque::new(),
             action_history: VecDeque::new(),
             hover_action,
+            trim_scale: 1.0,
         };
         session.reset(initial_state)?;
         Ok(session)
     }
 
     pub fn reset(&mut self, initial_state: SkyJepaRotorState) -> anyhow::Result<()> {
+        self.reset_with_action(initial_state, self.hover_action)
+    }
+
+    /// Resets control history with the actuator command that held the vehicle
+    /// before model-based control took over. This trim is observable on a real
+    /// flight stack and lets the prior start correctly across payload/thrust
+    /// changes while SkyJEPA infers residual dynamics from history.
+    pub fn reset_with_action(
+        &mut self,
+        initial_state: SkyJepaRotorState,
+        initial_action: [f32; SKYJEPA_ACTION_DIM],
+    ) -> anyhow::Result<()> {
+        ensure!(
+            initial_action
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0),
+            "SkyJEPA initial action must be finite and non-negative"
+        );
+        let nominal_collective = self.hover_action.iter().sum::<f32>();
+        self.trim_scale = initial_action.iter().sum::<f32>() / nominal_collective;
         self.state_history = VecDeque::from(vec![
             initial_state.as_state18();
             self.model_cfg.history_steps
         ]);
         self.action_history =
-            VecDeque::from(vec![self.hover_action; self.model_cfg.history_steps - 1]);
+            VecDeque::from(vec![initial_action; self.model_cfg.history_steps - 1]);
         self.planner = MppiPlanner::new(self.planner_cfg.clone());
         self.planner.set_warm_start_sequence(
             Tensor::from_vec(
-                self.hover_action.repeat(self.control_cfg.horizon),
+                initial_action.repeat(self.control_cfg.horizon),
                 (1, self.control_cfg.horizon, SKYJEPA_ACTION_DIM),
                 &self.device,
             )?
@@ -221,6 +246,24 @@ impl SkyJepaControllerSession {
             (1, self.model_cfg.history_steps - 1, SKYJEPA_ACTION_DIM),
             &self.device,
         )?;
+        let prior_actions = skyjepa_geometric_action_prior(
+            *self
+                .state_history
+                .back()
+                .expect("SkyJEPA state history is initialized"),
+            reference_states,
+            self.control_cfg.dt,
+            SkyJepaDomain::default(),
+        )
+        .into_iter()
+        .map(|action| action.map(|force| force * self.trim_scale))
+        .collect::<Vec<_>>();
+        let prior_tensor = Tensor::from_vec(
+            prior_actions.iter().flatten().copied().collect::<Vec<_>>(),
+            (1, self.control_cfg.horizon, SKYJEPA_ACTION_DIM),
+            &self.device,
+        )?;
+        self.planner.set_warm_start_sequence(prior_tensor.clone());
         let reference_states = Tensor::from_vec(
             reference_states
                 .iter()
@@ -230,11 +273,7 @@ impl SkyJepaControllerSession {
             (1, self.control_cfg.horizon, SKYJEPA_STATE_DIM),
             &self.device,
         )?;
-        let reference_actions = Tensor::from_vec(
-            self.hover_action.repeat(self.control_cfg.horizon),
-            (1, self.control_cfg.horizon, SKYJEPA_ACTION_DIM),
-            &self.device,
-        )?;
+        let reference_actions = prior_tensor;
         let scorer = SkyJepaMppiScorer::new(
             &self.model,
             &self.prober,
@@ -265,12 +304,16 @@ impl SkyJepaControllerSession {
         };
         let actions = result.sequence.to_vec3::<f32>()?;
         let first_action = result.first_action.to_vec2::<f32>()?;
+        let action: [f32; SKYJEPA_ACTION_DIM] = first_action[0]
+            .as_slice()
+            .try_into()
+            .expect("planner action has four values");
+        let prior_action = prior_actions[0];
         let best_candidate_score = result.scores.min_all()?.to_scalar::<f32>()?;
         Ok(SkyJepaControllerPlan {
-            action: first_action[0]
-                .as_slice()
-                .try_into()
-                .expect("planner action has four values"),
+            action,
+            prior_action,
+            action_correction: [0, 1, 2, 3].map(|index| action[index] - prior_action[index]),
             action_sequence: actions[0]
                 .iter()
                 .map(|action| {
@@ -313,6 +356,10 @@ impl SkyJepaControllerSession {
 
     pub fn hover_action(&self) -> [f32; SKYJEPA_ACTION_DIM] {
         self.hover_action
+    }
+
+    pub fn trim_scale(&self) -> f32 {
+        self.trim_scale
     }
 
     pub fn device(&self) -> &Device {
