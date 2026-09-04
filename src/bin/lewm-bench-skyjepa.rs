@@ -1,12 +1,15 @@
 use std::{fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use le_wm_nv::{
     models::skyjepa::{SkyJepaControllerSession, SkyJepaSessionConfig},
     runtime::DeviceSpec,
     skyjepa_sim::{SkyJepaDomain, SkyJepaRotorPlant, SkyJepaRotorState},
-    skyjepa_task::{SkyJepaReferenceKind, skyjepa_reference_horizon, skyjepa_reference_state},
+    skyjepa_task::{
+        SkyJepaReferenceKind, skyjepa_geometric_action_prior, skyjepa_reference_horizon,
+        skyjepa_reference_state,
+    },
 };
 use serde::Serialize;
 
@@ -46,6 +49,11 @@ struct Args {
     #[arg(long, default_value_t = 7)]
     planner_seed: u64,
 
+    /// `prior` runs the same trim-aware geometric sequence without learned
+    /// MPPI corrections, providing an apples-to-apples control baseline.
+    #[arg(long, value_enum, default_value_t = ControllerMode::SkyJepa)]
+    controller: ControllerMode,
+
     #[arg(long, default_value_t = 0.75)]
     max_position_rmse_m: f64,
 
@@ -63,6 +71,13 @@ struct Args {
 
     #[arg(long)]
     allow_fail: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ControllerMode {
+    SkyJepa,
+    Prior,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +105,7 @@ struct ScenarioResult {
 #[derive(Debug, Serialize)]
 struct BenchmarkReport {
     passed: bool,
+    controller: ControllerMode,
     checkpoint_dir: PathBuf,
     samples: usize,
     horizon: usize,
@@ -201,6 +217,7 @@ fn main() -> anyhow::Result<()> {
     }
     let report = BenchmarkReport {
         passed: failures.is_empty(),
+        controller: args.controller,
         checkpoint_dir: fs::canonicalize(&args.checkpoint_dir)
             .unwrap_or(args.checkpoint_dir.clone()),
         samples: args.samples,
@@ -271,29 +288,45 @@ fn run_scenario(
             args.radius_m,
             args.period_seconds,
         );
-        let plan = controller.plan(&references)?;
-        let correction = plan
-            .action_correction
-            .iter()
-            .map(|value| f64::from(*value).powi(2))
-            .sum::<f64>()
-            .sqrt();
+        let plan_started = Instant::now();
+        let (action, correction, plan_ms) = match args.controller {
+            ControllerMode::SkyJepa => {
+                let plan = controller.plan(&references)?;
+                let correction = plan
+                    .action_correction
+                    .iter()
+                    .map(|value| f64::from(*value).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                (plan.action, correction, plan.plan_ms)
+            }
+            ControllerMode::Prior => {
+                let action = skyjepa_geometric_action_prior(
+                    plant.state().as_state18(),
+                    &references,
+                    controller.dt(),
+                    SkyJepaDomain::default(),
+                )[0]
+                .map(|force| force * controller.trim_scale());
+                (action, 0.0, plan_started.elapsed().as_secs_f64() * 1e3)
+            }
+        };
         correction_sum += correction;
         maximum_correction = maximum_correction.max(correction);
-        plan_times.push(plan.plan_ms);
-        aggregate_plan_times.push(plan.plan_ms);
-        for action in plan.action {
-            if action <= 1e-6 {
+        plan_times.push(plan_ms);
+        aggregate_plan_times.push(plan_ms);
+        for force in action {
+            if force <= 1e-6 {
                 low_actions += 1;
             }
-            if action >= maximum_force * 0.999 {
+            if force >= maximum_force * 0.999 {
                 high_actions += 1;
             }
         }
         for _ in 0..substeps {
-            plant.step(plan.action, sim_dt);
+            plant.step(action, sim_dt);
         }
-        controller.commit_observation(plant.state(), plan.action);
+        controller.commit_observation(plant.state(), action);
         let reference = skyjepa_reference_state(
             reference_kind,
             time + dt,
@@ -308,7 +341,7 @@ fn run_scenario(
             .state()
             .as_state18()
             .iter()
-            .chain(plan.action.iter())
+            .chain(action.iter())
             .all(|value| value.is_finite());
         if !finite {
             break;
