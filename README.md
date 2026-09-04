@@ -19,14 +19,7 @@ UAV state18/action4 -> SkyJEPA TCN/GRU -> physics prober -> metric MPPI -> rotor
 
 ## SkyJEPA UAV control
 
-[![Published SkyJEPA pipeline from simulation data synthesis through latent dynamics and physics-informed probing to sampling-based control](docs/skyjepa-pipeline.jpg)](https://x.com/robotsdigest/status/2070179832462491857/photo/1)
-
-*Published SkyJEPA concept: simulation data synthesis → latent dynamics →
-physics-inspired prober → sampling-based control. Image shared by
-[Robots Digest](https://x.com/robotsdigest/status/2070179832462491857/photo/1);
-method from the [SkyJEPA paper](https://arxiv.org/html/2606.23444). Its
-zero-shot sim-to-real panel describes the authors' result; our validation below
-is currently simulation-only.*
+![SkyJEPA pipeline from simulation data synthesis through latent dynamics and physics-inspired probing to sampling-based control](docs/skyjepa-pipeline.jpg)
 
 This is a real capture from the dedicated Bevy simulator running the trained
 pilot checkpoint on a held-out randomized rotor plant. Yellow is the executed
