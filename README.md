@@ -19,22 +19,20 @@ UAV state18/action4 -> SkyJEPA TCN/GRU -> physics prober -> metric MPPI -> rotor
 
 ## SkyJEPA UAV control
 
-These are real frames from the dedicated Bevy simulator running the trained
+This is a real capture from the dedicated Bevy simulator running the trained
 pilot checkpoint on a held-out randomized rotor plant. Yellow is the executed
 trajectory, cyan is the current reference horizon, magenta is SkyJEPA's metric
 prediction, and the green bars are the four commanded rotor forces. The HUD
-shows the geometric prior and the learned correction separately; these are not
-scripted animation captures.
+shows the geometric prior and the learned correction separately; this is not a
+scripted animation.
 
-| Randomized circle | Randomized figure-eight |
-| --- | --- |
-| ![Trained SkyJEPA controlling a randomized UAV on a circle](docs/skyjepa-circle.png) | [![Animated preview of trained SkyJEPA controlling a randomized UAV on a figure-eight; click for the full video](docs/skyjepa-trained-figure-eight.gif)](docs/skyjepa-trained-figure-eight.mp4) |
+[![Animated preview of trained SkyJEPA controlling a randomized UAV on a figure-eight; click for the full video](docs/skyjepa-trained-figure-eight.gif)](docs/skyjepa-trained-figure-eight.mp4)
 
 **Video:** [watch the 20-second trained SkyJEPA figure-eight flight](docs/skyjepa-trained-figure-eight.mp4)
 at normal simulation speed. Yellow is executed, cyan is reference, magenta is
 predicted, and green shows rotor force.
 
-The model in those captures was trained locally on an RTX 4090 from 2,000
+The model in this capture was trained locally on an RTX 4090 from 2,000
 ten-second trajectories across 100 randomized domains (402,000 state/action
 rows). At the paper's controller setting of 512 candidates and horizon 15, the
 automated gate passed all 63 nominal and held-out hover, circle, and
