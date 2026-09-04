@@ -90,6 +90,10 @@ name = "lewm-sim-skyjepa"
 path = "src/bin/lewm-sim-skyjepa.rs"
 
 [[bin]]
+name = "lewm-bench-skyjepa"
+path = "src/bin/lewm-bench-skyjepa.rs"
+
+[[bin]]
 name = "lewm-drone-dynamics-stats"
 path = "src/bin/lewm-drone-dynamics-stats.rs"
 
