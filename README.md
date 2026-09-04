@@ -17,6 +17,98 @@ vector/state observation -> normalize -> LeWM encode -> candidate rollout -> cos
 UAV state18/action4 -> SkyJEPA TCN/GRU -> physics prober -> metric MPPI -> rotor forces
 ```
 
+## SkyJEPA UAV control
+
+These are real frames from the dedicated Bevy simulator running the trained
+pilot checkpoint on a held-out randomized rotor plant. Yellow is the executed
+trajectory, cyan is the current reference horizon, magenta is SkyJEPA's metric
+prediction, and the green bars are the four commanded rotor forces. The HUD
+shows the geometric prior and the learned correction separately; these are not
+scripted animation captures.
+
+| Randomized circle | Randomized figure-eight |
+| --- | --- |
+| ![Trained SkyJEPA controlling a randomized UAV on a circle](docs/skyjepa-circle.png) | ![Trained SkyJEPA controlling a randomized UAV on a figure-eight](docs/skyjepa-figure-eight.png) |
+
+The model in those captures was trained locally on an RTX 4090 from 2,000
+ten-second trajectories across 100 randomized domains (402,000 state/action
+rows). At the paper's controller setting of 512 candidates and horizon 15, the
+automated gate passed all 63 nominal and held-out hover, circle, and
+figure-eight runs:
+
+| Closed-loop result | SkyJEPA + prior | Matched prior only |
+| --- | ---: | ---: |
+| Successful runs | **63 / 63** | 62 / 63 |
+| Mean trajectory RMSE | **0.2210 m** | 0.2245 m |
+| Worst trajectory RMSE | **0.407 m** | 0.888 m |
+| Worst position error | **0.984 m** | 1.394 m |
+| Aggregate p95 planning latency | **8.64 ms** | 0.0013 ms |
+
+The prior-only column is important: SkyJEPA is not being credited for the
+geometric stabilization shared by both controllers. It measures whether the
+learned dynamics correction improves the same nominal flight sequence. The
+learned controller eliminated the one prior-only failure and substantially
+reduced the worst-domain error. The screenshots use accelerated visualization,
+so their render-contended HUD latency is not the headless benchmark above.
+
+### How this was built without released implementation code
+
+When this implementation was written on 2026-09-03, the
+[authors' SkyJEPA repository](https://github.com/arplaboratory/SkyJEPA) stated
+that code, data, and pretrained models were forthcoming. There was no Python
+model or controller source to translate. This is therefore a clean-room
+Rust/Candle implementation of the contracts published in the
+[SkyJEPA paper](https://arxiv.org/html/2606.23444), not a claim of source-level
+upstream parity.
+
+We separated the reconstruction into things the paper specifies and things it
+does not:
+
+- From the paper: state18 and individual rotor-force action4, history 10,
+  rollout 20, state/action causal TCN channel sizes, latent/GRU width 24,
+  two-stage frozen-latent training, SIGReg weight and knots, the
+  physics-inspired prober outputs, SO(3) metric integration, MPPI horizon and
+  512-sample budget, action-noise scales, temperature, and control costs.
+- Explicit local choices: the internal residual TCN block layout, the small
+  prober MLP layout, 64 SIGReg projection directions, the random-Fourier
+  periodic-reference generator, the geometric data-collection tracker, and an
+  arm-length randomization range omitted from the paper's parameter table.
+  These choices are versioned in [the detailed SkyJEPA notes](docs/skyjepa.md).
+
+The implementation/evidence loop was:
+
+1. Define a canonical HDF5 contract for state, commanded rotor force, realized
+   motor force, reference state, episode, time step, and randomized domain.
+2. Build a 200 Hz rigid-body/SO(3) rotor plant and collect control-rich data at
+   20 Hz. The first pilot was rejected after a new audit showed that its
+   differential rotor excitation was too small; the generator was strengthened
+   before the accepted data was trained.
+3. Reconstruct the paper's latent TCN/GRU objective and physics prober natively
+   in Candle. Training is staged, deterministic, resumable with optimizer
+   state, guarded by the audited dataset SHA-256, and promotes best-validation
+   safetensors rather than merely the last step.
+4. Keep the control hot path on CUDA: encode state history once, flatten all
+   sampled rolling action windows into one action-TCN batch, recursively unroll
+   the GRU, and advance each metric candidate with a fused CUDA integrator.
+5. Add a trim-aware geometric action prior after early closed-loop experiments
+   showed that sampling raw rotor forces was not a reliable flight initializer.
+   SkyJEPA's role is now precise: predict and optimize the correction around a
+   stable nominal flight sequence.
+6. Validate at three levels: per-horizon offline metrics against
+   constant-velocity and kinematic baselines, deterministic closed-loop gates
+   against unseen domains, and an interactive simulator using the same reusable
+   checkpoint-backed controller session as the headless tools.
+
+This process also found a real boundary rather than only successes. On an
+independently generated 500-trajectory OOD dataset, SkyJEPA slightly beat the
+constant-velocity position baseline at 0.25 seconds (`0.0519 m` versus
+`0.0535 m`), but lost at 1 second (`0.818 m` versus `0.769 m`) and degraded
+further by 3 seconds. The current checkpoint demonstrates a working, fast,
+learned closed-loop stack; it does not yet establish superior long-horizon
+open-loop prediction. Reproduction commands, audit thresholds, checkpoint
+contents, simulator controls, and the full pilot evidence are in
+[docs/skyjepa.md](docs/skyjepa.md).
+
 ## Mandate
 
 Performance is the primary acceptance criterion. The repo is not a portability
