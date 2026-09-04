@@ -28,7 +28,7 @@ scripted animation captures.
 
 | Randomized circle | Randomized figure-eight |
 | --- | --- |
-| ![Trained SkyJEPA controlling a randomized UAV on a circle](docs/skyjepa-circle.png) | [![Trained SkyJEPA controlling a randomized UAV on a figure-eight; click to play the video](docs/skyjepa-figure-eight.png)](docs/skyjepa-trained-figure-eight.mp4) |
+| ![Trained SkyJEPA controlling a randomized UAV on a circle](docs/skyjepa-circle.png) | [![Animated preview of trained SkyJEPA controlling a randomized UAV on a figure-eight; click for the full video](docs/skyjepa-trained-figure-eight.gif)](docs/skyjepa-trained-figure-eight.mp4) |
 
 **Video:** [watch the 20-second trained SkyJEPA figure-eight flight](docs/skyjepa-trained-figure-eight.mp4)
 at normal simulation speed. Yellow is executed, cyan is reference, magenta is
