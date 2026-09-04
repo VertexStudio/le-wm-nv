@@ -62,8 +62,10 @@ drone evaluation paths.
 - Native SkyJEPA surface: full UAV state18/rotor-force action4 schema,
   causal-TCN encoders, recursive GRU latent dynamics, SIGReg, frozen
   physics-inspired prober, differentiable SO(3) integration, batched MPPI,
-  domain-randomized data generation, horizon evaluation, and closed-loop
-  simulation.
+  audited domain-randomized data generation, resumable best-checkpoint staged
+  training, fixed-normalization long-horizon evaluation with baselines,
+  trim-aware low-latency control, closed-loop scenario gating, and a dedicated
+  Bevy rotor-force simulator.
 - Python bootstrap tooling: official `stable-worldmodel[train]` package via
   `uv`, checkpoint conversion, PushT batch export, Python parity fixture export,
   and Python-vs-Rust image-planning benchmark scripts.
