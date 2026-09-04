@@ -18,3 +18,4 @@ pub mod preprocess;
 pub mod runtime;
 pub mod session;
 pub mod skyjepa_sim;
+pub mod skyjepa_task;
