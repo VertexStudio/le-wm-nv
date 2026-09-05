@@ -21,122 +21,54 @@ UAV state18/action4 -> SkyJEPA TCN/GRU -> physics prober -> metric MPPI -> rotor
 
 ![SkyJEPA pipeline from simulation data synthesis through latent dynamics and physics-inspired probing to sampling-based control](docs/skyjepa-pipeline.jpg)
 
-### Corrected pilot (2026-09-05)
+SkyJEPA learns UAV dynamics from state/action logs and uses those predictions
+to plan rotor commands. Our Rust/Candle implementation trains and runs on CUDA,
+with a dedicated 200 Hz rotor-physics simulator and a 20 Hz controller.
 
-Three independent training seeds now use audited, domain-disjoint data and
-validated checkpoint/resume contracts. Each model trains in approximately
-**34 minutes on a shared RTX 4090**, using 1,600 ten-second training episodes
-(4.44 simulated hours) from a 2,000-episode dataset. This is a measured pilot
-budget, not the minimum data needed or an RL-policy sample-efficiency result.
+The flight controller is a hybrid: a **hand-written geometric controller**
+provides the initial commands, and **MPPI uses SkyJEPA's learned predictions**
+to improve them. Basic stabilization and learned dynamics have distinct roles.
 
-At 512 MPPI candidates, horizon 15 and 20 Hz control, the exact-trim comparison
-on the same 63 nominal/held-out-domain cases is:
+[![SkyJEPA seed 7 flying a randomized UAV on a figure-eight; click for the full video](docs/skyjepa-v3-figure-eight.gif)](docs/skyjepa-v3-figure-eight.mp4)
 
-| Controller | Tracking passes | Mean RMSE | Worst RMSE | Planning p95 |
+[Full 20-second simulator video](docs/skyjepa-v3-figure-eight.mp4), at normal
+speed. Yellow: executed. Cyan: reference. Magenta: predicted.
+Green bars: commanded rotor forces. HUD timing includes the visual workload;
+the headless measurements below are the performance reference.
+
+### Training and control results
+
+Three models trained in approximately **34 minutes each on a shared RTX 4090**,
+using 1,600 ten-second training episodes from a 2,000-episode dataset.
+Training, validation and test partitions use different physical vehicle
+configurations. MPPI uses 512 candidates and a 15-step horizon. On the same
+63 hover/circle/figure-eight test cases:
+
+| Controller | Tracking passes | Mean trajectory RMSE | Worst trajectory RMSE | Planning p95 |
 | --- | ---: | ---: | ---: | ---: |
-| Geometric prior | 63/63 | 0.2153 m | 0.5706 m | 0.0015 ms |
-| Nominal-physics MPPI | 63/63 | 0.1609 m | 0.3038 m | 3.215 ms |
-| Fixed untrained MPPI | 51/63 | 0.6035 m | 1.8637 m | 8.931 ms |
-| Trained SkyJEPA, three seeds | 63/63 each | 0.2009–0.2059 m | 0.3781–0.4231 m | 8.818–8.936 ms |
+| Random-weight model + MPPI | 51/63 | 0.6035 m | 1.8637 m | 8.931 ms |
+| Hand-written controller alone | 63/63 | 0.2153 m | 0.5706 m | 0.0015 ms |
+| Trained SkyJEPA + controller, three seeds | **63/63 each** | **0.2009–0.2059 m** | **0.3781–0.4231 m** | 8.818–8.936 ms |
+| Nominal-physics MPPI + controller | 63/63 | 0.1609 m | 0.3038 m | 3.215 ms |
 
-Training improves on random weights and reduces the prior's mean error by
-4.4–6.7% and worst trajectory RMSE by 25.9–33.7%. However, **nominal-physics MPPI
-is more accurate and faster here**. This validates working learned control,
-not an advantage over a nonlearned predictive controller. All exact-trim rows
-pass the timing criterion; tracking and timing are reported separately for the
-trim and distribution stress tests, including failures.
+**Training produces useful behavior:** tracking error is roughly two-thirds
+lower than with random weights. Adding SkyJEPA to the hand-written controller
+reduces mean error by 4.4–6.7% and worst trajectory RMSE by 25.9–33.7%.
 
-Across exact/±10% trim and deliberately shifted mass/motor lag, trained models
-pass **756/756 tracking cases** and 741/756 timing cases. Two seed/trim reports
-fail the combined gate; no controller records a 50 ms deadline miss. Under the
-mass/lag shift, trained mean error is slightly worse than the prior's.
+Across all three training seeds and four test conditions—including ±10% hover
+calibration error and heavier, slower-motor plants—the learned controllers pass
+**756/756 tracking runs with no ground contact**. They pass 741/756 of the
+stricter 10 ms p95 timing checks, with zero 50 ms control-deadline misses.
 
-See the [complete three-seed results](docs/skyjepa-remediation-results.md) for
-the frozen warm-start decision, all stress conditions, long-horizon limitations,
-reproduction commands and simulator recording provenance.
+This is a working learned-control system. The next targets are better
+long-horizon predictions and tighter latency tails; nominal-physics MPPI is
+currently the most accurate and fastest predictive controller in these tests.
 
-### Simulator capture (corrected pilot)
-
-The dedicated Bevy simulator runs the **2026-09-05 corrected seed-7 checkpoint**
-on a held-out randomized in-range rotor plant, using the validation-selected
-fresh-prior controller. This is an actual simulator capture, not a scripted animation.
-
-[![Eight-second preview of corrected SkyJEPA seed 7 controlling a randomized UAV on a figure-eight; click for the full video](docs/skyjepa-v3-figure-eight.gif)](docs/skyjepa-v3-figure-eight.mp4)
-
-**Video:** [full 20-second corrected SkyJEPA flight](docs/skyjepa-v3-figure-eight.mp4),
-at normal simulation speed. Yellow: executed. Cyan: reference. Magenta:
-prediction. Green bars: commanded rotor forces.
-
-The HUD separates prior action and learned correction; its render-contended
-latency is not the headless benchmark above. See [media provenance and GIF
-reproduction](docs/skyjepa-v3-media.md). The older recording and results remain
-preserved in [the historical pilot notes](docs/skyjepa.md#historical-pilot-evidence-2026-09-03).
-
-### How this was built without released implementation code
-
-When this implementation was written on 2026-09-03, the
-[authors' SkyJEPA repository](https://github.com/arplaboratory/SkyJEPA) stated
-that code, data, and pretrained models were forthcoming. There was no Python
-model or controller source to translate. This is therefore a clean-room
-Rust/Candle implementation of the contracts published in the
-[SkyJEPA paper](https://arxiv.org/html/2606.23444), not a claim of source-level
-upstream parity.
-
-We separated the reconstruction into things the paper specifies and things it
-does not:
-
-- From the paper: state18 and individual rotor-force action4, history 10,
-  rollout 20, state/action causal TCN channel sizes, latent/GRU width 24,
-  two-stage frozen-latent training, SIGReg weight and knots, the
-  physics-inspired prober outputs, SO(3) metric integration, MPPI horizon and
-  512-sample budget, action-noise scales, temperature, and control costs.
-- Explicit local choices: the internal residual TCN block layout, the small
-  prober MLP layout, 64 SIGReg projection directions, the random-Fourier
-  periodic-reference generator, the geometric data-collection tracker, and an
-  arm-length randomization range omitted from the paper's parameter table.
-  These choices are versioned in [the detailed SkyJEPA notes](docs/skyjepa.md).
-
-The implementation/evidence loop was:
-
-1. Define a canonical HDF5 contract for state, commanded rotor force, realized
-   motor force, reference state, episode, time step, and randomized domain.
-2. Build a 200 Hz rigid-body/SO(3) rotor plant and collect control-rich data at
-   20 Hz. Audits first caught insufficient differential rotor excitation and
-   later caught hover/motion coverage aliased to domain IDs. The corrected
-   dataset includes both flight types in every domain, with domain-disjoint
-   training, validation and test partitions.
-3. Reconstruct the paper's latent TCN/GRU objective and physics prober natively
-   in Candle. Training is staged, deterministic, resumable with optimizer
-   state, guarded by the audited dataset SHA-256, and promotes best-validation
-   weights rather than merely the last step. Versioned packages bind model,
-   normalization, physics and latent ancestry; atomic snapshot publication and
-   interrupted-versus-continuous CUDA tests protect resume correctness.
-4. Keep the control hot path on CUDA: encode state history once, flatten all
-   sampled rolling action windows into one action-TCN batch, recursively unroll
-   the GRU, and advance each metric candidate with a fused CUDA integrator.
-5. Add a trim-aware geometric action prior after early closed-loop experiments
-   showed that sampling raw rotor forces was not a reliable flight initializer.
-   SkyJEPA's role is now precise: predict and optimize the correction around a
-   stable nominal flight sequence.
-6. Validate at three levels: per-horizon offline metrics against
-   constant-velocity and kinematic baselines, deterministic closed-loop gates
-   against unseen domains, and an interactive simulator using the same reusable
-   checkpoint-backed controller session as the headless tools.
-
-The corrected three-seed experiment also found a clear limitation. On the full
-1,000-episode independent **in-range** population, one-second position RMSE is
-`0.636 / 0.999 / 0.635 m`, versus `0.740 m` for constant velocity. All three
-seeds lose at three seconds and under deliberately out-of-support mass/motor
-lag. Fresh random seeds alone are not distribution shift; the historical
-500-trajectory external dataset was in-range and its old evaluator measured
-only the selected test partition, not all 500 trajectories.
-
-The stack runs learned closed-loop control, but these results do not establish
-consistently superior long-horizon prediction or sim-to-real transfer.
-Reproduction commands, audit thresholds, checkpoint contents, simulator
-controls and historical evidence are in [docs/skyjepa.md](docs/skyjepa.md).
-The corrected experiment protocol and implementation checks are in
-[the remediation log](docs/skyjepa-remediation.md).
+The [SkyJEPA guide](docs/skyjepa.md) explains the architecture, what each
+controller contributes, current results, dataset format, and how to train,
+evaluate and run the simulator. The implementation follows the
+[SkyJEPA paper](https://arxiv.org/html/2606.23444), with its paper-derived
+contracts and repo-specific design choices documented in that guide.
 
 ## Mandate
 

@@ -1,348 +1,363 @@
-# Native SkyJEPA
+# SkyJEPA
 
-This repository supports SkyJEPA as a second model family alongside LeWM.
-LeWM's models, checkpoint-compatible image runtime, vector extensions,
-trainers, planners, and simulator remain available. SkyJEPA has an independent
-state/action schema and independent checkpoints; there is no forced conversion
-between the two model families.
+SkyJEPA is this repository's learned UAV dynamics model and model-predictive
+control pipeline. It trains from state/action logs, predicts vehicle motion,
+and helps select rotor commands in a 200 Hz quadrotor simulator. Training and
+planning run natively in Rust/Candle on NVIDIA CUDA; LeWM remains a separate,
+supported model family.
 
-The implementation is a clean-room Rust/Candle interpretation of the
-[SkyJEPA paper](https://arxiv.org/html/2606.23444) and is CUDA-oriented from
-training through candidate rollout and MPPI scoring. The
-[authors' repository](https://github.com/arplaboratory/SkyJEPA) did not contain
-model, training, data, or controller source when this implementation was
-written, so paper-omitted details are explicit below rather than represented as
-upstream parity.
+Three trained models complete every tracking case in the current simulator
+suite. Training reduces tracking error by about two-thirds versus random
+weights, and improves the hand-written controller's worst trajectory RMSE by
+26–34%. Each model took about 34 minutes to train on a shared RTX 4090.
 
-## Implemented pipeline
+## How the system works
 
-Stage one learns a latent dynamics model:
+| Component | Responsibility |
+| --- | --- |
+| Hand-written geometric controller | Uses current state and the desired path to propose thrust, attitude corrections and four rotor commands. |
+| SkyJEPA model and physics prober | Learn to predict motion under candidate rotor commands. |
+| MPPI planner | Samples alternatives around the proposed commands and uses predicted tracking cost to choose an action. |
+| Rotor simulator | Independently executes that action using rigid-body physics, motor lag and drag. |
+
+The geometric controller is code we wrote, not another trained network.
+It supplies basic stabilization and trajectory tracking. It receives full
+position, velocity, attitude and angular-rate state, nominal physics parameters,
+and a hover-thrust calibration. In the simulator, that calibration comes from
+the command that holds the randomized plant in hover.
+
+SkyJEPA supplies predictions to MPPI, which improves commands around that
+starting sequence. Learned dynamics residuals modify the predictor; MPPI's
+action corrections modify rotor commands. The simulator itself is not modified
+by learned residuals. The flight in the README shows this hybrid system.
+
+### Model and acceleration
+
+Stage one learns action-conditioned latent dynamics:
 
 ```text
-state history [B,10,18] -> causal residual TCN [8,8,16] -> linear -> latent24
-action windows [B,20,10,4] -> causal residual TCN [4,4,8]
-latent24 + action8 -> one-layer GRU unrolled for 20 steps -> predicted latent24
+state history [B,10,18] -> causal TCN [8,8,16] -> latent24
+action windows [B,20,10,4] -> causal TCN [4,4,8] -> action8
+latent24 + action8 -> GRU unrolled 20 steps -> predicted latent24
 loss = multi-step latent MSE + 0.02 * SIGReg
 ```
 
-Stage two freezes the complete stage-one path. A small prober maps each
-predicted latent to residual linear acceleration `[3]` and a latent-dependent
-angular action map `[3,4]`. A differentiable kinematic integrator propagates
-position, inertial velocity, rotation on SO(3), and body angular velocity. Only
-the prober parameters receive gradients in this stage.
+Stage two freezes the latent model. A small prober maps each predicted latent
+to a linear-acceleration residual [3] and an angular-action map [3,4].
+Known thrust/gravity and those learned outputs drive a differentiable integrator
+for position, velocity, SO(3) orientation and angular velocity. State-prediction
+loss backpropagates through integration into the prober.
 
-The control path encodes a state history once, flattens all sampled rolling
-action windows into one TCN batch, unrolls the GRU over the short horizon, and
-passes all candidates through the prober/integrator without a host-side sample
-loop. The native MPPI implementation supports a per-action noise vector and
-an optional shifted-residual warm start (`--warm-start shifted-residual`).
-The default is `fresh-prior`; carried residuals are bounded to +/-2 N per rotor,
-shifted only after executing an action, and cleared on reset. MPPI optimizes learned
-corrections around a trim-aware geometric flight prior instead of rediscovering
-basic stabilization from noise on every cycle. Prober training uses the fully
-differentiable Candle integrator; control uses an equivalent fused CUDA forward
-kernel that advances one complete candidate trajectory per thread.
+Planning uses an equivalent fused CUDA forward integrator: one thread advances
+a candidate trajectory. It has no backward implementation, because MPPI uses
+sampling and scoring rather than gradients. The independent rotor simulator
+also runs outside autodiff.
 
-The paper-derived defaults are:
+The runtime encodes state history once, batches candidate action windows into
+one TCN call, and keeps latent rollouts, metric rollouts, costs and MPPI weights
+on CUDA. Only the selected action sequence and optional single visualization
+path return to the CPU.
 
 | Setting | Value |
-| --- | ---: |
-| State / action dimensions | 18 / 4 |
-| State / action TCN channels | `[8,8,16]` / `[4,4,8]` |
-| Latent / GRU hidden size | 24 |
-| History / training rollout | 10 / 20 at 20 Hz |
-| Training epochs / batch | 50 / 2048 |
-| SIGReg knots / weight | 17 / 0.02 |
-| AdamW decay / gradient clip | `1e-5` / `0.5` |
-| LR schedule | 4k warmup to `5e-3`, 20k cosine to `1e-4` |
-| MPPI horizon / samples / dt | 15 / 512 / 0.05 s |
-| MPPI temperature | `1e-4` |
-| MPPI action noise scales | `[0.60,0.15,0.15,0.05]` |
-| State group weights | `[400,40,20,20]` |
-| Per-action weights | `[0.01,0.05,0.05,0.10]` |
+| --- | --- |
+| State / action | 18 values / 4 rotor forces |
+| History / training rollout | 10 / 20 steps at 20 Hz |
+| Latent / GRU width | 24 |
+| SIGReg | 17 knots, weight 0.02, 64 projections |
+| MPPI horizon / candidates | 15 steps (0.75 s) / 512 |
+| MPPI temperature / noise scales | `1e-4` / `[0.60,0.15,0.15,0.05]` |
+| State group / action cost weights | `[400,40,20,20]` / `[0.01,0.05,0.05,0.10]` |
 
-## Canonical dataset
+The selected learned-controller warm start is `fresh-prior`: build a new
+geometric command sequence each cycle. Optional `shifted-residual` carries
+the previous action correction, bounded to ±2 N, with a zero tail. It is
+activated only after execution and cleared on reset. Validation selected
+fresh-prior for trained/untrained MPPI and shifted-residual for nominal-physics
+MPPI.
 
-`lewm-generate-skyjepa` writes schema version 1:
+## Results
+
+Measurements below use training seeds 7, 17 and 29 on a shared RTX 4090
+(2026-09-05). Each model uses 1,000 latent updates and 5,000 prober updates,
+batch size 2,048. Training takes about 34 minutes per model, 102.47 minutes
+total. Checkpoint selection uses eight validation batches per epoch.
+
+The dataset has 2,000 ten-second trajectories across 100 physical domains,
+with two hover and eighteen moving trajectories per domain. Domain-disjoint
+80/10/10 splits yield 1,600 training, 200 validation and 200 test episodes.
+Training uses 4.44 simulated hours; the full dataset contains 5.56 hours.
+Overlapping training windows reuse those observations. These times and data
+volumes describe this experiment's budget; the learned objective is dynamics
+prediction rather than an RL policy.
+
+### Flight control
+
+Every exact-trim row measures the same 63 cases: hover, circle and figure-eight
+in 20 randomized domains plus a nominal anchor. MPPI uses 512 candidates,
+horizon 15 and 20 Hz control. Test-domain seed 271828 is separate from the
+warm-start validation seed 31415.
+
+| Controller | Tracking passes | Mean RMSE | Worst RMSE | Planning p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Hand-written controller | 63/63 | 0.2153 m | 0.5706 m | 0.0015 ms |
+| Random-weight model + MPPI | 51/63 | 0.6035 m | 1.8637 m | 8.931 ms |
+| SkyJEPA seed 7 + MPPI | 63/63 | 0.2009 m | 0.4024 m | 8.818 ms |
+| SkyJEPA seed 17 + MPPI | 63/63 | 0.2059 m | 0.4231 m | 8.936 ms |
+| SkyJEPA seed 29 + MPPI | 63/63 | 0.2029 m | 0.3781 m | 8.849 ms |
+| Nominal-physics MPPI | 63/63 | 0.1609 m | 0.3038 m | 3.215 ms |
+
+Training has a consistent positive effect across all three seeds. Relative to
+the hand-written controller alone, mean tracking RMSE improves by 4.4–6.7% and
+worst trajectory RMSE by 25.9–33.7%. Most of that benefit is in figure-eight
+tracking; the hand-written controller already hovers very accurately.
+
+Nominal-physics MPPI is the strongest mean-error/latency baseline here. It uses
+explicit rigid-body equations with nominal parameters, command-derived motor
+estimates and the same hover calibration. It does not receive the randomized
+plant's hidden parameters. All MPPI modes share the cost, candidate budget,
+geometric starting sequence and actuator bounds; only the prediction model and
+validation-selected warm-start strategy differ. The nonlearned/random baselines
+are measured once per condition, rather than treated as independent training seeds.
+
+The wider suite tests exact and ±10% hover calibration, plus mass 1.55–1.75×
+nominal and motor lag 0.11–0.14 s, outside training support. Each count below
+sums three models on the same 63 cases; the shift includes 60 shifted cases
+and three nominal anchors.
+
+| Condition | Trained tracking passes | Trained timing passes |
+| --- | ---: | ---: |
+| Exact calibration | 189/189 | 189/189 |
+| Calibration ×0.9 | 189/189 | 183/189 |
+| Calibration ×1.1 | 189/189 | 181/189 |
+| Mass/motor-lag shift | 189/189 | 188/189 |
+| Total | **756/756** | **741/756** |
+
+All trained flights complete without ground contact. Each trained model also
+fixes the hand-written controller's one tracking failure at calibration ×0.9.
+Under the mass/lag shift, mean error is 0.204–0.208 m versus the hand-written
+controller's 0.196 m; nominal-physics MPPI has the lowest mean error in every
+condition.
+
+Tracking requires finite state/actions, no ground contact, trajectory RMSE
+≤0.75 m and maximum position error ≤3 m. Timing is a separate per-case p95
+≤10 ms check. A report passes the combined gate when all nominal anchors pass,
+at least 95% of cases pass both checks and aggregate p95 is ≤10 ms.
+Two seed-29 reports, at perturbed trim, miss that combined gate on timing.
+
+None of the 1,512 final comparator runs records a 50 ms control-deadline miss.
+Other GPU workloads are recorded in the reports. Planning latency is measured
+after warm-up; simulator time does not model wall-clock scheduling overruns.
+
+### Prediction quality
+
+Each model is evaluated on all 26,400 valid windows from 200 held-out-domain
+test episodes and all 132,000 windows in each independent 1,000-episode
+in-range/shifted population. Those domains do not overlap training. The external
+in-range position-vector RMSE is:
+
+| Prediction horizon | Seed 7 | Seed 17 | Seed 29 | Constant velocity |
+| --- | ---: | ---: | ---: | ---: |
+| 0.25 s | 0.0398 m | 0.0562 m | 0.0372 m | 0.0515 m |
+| 0.75 s | 0.3697 m | 0.5639 m | 0.3633 m | 0.4353 m |
+| 1.00 s | 0.6360 m | 0.9994 m | 0.6346 m | 0.7400 m |
+| 3.00 s | 10.399 m | 12.277 m | 10.501 m | 3.300 m |
+
+Two seeds improve short-horizon prediction over constant velocity. Long
+uncorrected rollouts are the main model-quality weakness: all three lose the
+three-second comparison. Under shifted dynamics, one-second error is
+2.145–2.924 m versus 0.881 m for constant velocity.
+
+The controller succeeds with much shorter predictions: it looks 0.75 seconds
+ahead, applies one action and replans every 0.05 seconds with fresh state
+feedback. The next model-quality target is reducing accumulated prediction
+error; the next runtime target is tighter planning-latency tails.
+
+The [machine-readable results](../benchmarks/skyjepa/results.json) retain all
+24 control reports, nine prediction reports, individual seeds, paired
+comparisons, timing failures and artifact hashes. The
+[experiment protocol](../benchmarks/skyjepa/protocol.json) records the fixed
+training budgets, validation/test seeds and selection rules.
+
+## Dataset
+
+The canonical schema uses commanded rotor forces in newtons and state18 ordered
+as world position [3], world velocity [3], row-major world-from-body rotation [9]
+and body angular velocity [3]. Generated datasets contain:
 
 ```text
-metadata.json
+metadata.json       schema, rates, action semantics, counts and distribution
+domains.json        physical parameters for each domain
 data.h5
-  state           float32 [N,18]
-  action          float32 [N,4]
-  reference_state float32 [N,18]
-  motor_force     float32 [N,4]
-  episode_idx     int64   [N]
-  step_idx        int64   [N]
-  dt              float32 [N,1]
-  domain_idx      int64   [N]
-domains.json
+  state            float32 [N,18]
+  action           float32 [N,4]
+  reference_state  float32 [N,18]
+  motor_force      float32 [N,4]
+  episode_idx      int64   [N]
+  step_idx         int64   [N]
+  dt               float32 [N,1]
+  domain_idx       int64   [N]
 ```
 
-State order is position in world `[3]`, velocity in world `[3]`, row-major
-world-from-body rotation matrix `[9]`, and body angular velocity `[3]`. The
-canonical action is four commanded rotor forces in newtons. `metadata.json`
-declares the action space, dimensions, sample rate, row/episode counts, and
-schema version. Normalization is fit only on the training partition. The trainer
-defaults to deterministic, domain-disjoint 80/10/10 splits (`--split-by domains`);
-`--split-by episodes` is an explicit diagnostic alternative that can share
-physical domains across partitions. The model/controller rate is fixed at
-20 Hz. Higher-rate raw data must be explicitly strided to this rate.
+The plant models rotor allocation, first-order motor response, gyroscopic
+torque, angular damping, body-axis drag and SO(3) attitude integration.
+Generation runs trajectories in parallel and includes hover and moving flight
+in every domain. Physical parameters are randomized across domains.
 
-The loader can also compose state18 from the existing LeWM drone import. That
-legacy route must explicitly select `--action-space body-rates-throttle`; it is
-an adaptation route and not the canonical SkyJEPA rotor-force model.
+The required version-2 audit checks schema, finite values, trajectory indices,
+20 Hz sampling, valid rotations, tracking, ground contact, saturation and
+per-domain flight/rotor-excitation coverage. Its SHA-256 binds the data files;
+training rejects failed, missing or stale audits. Normalization is fitted on
+training domains and reused by the prober, evaluator and controller.
+Higher-rate raw data can be explicitly strided to 20 Hz. A separately tagged
+`body-rates-throttle` import path exists for LeWM drone logs; the experiments
+in this guide use the canonical rotor-force schema.
 
-Generate a small dataset first, then scale to the paper's 500 domains and
-20,000 ten-second trajectories. The commands below deliberately use a shell
-variable other than `HOME` so they are safe to paste into automation:
+## Training and evaluation
 
-```bash
-SKYJEPA_DATA="$HOME/.stable_worldmodel/le-wm-nv-data/skyjepa-domain-randomized-20hz"
-cargo run --release --locked --bin lewm-generate-skyjepa -- \
-  --output-dir "$SKYJEPA_DATA" \
-  --domains 500 \
-  --trajectories 20000 \
-  --duration-seconds 10
-
-cargo run --release --locked --bin lewm-audit-skyjepa -- \
-  --dataset-dir "$SKYJEPA_DATA" \
-  --output "$SKYJEPA_DATA/audit.json"
-```
-
-Generation is parallel across trajectories. Each domain samples the reported
-mass, inertia, motor-time-constant, drag, thrust, and torque ranges. The plant
-includes rotor allocation, first-order motor response, rigid-body angular
-dynamics, body-axis drag, and SO(3) attitude integration.
-
-The audit is a required training gate. It validates schema and shapes, finite
-values, episode/domain indices, sample interval, SO(3) orthogonality and
-determinant, reference tracking, ground contact, command saturation, per-rotor
-variance, rotor-about-collective variance, and within-episode command deltas.
-Audit version 2 also requires both hover and moving trajectories and adequate
-command excitation in every domain. Generator scheduling changes flight type
-on successive visits to a domain, avoiding domain/trajectory-type aliasing.
-It also records a SHA-256 fingerprint over the dataset artifact. Training
-refuses a failed, missing, or stale audit unless `--skip-audit` is explicitly
-used for a developer smoke test.
-
-## Train, evaluate, and simulate
-
-Train both stages on CUDA:
+Use Linux/NVIDIA with the repo's CUDA dependencies. The following commands
+create a new seed-7 experiment with the measured 1,000/5,000-update budget;
+choose an unused work directory. For a three-seed comparison, reuse the same
+dataset and repeat only the two training commands with seeds 17 and 29 and
+separate model directories.
 
 ```bash
-SKYJEPA_DATA="$HOME/.stable_worldmodel/le-wm-nv-data/skyjepa-domain-randomized-20hz"
-SKYJEPA_RUN="$HOME/.stable_worldmodel/le-wm-nv-runs/skyjepa-drone-state18-20hz"
-cargo run --release --locked --bin lewm-train-skyjepa -- \
-  --dataset-dir "$SKYJEPA_DATA" \
-  --output-dir "$SKYJEPA_RUN" \
-  --stage both \
-  --action-space rotor-forces
-```
+cargo build --release --locked --workspace
+SKYJEPA_WORK="$HOME/.stable_worldmodel/le-wm-nv-runs/skyjepa-example"
+SKYJEPA_DATA="$SKYJEPA_WORK/data"
+SKYJEPA_LATENT="$SKYJEPA_WORK/latent"
+SKYJEPA_RUN="$SKYJEPA_WORK/prober"
 
-For operational runs, the two stages may instead use independent step budgets
-and output directories. A standalone prober run copies the frozen latent model
-into its directory, producing a self-contained deployable checkpoint:
+target/release/lewm-generate-skyjepa \
+  --output-dir "$SKYJEPA_DATA" --seed 7 --domains 100 \
+  --trajectories 2000 --duration-seconds 10
+target/release/lewm-audit-skyjepa \
+  --dataset-dir "$SKYJEPA_DATA" --output "$SKYJEPA_DATA/audit.json"
 
-```bash
-SKYJEPA_DATA="$HOME/.stable_worldmodel/le-wm-nv-data/skyjepa-domain-randomized-20hz"
-SKYJEPA_LATENT="$HOME/.stable_worldmodel/le-wm-nv-runs/skyjepa-latent"
-SKYJEPA_RUN="$HOME/.stable_worldmodel/le-wm-nv-runs/skyjepa-prober"
-cargo run --release --locked --bin lewm-train-skyjepa -- \
+target/release/lewm-train-skyjepa \
   --dataset-dir "$SKYJEPA_DATA" --output-dir "$SKYJEPA_LATENT" \
-  --stage latent --batch-size 2048 --latent-max-steps 20000
-cargo run --release --locked --bin lewm-train-skyjepa -- \
+  --stage latent --seed 7 --split-by domains --batch-size 2048 \
+  --latent-max-steps 1000 --warmup-steps 200 --cosine-steps 800 \
+  --max-lr 0.005 --min-lr 0.0001
+target/release/lewm-train-skyjepa \
   --dataset-dir "$SKYJEPA_DATA" --output-dir "$SKYJEPA_RUN" \
-  --stage prober --batch-size 2048 --prober-max-steps 20000 \
-  --latent-checkpoint "$SKYJEPA_LATENT"
-```
+  --stage prober --latent-checkpoint "$SKYJEPA_LATENT" \
+  --seed 7 --split-by domains --batch-size 2048 \
+  --prober-max-steps 5000 --warmup-steps 500 --cosine-steps 4500 \
+  --max-lr 0.005 --min-lr 0.0001
 
-Deployable packages use version-2 `checkpoint.json` and content-addressed,
-immutable safetensors in `objects/`. The manifest binds architecture,
-normalization, timestep, action semantics, prober physics, latent ancestry and
-weight hashes. Controller/evaluator loading rejects incomplete, changed or
-loose legacy checkpoints. Historical artifacts remain untouched; these new
-tools do not automatically migrate them.
-
-Each training snapshot is a complete immutable generation under `snapshots/`:
-weights, optimizer, progress, numerical contract and metrics byte boundary.
-Atomic `{stage}-current.json` publication selects a complete generation; the
-previous one remains recoverable. Best-validation publication uses the same
-package contract. Restart an interrupted explicit stage with identical training
-arguments plus `--resume`. Changes to data, preprocessing, parent latent model,
-physics, loss, seed, batch size or optimizer schedule are rejected before any
-existing run is modified. A completed-stage resume can recover package export.
-
-`--stop-after-step N` pauses an explicit stage without changing its training
-target or adding artificial validation. Step-addressed SIGReg randomness and
-metrics-tail recovery make resumed updates bit-exact on the tested CUDA stack,
-including interruption across validation/epoch boundaries. This is not a
-cross-hardware or cross-library-version determinism guarantee.
-
-Report latent RMSE and metric position, velocity, attitude-geodesic, and angular
-velocity RMSE at each requested open-loop horizon:
-
-```bash
-cargo run --release --locked --bin lewm-eval-skyjepa -- \
-  --dataset-dir "$SKYJEPA_DATA" \
-  --checkpoint-dir "$SKYJEPA_RUN" \
-  --rollout-steps 60 \
-  --output "$SKYJEPA_RUN/eval-test-60.json"
-```
-
-Evaluation always uses the checkpoint's fixed training normalization, including
-when `--dataset-dir` points at independent data. For an external dataset, pass
-`--split all` to evaluate every valid window; the default `test` is only its
-held-out partition. Reports state actual episode/domain IDs, physical-domain
-overlap, artifact hashes, window counts and whether evaluation was truncated.
-Training-episode overlap is rejected. Independently sampled domains within
-training ranges are not automatically a distribution shift. Generate a named
-stress population with `--domain-distribution extended-mass-and-motor-lag` to
-place mass and motor lag outside training support. Reports
-include constant-velocity and zero-residual kinematic baselines so learned
-rollout error is not interpreted without context.
-
-Exercise the learned model in closed-loop MPPI against a held-out randomized
-rotor-force plant:
-
-```bash
-cargo run --release --locked --bin lewm-sim-skyjepa -- \
-  --checkpoint-dir "$SKYJEPA_RUN" \
-  --samples 512 \
-  --horizon 15 \
-  --randomize-domain
-```
-
-Gate nominal plus held-out hover, circle, and figure-eight scenarios and compare
-the learned corrections against the exact same flight prior:
-
-```bash
-cargo run --release --locked --bin lewm-bench-skyjepa -- \
+target/release/lewm-eval-skyjepa \
+  --dataset-dir "$SKYJEPA_DATA" --checkpoint-dir "$SKYJEPA_RUN" \
+  --split test --rollout-steps 60 --output "$SKYJEPA_RUN/eval.json"
+target/release/lewm-bench-skyjepa \
   --checkpoint-dir "$SKYJEPA_RUN" --controller trained-mppi \
-  --random-domains 20 --output "$SKYJEPA_RUN/bench-skyjepa.json"
-cargo run --release --locked --bin lewm-bench-skyjepa -- \
-  --checkpoint-dir "$SKYJEPA_RUN" --controller prior \
-  --random-domains 20 --output "$SKYJEPA_RUN/bench-prior.json"
+  --warm-start fresh-prior --samples 512 --horizon 15 \
+  --domain-seed 271828 --random-domains 20 --output "$SKYJEPA_RUN/control.json"
 ```
 
-Also compare `--controller nominal-physics-mppi` and `--controller untrained-mppi`.
-All MPPI modes share the candidate budget, cost, prior and actuator bounds.
-Nominal physics uses a fused CUDA rigid-body model with motor lag/drag and only
-nominal parameters, not hidden test-domain parameters. Untrained MPPI has the
-same architecture/normalization but fixed random weights (`--ablation-seed 7`).
-All modes use observed hover trim; `--trim-multiplier 0.9` or `1.1` perturbs
-calibration without falsifying observed command history. This remains a
-trim-initialized state-feedback test, not unknown-trim or visual flight.
+The evaluator reports every prediction horizon against constant-velocity and
+zero-residual kinematic baselines. Use `--split all` for an independent dataset;
+reports include actual episode/domain IDs, training overlap and population
+completeness. Generate out-of-support data with
+`--domain-distribution extended-mass-and-motor-lag`.
 
-Benchmark v2 reports tracking and timing separately, incomplete/failed runs,
-raw per-cycle planning times, p50/p95/p99/max, 10 ms budget exceedances and
-50 ms control-deadline misses. Checkpoint/executable hashes, full configuration
-and GPU/process snapshots accompany each result. Simulated time does not model
-wall-clock overruns; passing these gates is not hard real-time certification.
+The benchmark also accepts `--controller prior`, `untrained-mppi`, and
+`nominal-physics-mppi`. For the settings in the results above, use fresh-prior
+for trained/untrained modes, shifted-residual for nominal physics, and
+`--ablation-seed 7`. `--trim-multiplier 0.9` or `1.1` changes hover calibration
+without changing the model's observed action history. The shifted population
+uses `--domain-distribution extended-mass-and-motor-lag --domain-seed 90002`.
+Use a new output file per comparison. `--allow-fail` retains negative benchmark
+results without making the process exit unsuccessfully.
 
-Run the dedicated Bevy rotor-force simulator (the existing LeWM simulator is a
-different binary and remains available):
+### Checkpoints and resume
+
+A deployable prober directory is self-contained: version-2 `checkpoint.json`
+binds architecture, normalization, 20 Hz timing, action semantics, physics,
+latent ancestry and immutable hashed safetensors under `objects/`.
+Loading verifies that contract and the weight files.
+
+Snapshots under `snapshots/` contain weights, optimizer, progress and the
+committed metrics boundary. Atomic `{stage}-current.json` publication selects
+a complete generation; the previous generation remains recoverable. Export
+selects the best validation checkpoint. To resume an interrupted explicit
+stage, repeat its original command with `--resume`; incompatible settings are
+rejected before writes. `--stop-after-step N` deliberately pauses a stage while
+preserving its total budget. Resume equivalence is tested across validation
+and epoch boundaries on the same hardware/software environment.
+
+## Run the simulator
+
+Using the prober directory produced above:
 
 ```bash
-cargo run --release --locked -p lewm-drone-viewer \
-  --bin skyjepa-drone-sim -- \
-  --checkpoint-dir "$SKYJEPA_RUN" \
-  --scenario figure-eight --randomize-domain
+target/release/skyjepa-drone-sim \
+  --checkpoint-dir "$SKYJEPA_RUN" --scenario figure-eight \
+  --randomize-domain --domain-seed 31415 \
+  --samples 512 --horizon 15 --warm-start fresh-prior --time-scale 1
 ```
 
-The window shows actual, reference, and learned predicted paths, commanded rotor
-forces, prior action, learned action delta, CUDA plan latency, and tracking
-telemetry. Use `Space` to pause, `L` to toggle the controller (off applies the
-hover command; it is not a prior-only tracking comparison),
-`Backspace` to reset, `R` to randomize the plant, `1`/`2`/`3` to select
-hover/circle/figure-eight, and the free-camera mouse/keyboard controls to inspect
-the flight.
+Controls: `Space` pauses; `Backspace` resets; `R` randomizes the plant;
+`1`/`2`/`3` select hover/circle/figure-eight. `L` toggles the learned controller;
+off applies the hover command, so use the benchmark's `prior` mode for an
+actual hand-written-controller tracking comparison. Free-camera mouse/keyboard
+controls inspect the scene.
 
-Inference loads immutable safetensors directly rather than creating trainable
-variables. Candidate tensors, latent rollouts, metric rollouts, costs, MPPI
-weights, and selected actions remain on the Candle CUDA path until selection.
-The selected action sequence and optional single predicted path are copied to
-the host for control/visualization; the full candidate population is not.
+For a headless state/action trace:
 
-The simulator reports both cold-start and steady planning latency. NVRTC and
-library initialization make the first cycle intentionally visible in
-`mean_plan_ms`/`max_plan_ms`; `steady_mean_plan_ms`, p50, and p95 are the useful
-control-loop measures after that first compile cycle.
+```bash
+target/release/lewm-sim-skyjepa \
+  --checkpoint-dir "$SKYJEPA_RUN" --reference figure-eight \
+  --control-steps 400 --randomize-domain --domain-seed 31415 \
+  --output "$SKYJEPA_RUN/flight.json"
+```
 
-## Historical pilot evidence (2026-09-03)
+The README's [20-second MP4](skyjepa-v3-figure-eight.mp4) runs seed 7 with the
+settings above. Additional 20-second headless runs achieve 0.190 m circle RMSE
+and 0.293 m figure-eight RMSE, with no ground contact. The HUD shows commanded
+forces, prior action, learned correction, prediction and render-contended
+latency. Yellow is executed flight, cyan reference, magenta prediction, and
+green bars rotor commands.
 
-Current results are in [the corrected three-seed report](skyjepa-remediation-results.md),
-including nominal-physics/untrained baselines, trim stress, deliberate distribution
-shift, full-population prediction metrics and the
-[corrected simulator recording](skyjepa-v3-media.md) now shown in the README.
+The [GIF](skyjepa-v3-figure-eight.gif) is an eight-second excerpt (video seconds
+8–16), at normal speed, 800×500 and 10 fps. To regenerate it from the repo root:
 
-The results in this section and the preserved historical
-[MP4](skyjepa-trained-figure-eight.mp4)/[GIF](skyjepa-trained-figure-eight.gif)
-refer to the older checkpoint, not the corrected three-seed pilot.
-The historical episode-disjoint split shared
-physical domains, and a later audit found domain/flight-type coverage aliasing.
-The corrected generator, domain-disjoint splits, checkpoint/resume safeguards,
-and preregistered follow-up are documented in
-[skyjepa-remediation.md](skyjepa-remediation.md).
+```bash
+ffmpeg -hide_banner -loglevel warning -n \
+  -ss 8 -t 8 -i docs/skyjepa-v3-figure-eight.mp4 \
+  -filter_complex '[0:v]fps=10,scale=800:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=64:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle' \
+  -loop 0 /tmp/skyjepa-v3-preview.gif
+```
 
-The 2026-09-03 RTX 4090 pilot is an end-to-end implementation validation, not a
-claim of reproducing the authors' unreleased 20,000-trajectory checkpoint. It
-used 2,000 ten-second trajectories over 100 randomized domains (402,000 rows),
-a 1,000-step latent stage, and a 5,000-step prober stage. The accepted dataset
-fingerprint is
-`67928c082cb7fd627aa6132df8738a80cd5fed6aa778bce25d2be6c4a379a37d`.
+## Verification and implementation basis
 
-- Audit passed with `0.263 m` reference-position RMSE, zero ground contact,
-  rotor-about-collective standard deviations `0.273`-`0.275 N`, and command
-  delta standard deviations `0.0724`-`0.0727 N`.
-- The latent best validation loss was `0.2383`; all 24 latent dimensions were
-  active. The prober best validation loss was `0.07390`.
-- A separate 500-trajectory/100-domain artifact sampled within the training
-  parameter ranges passed the then-current audit. The original report evaluated
-  its test partition, not all 500 trajectories. At
-  5 steps (`0.25 s`), SkyJEPA position-vector RMSE was `0.0519 m` versus
-  `0.0535 m` for constant velocity. At 20 steps (`1.0 s`), it was `0.818 m`
-  versus `0.769 m`; at 60 steps it degraded to `10.30 m` versus `3.43 m`.
-  The pilot therefore validates the complete learned path but does not yet
-  establish superior long-horizon open-loop prediction.
-- Closed-loop gating at the paper's 512 samples/horizon 15 passed all 63
-  nominal and held-out-domain scenario runs. Aggregate p95 planning latency was
-  `8.69 ms`, worst trajectory RMSE `0.407 m`, and worst position error
-  `0.984 m`. The matched prior-only baseline passed 62/63, with worst RMSE
-  `0.888 m` and worst error `1.394 m`; learned corrections materially improved
-  the worst randomized case while mean RMSE moved from `0.2245` to `0.2210 m`.
+The current implementation passes 85 Rust tests and five local-uv protocol
+tests, covering checkpoints, resume, data contracts, CPU/CUDA integration
+agreement, controller comparisons and existing LeWM regressions:
 
-This historical control result did not isolate the benefit of learning against
-nominal-physics MPPI or untrained MPPI. The corrected experiment adds those
-comparators and imperfect-trim tests before making a stronger learning claim.
+```bash
+cargo test --locked --workspace -- --test-threads=1
+uv run --locked scripts/test_skyjepa_evaluation.py
+```
 
-## Explicit clean-room choices
+This implementation is built from the
+[SkyJEPA paper](https://arxiv.org/html/2606.23444), rather than translated from
+upstream source code. The [authors' project](https://github.com/arplaboratory/SkyJEPA)
+is the research reference. The paper supplies the state/action contract,
+encoder dimensions, latent/GRU size, two-stage objective, prober outputs,
+integration structure and MPPI settings. Repo-specific choices include:
 
-The following details are not specified by the paper or released source:
+- Two causal GELU convolutions per TCN residual block, kernel 3, exponential
+  dilation, residual projections and no dropout.
+- A two-hidden-layer, width-32 GELU prober and 64 SIGReg projections.
+- Rotation-matrix Frobenius attitude cost and a hand-written geometric
+  action prior.
+- Random-Fourier reference generation, a geometric data-collection tracker
+  with rotor excitation, and arm-length randomization of ±20%.
 
-- TCN blocks use two causal GELU Conv1d layers per level, residual projections,
-  kernel size 3, exponentially increasing dilation, and no dropout.
-- The prober is a two-hidden-layer GELU MLP with width 32 and a small-output
-  initialization. The paper specifies its outputs but not its internal layers.
-- SIGReg uses 64 projection directions. The paper gives 17 knots and weight
-  0.02, does not report projection count, and says the result is insensitive to
-  that count. This bounded choice avoids a very large `[T,B,M,17]` training
-  allocation at batch 2048.
-- Prober training defaults to 50 epochs because its epoch count is not reported.
-- Grouped attitude control cost uses squared rotation-matrix Frobenius error;
-  the paper reports the group weight but not the attitude error formula.
-- The paper defines actions as rotor forces but later describes PX4 deployment
-  using collective-thrust/body-rate commands. The canonical implementation
-  follows the mathematical rotor-force definition; the legacy loader retains a
-  separately tagged body-rate/throttle option.
-- The data generator uses a random-Fourier approximation of the reported
-  multi-periodic GP references and a geometric PD tracker with smooth action
-  excitation. It is dynamically valid and uses the paper's domain ranges, but
-  it is not claimed to reproduce the authors' unreleased NMPC/MPPI data
-  synthesis implementation.
-- Arm length is randomized ±20% because the methodology lists it as a domain
-  parameter but the parameter table omits its range.
+These choices describe the model we run. Its measured scope is state-feedback
+control in the rotor simulator; real-vehicle deployment requires its own
+validation. Python is used through local `uv` for experiment orchestration and
+analysis, while model training and the control runtime are Rust/CUDA.
 
-Python is not part of the SkyJEPA runtime or training path. The repository's
-existing `uv`-locked Python environment remains available for LeWM parity and
-analysis tooling; this implementation adds no Python sidecar.
+[Development history](skyjepa-history.md) preserves experiment decisions,
+lessons, artifact provenance and the workflow for extending this evaluation.
