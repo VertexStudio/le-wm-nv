@@ -1,0 +1,1850 @@
+{
+  "artifact_root": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3",
+  "training": [
+    {
+      "seed": 7,
+      "latent": {
+        "steps": 1000,
+        "best_step": 1000,
+        "best_validation": 0.25928357243537903,
+        "elapsed_seconds": 1724.665,
+        "validation_batches_per_epoch": 8,
+        "training_domains": 80,
+        "training_episodes": 1600,
+        "checkpoint_file_sha256": "d45057c5c514ae38e32cd9a3e6a9efd2598ca0926aaad51e89119d8101c7163b"
+      },
+      "prober": {
+        "steps": 5000,
+        "best_step": 4860,
+        "best_validation": 0.019534585997462273,
+        "elapsed_seconds": 343.128,
+        "validation_batches_per_epoch": 8,
+        "training_domains": 80,
+        "training_episodes": 1600,
+        "checkpoint_file_sha256": "cf97165c25a71906ce0cb8ae36ecbdcccc380137a7405dd83c38476550d660c6"
+      }
+    },
+    {
+      "seed": 17,
+      "latent": {
+        "steps": 1000,
+        "best_step": 1000,
+        "best_validation": 0.20871854200959206,
+        "elapsed_seconds": 1711.019,
+        "validation_batches_per_epoch": 8,
+        "training_domains": 80,
+        "training_episodes": 1600,
+        "checkpoint_file_sha256": "8e11f7dd301927d519a3c0bb027c759639dc9324e432ef5dcd2ef307b5bedff6"
+      },
+      "prober": {
+        "steps": 5000,
+        "best_step": 4320,
+        "best_validation": 0.02548578637652099,
+        "elapsed_seconds": 315.564,
+        "validation_batches_per_epoch": 8,
+        "training_domains": 80,
+        "training_episodes": 1600,
+        "checkpoint_file_sha256": "c2ceaf02cbf2f17ed8f056e130e8ce4c2cf94d07ef1447b9676e7911a4dd4f35"
+      }
+    },
+    {
+      "seed": 29,
+      "latent": {
+        "steps": 1000,
+        "best_step": 1000,
+        "best_validation": 0.22852230817079544,
+        "elapsed_seconds": 1740.367,
+        "validation_batches_per_epoch": 8,
+        "training_domains": 80,
+        "training_episodes": 1600,
+        "checkpoint_file_sha256": "c0062bfd56c44b124f106fbc91acdbd0abf81300e536b00c397aac2e2c7e149a"
+      },
+      "prober": {
+        "steps": 5000,
+        "best_step": 3915,
+        "best_validation": 0.01441259658895433,
+        "elapsed_seconds": 313.624,
+        "validation_batches_per_epoch": 8,
+        "training_domains": 80,
+        "training_episodes": 1600,
+        "checkpoint_file_sha256": "6723bf122bae3ac9a15d9a60e7e300d96921a4d585fba9b7eded78f4b124bdb7"
+      }
+    }
+  ],
+  "warm_start_selection": {
+    "selection": {
+      "prior": "fresh-prior",
+      "nominal-physics-mppi": "shifted-residual",
+      "untrained-mppi": "fresh-prior",
+      "trained-mppi": "fresh-prior"
+    },
+    "validation": {
+      "nominal-physics-mppi": {
+        "fresh-prior": {
+          "runs": 27,
+          "tracking": 27,
+          "timing": 27,
+          "complete": true,
+          "mean_rmse_m": 0.16913315261954306,
+          "worst_rmse_m": 0.3353273583314181,
+          "maximum_aggregate_p95_ms": 2.154474
+        },
+        "shifted-residual": {
+          "runs": 27,
+          "tracking": 27,
+          "timing": 27,
+          "complete": true,
+          "mean_rmse_m": 0.1575338527349079,
+          "worst_rmse_m": 0.280597741623933,
+          "maximum_aggregate_p95_ms": 3.10338
+        }
+      },
+      "untrained-mppi": {
+        "fresh-prior": {
+          "runs": 27,
+          "tracking": 24,
+          "timing": 27,
+          "complete": true,
+          "mean_rmse_m": 0.5047463474863042,
+          "worst_rmse_m": 1.0894394544203085,
+          "maximum_aggregate_p95_ms": 8.971332
+        },
+        "shifted-residual": {
+          "runs": 27,
+          "tracking": 4,
+          "timing": 27,
+          "complete": true,
+          "mean_rmse_m": 1.8131236945658966,
+          "worst_rmse_m": 9.741023255260986,
+          "maximum_aggregate_p95_ms": 9.237523
+        }
+      },
+      "trained-mppi": {
+        "fresh-prior": {
+          "runs": 81,
+          "tracking": 81,
+          "timing": 79,
+          "complete": true,
+          "mean_rmse_m": 0.2037239173529203,
+          "worst_rmse_m": 0.4029692551352978,
+          "maximum_aggregate_p95_ms": 9.169383999999999
+        },
+        "shifted-residual": {
+          "runs": 81,
+          "tracking": 81,
+          "timing": 81,
+          "complete": true,
+          "mean_rmse_m": 0.2196327145768925,
+          "worst_rmse_m": 0.42111192153153604,
+          "maximum_aggregate_p95_ms": 9.153713000000002
+        }
+      }
+    },
+    "baseline_reuse": {
+      "reused_for_training_seeds": [
+        7,
+        17,
+        29
+      ],
+      "executed_with_package_seed": 7,
+      "reason": "identical architecture, normalization and physics; untrained initialization seed fixed at 7; trained weights not used"
+    },
+    "rule": "shift only if complete, tracking/timing counts do not regress, p95<=10ms, mean RMSE improves >=1%, worst RMSE regresses <=5%; otherwise fresh",
+    "validation_domain_seed": 31415,
+    "final_test_domain_seed": 271828
+  },
+  "control": [
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-17_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "report_sha256": "21016456c0dfada337eb44bfccead12dd9fd51feed0eea1dc0b5b76ef5d43f20",
+      "training_seed": 17,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 0.9,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.36517275474903155,
+      "mean_randomized_rmse_m": 0.3652625470260806,
+      "worst_rmse_m": 0.5107234466596129,
+      "worst_error_m": 1.0550860755586962,
+      "aggregate_p95_plan_ms": 8.851639,
+      "aggregate_p99_plan_ms": 9.925711,
+      "maximum_plan_ms": 12.099889000000001,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 87,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "557be1ed8db19f1a551ed408bd228480babbbcbb0a74696ee1522cffdd970ba2",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-17_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "report_sha256": "d5e624edae2ffdc7c046f1a83bd43d3b23336564362748363e3452f138d5de73",
+      "training_seed": 17,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.20779588474785582,
+      "mean_randomized_rmse_m": 0.2088594493780005,
+      "worst_rmse_m": 0.3924010934943732,
+      "worst_error_m": 0.9239136069409155,
+      "aggregate_p95_plan_ms": 8.853888000000001,
+      "aggregate_p99_plan_ms": 9.832146999999999,
+      "maximum_plan_ms": 12.248789,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 85,
+      "maximum_planner_high_command_fraction": 0.025,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "557be1ed8db19f1a551ed408bd228480babbbcbb0a74696ee1522cffdd970ba2",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-17_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "report_sha256": "60c2c2fe1ab29d8ff9413b5b726f6622962927417b427e12a707e7c2be5202da",
+      "training_seed": 17,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.20586907759290277,
+      "mean_randomized_rmse_m": 0.20683630186529978,
+      "worst_rmse_m": 0.42305180846588436,
+      "worst_error_m": 0.9827198203418833,
+      "aggregate_p95_plan_ms": 8.93562,
+      "aggregate_p99_plan_ms": 9.994912999999999,
+      "maximum_plan_ms": 12.509854,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 97,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "557be1ed8db19f1a551ed408bd228480babbbcbb0a74696ee1522cffdd970ba2",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-17_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "report_sha256": "99a57178f0d7893895a5e37061c66830269271132e0d1f4b5ff9806cc168dafd",
+      "training_seed": 17,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.1,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 61,
+      "joint_successes": 61,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.3049025659394152,
+      "mean_randomized_rmse_m": 0.3054314814292296,
+      "worst_rmse_m": 0.4398154587652089,
+      "worst_error_m": 0.9349238969731472,
+      "aggregate_p95_plan_ms": 9.389889,
+      "aggregate_p99_plan_ms": 10.262829,
+      "maximum_plan_ms": 12.903998,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 160,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "557be1ed8db19f1a551ed408bd228480babbbcbb0a74696ee1522cffdd970ba2",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-29_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "report_sha256": "cd892c5dff242c76f6e32c642c0f63e213e27341b14f998f1753a17e3571e79b",
+      "training_seed": 29,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 0.9,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 57,
+      "joint_successes": 57,
+      "complete_runs": 63,
+      "gate_passed": false,
+      "mean_rmse_m": 0.38026943529598806,
+      "mean_randomized_rmse_m": 0.38031801540852567,
+      "worst_rmse_m": 0.506800382320481,
+      "worst_error_m": 1.0217317580275371,
+      "aggregate_p95_plan_ms": 9.530281,
+      "aggregate_p99_plan_ms": 10.569574,
+      "maximum_plan_ms": 13.538943,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 232,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "40fc58814c28dafc7ad811d17cfc6cf496af3c4e223c0497ed54cf8e4dee8181",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-29_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "report_sha256": "9023d0bfb507042b85de79ebcf010d54ed6432210a5170c741e41c13bea6d06a",
+      "training_seed": 29,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 62,
+      "joint_successes": 62,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.20633623827543207,
+      "mean_randomized_rmse_m": 0.20803740239658666,
+      "worst_rmse_m": 0.4015027897973153,
+      "worst_error_m": 0.9234743959288885,
+      "aggregate_p95_plan_ms": 9.092239000000001,
+      "aggregate_p99_plan_ms": 9.981968,
+      "maximum_plan_ms": 12.403209,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 98,
+      "maximum_planner_high_command_fraction": 0.034375,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "40fc58814c28dafc7ad811d17cfc6cf496af3c4e223c0497ed54cf8e4dee8181",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-29_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "report_sha256": "a1b6820de9ad45d30997ecb71305066846ddd7462e4d4d6d3a9dff001b519ad8",
+      "training_seed": 29,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.20294100867028278,
+      "mean_randomized_rmse_m": 0.2044724113111799,
+      "worst_rmse_m": 0.3781244712974484,
+      "worst_error_m": 0.9666737509142366,
+      "aggregate_p95_plan_ms": 8.849447,
+      "aggregate_p99_plan_ms": 9.817107,
+      "maximum_plan_ms": 13.558855999999999,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 76,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "40fc58814c28dafc7ad811d17cfc6cf496af3c4e223c0497ed54cf8e4dee8181",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-29_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "report_sha256": "a37060cf8030cc5ee6eb59ff153e6662db5ca944598bea7551b63f6f1f454401",
+      "training_seed": 29,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.1,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 59,
+      "joint_successes": 59,
+      "complete_runs": 63,
+      "gate_passed": false,
+      "mean_rmse_m": 0.30724323074947857,
+      "mean_randomized_rmse_m": 0.3081794260931177,
+      "worst_rmse_m": 0.42701431928172184,
+      "worst_error_m": 0.9411782356953594,
+      "aggregate_p95_plan_ms": 9.244368,
+      "aggregate_p99_plan_ms": 10.456054,
+      "maximum_plan_ms": 13.615066,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 195,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "40fc58814c28dafc7ad811d17cfc6cf496af3c4e223c0497ed54cf8e4dee8181",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_nominal-physics-mppi_shifted-residual_trim-0.9_training-ranges.json",
+      "report_sha256": "c98468e06eb54b629e175ea539d492e82446f9cf96ccf72fae03cf1eba656f67",
+      "training_seed": null,
+      "controller": "nominal_physics_mppi",
+      "warm_start": "shifted_residual",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 0.9,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.24703668085005848,
+      "mean_randomized_rmse_m": 0.24756625430240664,
+      "worst_rmse_m": 0.35173115591296744,
+      "worst_error_m": 0.9564585031209848,
+      "aggregate_p95_plan_ms": 3.029118,
+      "aggregate_p99_plan_ms": 4.5973180000000005,
+      "maximum_plan_ms": 5.458298,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 0,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_nominal-physics-mppi_shifted-residual_trim-1.0_extended-mass-and-motor-lag.json",
+      "report_sha256": "95bac56e2927a427143661af72ac2b0b362e8b788906b889202bb99529d927fe",
+      "training_seed": null,
+      "controller": "nominal_physics_mppi",
+      "warm_start": "shifted_residual",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.1567648189987788,
+      "mean_randomized_rmse_m": 0.15688738057599563,
+      "worst_rmse_m": 0.4083071431819041,
+      "worst_error_m": 0.8989405267262841,
+      "aggregate_p95_plan_ms": 2.128239,
+      "aggregate_p99_plan_ms": 4.62214,
+      "maximum_plan_ms": 5.741332,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 0,
+      "maximum_planner_high_command_fraction": 0.1328125,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_nominal-physics-mppi_shifted-residual_trim-1.0_training-ranges.json",
+      "report_sha256": "e770d5d1c21a7be705484a3eb209f7cc89d88bac0207aad5364b706743537a68",
+      "training_seed": null,
+      "controller": "nominal_physics_mppi",
+      "warm_start": "shifted_residual",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.16086280882548315,
+      "mean_randomized_rmse_m": 0.16119026989403518,
+      "worst_rmse_m": 0.30384771286354817,
+      "worst_error_m": 0.9128870908987006,
+      "aggregate_p95_plan_ms": 3.215299,
+      "aggregate_p99_plan_ms": 4.6801960000000005,
+      "maximum_plan_ms": 5.680567,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 0,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_nominal-physics-mppi_shifted-residual_trim-1.1_training-ranges.json",
+      "report_sha256": "751f8352b3ee6e5bd11a91e5cb3aed4c81e3e8cf5ed1c0e3bdaa90d6b4f97840",
+      "training_seed": null,
+      "controller": "nominal_physics_mppi",
+      "warm_start": "shifted_residual",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.1,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.2235179111358476,
+      "mean_randomized_rmse_m": 0.2238648181666197,
+      "worst_rmse_m": 0.3367617909857148,
+      "worst_error_m": 0.8819532562704749,
+      "aggregate_p95_plan_ms": 2.018481,
+      "aggregate_p99_plan_ms": 4.5328870000000006,
+      "maximum_plan_ms": 5.5849779999999996,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 0,
+      "maximum_planner_high_command_fraction": 0.0015625,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_prior_fresh-prior_trim-0.9_training-ranges.json",
+      "report_sha256": "8d1f25f1ee8ff557d8e2d02c5e92ff1589b1fe37b4725e2c51731b7256e2ba2e",
+      "training_seed": null,
+      "controller": "prior",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 0.9,
+      "runs": 63,
+      "tracking_successes": 62,
+      "timing_successes": 63,
+      "joint_successes": 62,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.4270208002100956,
+      "mean_randomized_rmse_m": 0.427542671026719,
+      "worst_rmse_m": 0.7958564705333329,
+      "worst_error_m": 1.136551088531837,
+      "aggregate_p95_plan_ms": 0.001493,
+      "aggregate_p99_plan_ms": 0.001573,
+      "maximum_plan_ms": 0.010529,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 0,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_prior_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "report_sha256": "09ec186378ccfc7d7a65303dad0a7ed175fd853c7a35ff4ea789b680af57cd24",
+      "training_seed": null,
+      "controller": "prior",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.19572751245152264,
+      "mean_randomized_rmse_m": 0.195102181481175,
+      "worst_rmse_m": 0.39421151493256545,
+      "worst_error_m": 0.9478748664503857,
+      "aggregate_p95_plan_ms": 0.001313,
+      "aggregate_p99_plan_ms": 0.001613,
+      "maximum_plan_ms": 0.011882,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 0,
+      "maximum_planner_high_command_fraction": 0.0265625,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_prior_fresh-prior_trim-1.0_training-ranges.json",
+      "report_sha256": "a990168471f021ed728ff2b3a5aec835d18a0c220d3508b8c79036adbf9825d5",
+      "training_seed": null,
+      "controller": "prior",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.21530748160927593,
+      "mean_randomized_rmse_m": 0.21566114909681594,
+      "worst_rmse_m": 0.5706313407303807,
+      "worst_error_m": 1.0748088774740092,
+      "aggregate_p95_plan_ms": 0.001533,
+      "aggregate_p99_plan_ms": 0.001634,
+      "maximum_plan_ms": 0.009288,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 0,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_prior_fresh-prior_trim-1.1_training-ranges.json",
+      "report_sha256": "9f91d2bb7be35cf1fbbcf9bfe2945c4de8a9282d45c20686d9a54cd5bad42414",
+      "training_seed": null,
+      "controller": "prior",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.1,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.3218140781344084,
+      "mean_randomized_rmse_m": 0.32182730685045263,
+      "worst_rmse_m": 0.4741711235599034,
+      "worst_error_m": 1.0310362745943666,
+      "aggregate_p95_plan_ms": 0.001563,
+      "aggregate_p99_plan_ms": 0.001663,
+      "maximum_plan_ms": 0.017683,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 0,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "report_sha256": "fb5ab2455291a62c170c558043a6544ebbe50817f0ccdc0c7ef9c758df99da87",
+      "training_seed": 7,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 0.9,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.38689983938022626,
+      "mean_randomized_rmse_m": 0.3884325848759327,
+      "worst_rmse_m": 0.5753782542806067,
+      "worst_error_m": 1.0415826836579687,
+      "aggregate_p95_plan_ms": 8.763943999999999,
+      "aggregate_p99_plan_ms": 9.740305,
+      "maximum_plan_ms": 11.701122,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 59,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "report_sha256": "d4a3bc4048ebd78d53f55780a24a8fea680b58e65f4194cc5d890d0c51942edd",
+      "training_seed": 7,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.20441065148900928,
+      "mean_randomized_rmse_m": 0.20591037641157742,
+      "worst_rmse_m": 0.40914461439260064,
+      "worst_error_m": 0.9459212064629496,
+      "aggregate_p95_plan_ms": 9.061955,
+      "aggregate_p99_plan_ms": 9.993949,
+      "maximum_plan_ms": 12.999314,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 100,
+      "maximum_planner_high_command_fraction": 0.0296875,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "report_sha256": "ad0528920f604dad2b84107052326004a23b1c8ee565d74d7e18f1eed8e0cb91",
+      "training_seed": 7,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 63,
+      "joint_successes": 63,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.2008608665910137,
+      "mean_randomized_rmse_m": 0.20218310226868205,
+      "worst_rmse_m": 0.4024484521850735,
+      "worst_error_m": 0.9808918750151544,
+      "aggregate_p95_plan_ms": 8.81821,
+      "aggregate_p99_plan_ms": 9.831586,
+      "maximum_plan_ms": 16.508877000000002,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 80,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "report_sha256": "33ba0cd2370d90ea3c90022c28b11c1d2d142b1c34ff185c391fc267e4f999d2",
+      "training_seed": 7,
+      "controller": "trained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.1,
+      "runs": 63,
+      "tracking_successes": 63,
+      "timing_successes": 61,
+      "joint_successes": 61,
+      "complete_runs": 63,
+      "gate_passed": true,
+      "mean_rmse_m": 0.3149188288738023,
+      "mean_randomized_rmse_m": 0.31547121087820823,
+      "worst_rmse_m": 0.4336694364768433,
+      "worst_error_m": 0.9318063929134226,
+      "aggregate_p95_plan_ms": 9.20127,
+      "aggregate_p99_plan_ms": 10.339548,
+      "maximum_plan_ms": 13.360092,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 152,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_untrained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "report_sha256": "7c30d4ad65e1cf4fe41e5c5e3d3ab7e1732f77ab7f58dcd5c6356b6558f19e6f",
+      "training_seed": null,
+      "controller": "untrained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 0.9,
+      "runs": 63,
+      "tracking_successes": 27,
+      "timing_successes": 63,
+      "joint_successes": 27,
+      "complete_runs": 63,
+      "gate_passed": false,
+      "mean_rmse_m": 0.922257646411074,
+      "mean_randomized_rmse_m": 0.9271629180959942,
+      "worst_rmse_m": 2.8906506459072987,
+      "worst_error_m": 4.797338492185351,
+      "aggregate_p95_plan_ms": 8.929134999999999,
+      "aggregate_p99_plan_ms": 9.797861,
+      "maximum_plan_ms": 11.885873,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 77,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 6,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_untrained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "report_sha256": "aec43525b911c90063562c1c2dfbb0277116445a499839096d082d22d3631f13",
+      "training_seed": null,
+      "controller": "untrained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 62,
+      "timing_successes": 61,
+      "joint_successes": 60,
+      "complete_runs": 63,
+      "gate_passed": false,
+      "mean_rmse_m": 0.4228762426114802,
+      "mean_randomized_rmse_m": 0.4286498147218263,
+      "worst_rmse_m": 1.2197849621008205,
+      "worst_error_m": 2.2137603152525283,
+      "aggregate_p95_plan_ms": 9.085208000000002,
+      "aggregate_p99_plan_ms": 10.051969,
+      "maximum_plan_ms": 12.822825,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 110,
+      "maximum_planner_high_command_fraction": 0.1171875,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 1,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_untrained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "report_sha256": "2070d11b0ec39a9b5882e14bfa1d12172e220cd26de638ead127a0fd718b1c36",
+      "training_seed": null,
+      "controller": "untrained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.0,
+      "runs": 63,
+      "tracking_successes": 51,
+      "timing_successes": 63,
+      "joint_successes": 51,
+      "complete_runs": 63,
+      "gate_passed": false,
+      "mean_rmse_m": 0.6034580982446576,
+      "mean_randomized_rmse_m": 0.6182607631366625,
+      "worst_rmse_m": 1.8636834613682776,
+      "worst_error_m": 3.324486507007672,
+      "aggregate_p95_plan_ms": 8.930962000000001,
+      "aggregate_p99_plan_ms": 10.055137,
+      "maximum_plan_ms": 11.944892000000001,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 114,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 1,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/test/seed-7_untrained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "report_sha256": "f8cf9822adff583387e7e0d53045e1b562c222fed84f66ec58ad30cb693d4438",
+      "training_seed": null,
+      "controller": "untrained_mppi",
+      "warm_start": "fresh_prior",
+      "domain_distribution": "training_ranges",
+      "trim_multiplier": 1.1,
+      "runs": 63,
+      "tracking_successes": 52,
+      "timing_successes": 62,
+      "joint_successes": 51,
+      "complete_runs": 63,
+      "gate_passed": false,
+      "mean_rmse_m": 0.580216908052472,
+      "mean_randomized_rmse_m": 0.580967836827898,
+      "worst_rmse_m": 1.4546350323559447,
+      "worst_error_m": 2.4406766839087357,
+      "aggregate_p95_plan_ms": 9.364765,
+      "aggregate_p99_plan_ms": 10.422977,
+      "maximum_plan_ms": 13.547977,
+      "control_deadline_misses": 0,
+      "planning_budget_exceedances": 172,
+      "maximum_planner_high_command_fraction": 0.0,
+      "maximum_plant_high_command_fraction": 0.0,
+      "ground_contact_runs": 0,
+      "nonfinite_runs": 0,
+      "errors": [],
+      "checkpoint_sha256": "57d4736929baef4389dd73cec9318933c416135cb0dd050eed93bc23670fccb7",
+      "executable_sha256": "9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89"
+    }
+  ],
+  "paired_control_comparisons": [
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.11813607389897308,
+      "lower_rmse_runs": 1,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.06184804546106403,
+      "lower_rmse_runs": 60,
+      "tracking_gains": 1,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.5570848916620424,
+      "lower_rmse_runs": 63,
+      "tracking_gains": 36,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.051031065749077016,
+      "lower_rmse_runs": 1,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.012068372296333183,
+      "lower_rmse_runs": 27,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.2150803578636244,
+      "lower_rmse_runs": 62,
+      "tracking_gains": 1,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.04500626876741963,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.009438404016373145,
+      "lower_rmse_runs": 31,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.3975890206517548,
+      "lower_rmse_runs": 62,
+      "tracking_gains": 12,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.08138465480356763,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.016911512194993157,
+      "lower_rmse_runs": 48,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-17_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.2753143421130567,
+      "lower_rmse_runs": 63,
+      "tracking_gains": 11,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.13323275444592955,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.046751364914107564,
+      "lower_rmse_runs": 52,
+      "tracking_gains": 1,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.541988211115086,
+      "lower_rmse_runs": 63,
+      "tracking_gains": 36,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.049571419276653254,
+      "lower_rmse_runs": 1,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.010608725823909424,
+      "lower_rmse_runs": 22,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.21654000433604817,
+      "lower_rmse_runs": 62,
+      "tracking_gains": 1,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.04207819984479963,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.012366472938993142,
+      "lower_rmse_runs": 30,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.40051708957437476,
+      "lower_rmse_runs": 62,
+      "tracking_gains": 12,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.08372531961363097,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.014570847384929808,
+      "lower_rmse_runs": 41,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-29_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.2729736773029934,
+      "lower_rmse_runs": 62,
+      "tracking_gains": 11,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.13986315853016776,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.04012096082986936,
+      "lower_rmse_runs": 52,
+      "tracking_gains": 1,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-0.9_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.5353578070308478,
+      "lower_rmse_runs": 63,
+      "tracking_gains": 36,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.04764583249023048,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.00868313903748665,
+      "lower_rmse_runs": 18,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.0_extended-mass-and-motor-lag.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.21846559112247094,
+      "lower_rmse_runs": 62,
+      "tracking_gains": 1,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.039998057765530566,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.014446615018262207,
+      "lower_rmse_runs": 31,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.0_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.4025972316536438,
+      "lower_rmse_runs": 62,
+      "tracking_gains": 12,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "nominal_physics_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": 0.09140091773795467,
+      "lower_rmse_runs": 0,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "prior",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.006895249260606108,
+      "lower_rmse_runs": 34,
+      "tracking_gains": 0,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    },
+    {
+      "trained_report": "seed-7_trained-mppi_fresh-prior_trim-1.1_training-ranges.json",
+      "baseline": "untrained_mppi",
+      "paired_runs": 63,
+      "mean_rmse_delta_m": -0.2652980791786697,
+      "lower_rmse_runs": 62,
+      "tracking_gains": 11,
+      "tracking_losses": 0,
+      "delta_direction": "trained minus baseline; negative is better"
+    }
+  ],
+  "open_loop": [
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-17_data-external.json",
+      "report_sha256": "9fcb5b1f11073c1457973a2895310eb4ebe638bf7b2f831571e31c3bebd8e4c6",
+      "windows": 132000,
+      "episodes": 1000,
+      "domains": 100,
+      "scope": "external_unseen_domains",
+      "domain_distribution": "training_ranges",
+      "dataset_artifact_sha256": "afbc11b19ce91cf60a4d600e5dd47f551f4974f03a9f99c22aff4199494c81b3",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.05623139684079583
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.5638854072313998
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.9994063971078722
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 12.27673158890756
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.05146935187213396
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.4353264947508145
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.739953075096771
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.300077652860496
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.12673347914597036
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 1.3315046133454984
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 2.4168562885310703
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 25.65204620472487
+        }
+      ]
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-17_data-pilot.json",
+      "report_sha256": "3944e6e033d4015702458cad301e12800c69bf20df16501c85fb0d397327db9f",
+      "windows": 26400,
+      "episodes": 200,
+      "domains": 10,
+      "scope": "held_out_domains",
+      "domain_distribution": null,
+      "dataset_artifact_sha256": "77acffd68edbe3d5b352bb290693bfa86ef80045554488f2c94c2aaed72e5fe0",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.03502262983990979
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.3383481853438632
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.5999939722432474
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 8.570778585588469
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.05367323923456599
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.4525030282889876
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.7668471649514652
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.3228175902008044
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.08611172874467381
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.9049368988697089
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 1.6521015929384992
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 20.412294902829196
+        }
+      ]
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-17_data-shift.json",
+      "report_sha256": "e80f1326f5d1a8dcd36a5281f2110433230ffa9b5f9b75676fe46e893a9fbc3c",
+      "windows": 132000,
+      "episodes": 1000,
+      "domains": 100,
+      "scope": "external_unseen_domains",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "dataset_artifact_sha256": "709ffc3eec7ee96280eba0382c5015a7d822dafaae7e990220a85e9e116fb3bb",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.15674332984694156
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 1.6352507824130929
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 2.92362200047552
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 26.377076104802956
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.06260802381368503
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.5230135632296429
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.8805189107438142
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.655064753220803
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.26954187561375287
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 2.8391062287137916
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 5.142523812124757
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 50.363856198910895
+        }
+      ]
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-29_data-external.json",
+      "report_sha256": "2b6e077cc9616dc379f11fc978cbc3bfb9991790aaa01d0ca0637b247cf67924",
+      "windows": 132000,
+      "episodes": 1000,
+      "domains": 100,
+      "scope": "external_unseen_domains",
+      "domain_distribution": "training_ranges",
+      "dataset_artifact_sha256": "afbc11b19ce91cf60a4d600e5dd47f551f4974f03a9f99c22aff4199494c81b3",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.03715099954131184
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.3633171642843942
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.634639392950849
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 10.501127964455392
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.05146935187213396
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.4353264947508145
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.739953075096771
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.300077652860496
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.12673347914597036
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 1.3315046133454984
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 2.4168562885310703
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 25.65204620472487
+        }
+      ]
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-29_data-pilot.json",
+      "report_sha256": "dcf8a98cd99b079cb52849ff5de8f52c96933a1a0c9f6afa2313b04dbd4f96bc",
+      "windows": 26400,
+      "episodes": 200,
+      "domains": 10,
+      "scope": "held_out_domains",
+      "domain_distribution": null,
+      "dataset_artifact_sha256": "77acffd68edbe3d5b352bb290693bfa86ef80045554488f2c94c2aaed72e5fe0",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.02625189432172521
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.2574340692088077
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.4694887774289941
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 8.066454971462596
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.05367323923456599
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.4525030282889876
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.7668471649514652
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.3228175902008044
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.08611172874467381
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.9049368988697089
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 1.6521015929384992
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 20.412294902829196
+        }
+      ]
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-29_data-shift.json",
+      "report_sha256": "336d0e43f809e3f675d08d6da1cd1712fdb7b0eaef540c87bc46faf7c717c5c4",
+      "windows": 132000,
+      "episodes": 1000,
+      "domains": 100,
+      "scope": "external_unseen_domains",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "dataset_artifact_sha256": "709ffc3eec7ee96280eba0382c5015a7d822dafaae7e990220a85e9e116fb3bb",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.11587914192440722
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 1.210661615952205
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 2.1509622032658737
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 21.548640127713604
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.06260802381368503
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.5230135632296429
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.8805189107438142
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.655064753220803
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.26954187561375287
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 2.8391062287137916
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 5.142523812124757
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 50.363856198910895
+        }
+      ]
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-7_data-external.json",
+      "report_sha256": "23bb1cbcd4bc768e45cd847e38f0390435e9ca8802083527e860dd043c06a610",
+      "windows": 132000,
+      "episodes": 1000,
+      "domains": 100,
+      "scope": "external_unseen_domains",
+      "domain_distribution": "training_ranges",
+      "dataset_artifact_sha256": "afbc11b19ce91cf60a4d600e5dd47f551f4974f03a9f99c22aff4199494c81b3",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.039755906404135295
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.3696527030358656
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.636007338065599
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 10.398945170090656
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.05146935187213396
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.4353264947508145
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.739953075096771
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.300077652860496
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.12673347914597036
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 1.3315046133454984
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 2.4168562885310703
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 25.65204620472487
+        }
+      ]
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-7_data-pilot.json",
+      "report_sha256": "b0857503a21e5e06419776057cb12e16d47254f509703d9bc1e4e978954e5ed4",
+      "windows": 26400,
+      "episodes": 200,
+      "domains": 10,
+      "scope": "held_out_domains",
+      "domain_distribution": null,
+      "dataset_artifact_sha256": "77acffd68edbe3d5b352bb290693bfa86ef80045554488f2c94c2aaed72e5fe0",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.030480711432702833
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.2859522839626904
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.5106550643971001
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 8.164866279715412
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.05367323923456599
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.4525030282889876
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.7668471649514652
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.3228175902008044
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.08611172874467381
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.9049368988697089
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 1.6521015929384992
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 20.412294902829196
+        }
+      ]
+    },
+    {
+      "file": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/open-loop/seed-7_data-shift.json",
+      "report_sha256": "041ca65ebdf55ad839e730f4e85cf4d556a9586221e8f285c5d788f5b0bea434",
+      "windows": 132000,
+      "episodes": 1000,
+      "domains": 100,
+      "scope": "external_unseen_domains",
+      "domain_distribution": "extended_mass_and_motor_lag",
+      "dataset_artifact_sha256": "709ffc3eec7ee96280eba0382c5015a7d822dafaae7e990220a85e9e116fb3bb",
+      "skyjepa": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.11641006403841708
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 1.210826174799249
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 2.1449785814482727
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 21.260222657119186
+        }
+      ],
+      "constant_velocity": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.06260802381368503
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 0.5230135632296429
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 0.8805189107438142
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 3.655064753220803
+        }
+      ],
+      "kinematic": [
+        {
+          "seconds": 0.25,
+          "position_vector_rmse_m": 0.26954187561375287
+        },
+        {
+          "seconds": 0.75,
+          "position_vector_rmse_m": 2.8391062287137916
+        },
+        {
+          "seconds": 1.0,
+          "position_vector_rmse_m": 5.142523812124757
+        },
+        {
+          "seconds": 3.0,
+          "position_vector_rmse_m": 50.363856198910895
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "three training seeds are not a large-scale statistical study",
+    "prior/nominal/fixed-random baselines are measured once per condition, not three independent seeds",
+    "simulator supplies a hover-initialized state and observed trim; trim stress is +/-10%",
+    "timing is measured on a shared RTX 4090; other GPU workloads are retained",
+    "simulated time does not model real-time scheduling overruns",
+    "not upstream source parity, paper-scale reproduction, real flight or sim-to-real validation"
+  ]
+}
