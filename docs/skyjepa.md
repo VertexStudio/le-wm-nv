@@ -252,7 +252,8 @@ cargo run --release --locked -p lewm-drone-viewer \
 
 The window shows actual, reference, and learned predicted paths, commanded rotor
 forces, prior action, learned action delta, CUDA plan latency, and tracking
-telemetry. Use `Space` to pause, `L` to toggle the learned prediction trail,
+telemetry. Use `Space` to pause, `L` to toggle the controller (off applies the
+hover command; it is not a prior-only tracking comparison),
 `Backspace` to reset, `R` to randomize the plant, `1`/`2`/`3` to select
 hover/circle/figure-eight, and the free-camera mouse/keyboard controls to inspect
 the flight.
