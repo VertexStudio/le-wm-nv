@@ -201,3 +201,28 @@ prober 5,000 steps in 343.128 seconds. Best latent validation prediction loss
 per epoch, not the complete validation population. Follow-up open-loop evaluation
 will cover the complete selected test populations. These validation numbers are
 not directly comparable to the historical pilot's different preprocessing/split.
+
+The final implementation verification log is `workspace-tests.log` in the
+artifact root: 85 Rust tests pass, plus five local-uv protocol/summary tests.
+Clippy completes with existing warnings outside the newly introduced code.
+Evaluation uses frozen binaries with SHA-256:
+
+- Benchmark: `56462cf55bdaf2c96e42b830632d9e61f61608509996787764308c8839969c3c`
+- Open-loop evaluator: `e93a75b0aaaff2725bef0026d18db0dc4079b49f918c185cc28190c89afcae3a`
+- Headless simulator: `2a1c09f5c84cb76dd3c654f33ce6fb3778c2805832ad9bcfc5cdbbb97fcdf87d`
+
+Seed 7's complete open-loop populations are evaluated: 26,400 windows from
+200 held-out-domain pilot episodes, plus 132,000 windows from each 1,000-episode
+external population. On fresh in-range domains, learned versus constant-velocity
+position-vector RMSE is 0.0398/0.0515 m at 0.25 s, 0.6360/0.7400 m at 1 s,
+and 10.399/3.300 m at 3 s. Under deliberate mass/lag shift, it is
+0.1164/0.0626 m, 2.1450/0.8805 m and 21.260/3.655 m respectively. Thus the first
+seed improves short-horizon in-range prediction but fails long-horizon and
+shifted-dynamics comparisons. Other seeds and all control comparisons remain
+pending; these are not promoted as final multi-seed results.
+
+A preliminary seed-7, fresh-prior figure-eight simulation (raw domain seed
+31415, 160 control steps) completes with finite state, no ground contact,
+0.3682 m position-vector RMSE and 0.9320 m maximum error. Its full trace is in
+`simulation/preliminary-seed-7-figure-eight.json`. It ran alongside training:
+its 17.49 ms p95 is explicitly contention-affected and excluded from timing gates.
