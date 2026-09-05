@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, time::Instant};
 use anyhow::{Context, ensure};
 use clap::{Parser, ValueEnum};
 use le_wm_nv::{
-    models::skyjepa::{SkyJepaControllerSession, SkyJepaSessionConfig},
+    models::skyjepa::{SkyJepaControllerSession, SkyJepaSessionConfig, SkyJepaWarmStart},
     runtime::DeviceSpec,
     skyjepa_sim::{SkyJepaDomain, SkyJepaRotorPlant, SkyJepaRotorState},
     skyjepa_task::{
@@ -48,6 +48,9 @@ struct Args {
 
     #[arg(long, default_value_t = 7)]
     planner_seed: u64,
+
+    #[arg(long, value_enum, default_value_t = SkyJepaWarmStart::FreshPrior)]
+    warm_start: SkyJepaWarmStart,
 
     /// `prior` runs the same trim-aware geometric sequence without learned
     /// MPPI corrections, providing an apples-to-apples control baseline.
@@ -104,6 +107,7 @@ struct ScenarioResult {
 
 #[derive(Debug, Serialize)]
 struct BenchmarkReport {
+    warm_start: SkyJepaWarmStart,
     passed: bool,
     controller: ControllerMode,
     checkpoint_dir: PathBuf,
@@ -136,6 +140,8 @@ fn main() -> anyhow::Result<()> {
             samples: args.samples,
             horizon: args.horizon,
             planner_seed: args.planner_seed,
+            warm_start: args.warm_start,
+            ..SkyJepaSessionConfig::default()
         },
         initial_state,
     )?;
@@ -216,6 +222,7 @@ fn main() -> anyhow::Result<()> {
         ));
     }
     let report = BenchmarkReport {
+        warm_start: args.warm_start,
         passed: failures.is_empty(),
         controller: args.controller,
         checkpoint_dir: fs::canonicalize(&args.checkpoint_dir)

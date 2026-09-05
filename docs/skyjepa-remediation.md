@@ -114,3 +114,19 @@ episode overlap with either stage. A batch-limited report is explicitly marked
 incomplete. The integration test verifies domain-disjoint splits, full external
 evaluation, overlap rejection, and accurate reporting of truncated evaluation.
 All four trainer/evaluator integration tests and existing data/package tests pass.
+
+Warm-start comparison support is implemented but no default change is promoted:
+`--warm-start fresh-prior` remains the default; `shifted-residual` carries the
+previous correction around the new geometric prior, bounded to +/-2 N per rotor
+with a zero tail and actuator clamping. A correction becomes active only after
+the action is committed, and reset clears it. CPU tensor regression and workspace
+checks pass. The validation comparison will run after training, without GPU
+training contention, before any final-test evaluation.
+
+The pilot runner uses a frozen trainer binary with SHA-256
+`057571a4afa52cde3ae5c4b258c18536716f91c4f60ab601286074244804096d`
+(training source at `1711787`; runner committed at `2d6295c`). Runtime
+`git_commit` fields describe the invocation checkout; the frozen executable hash
+is the authority for this experiment's training implementation. Training started
+with approximately 11 GiB GPU memory occupied by other workloads, including
+Isaac Sim; those workloads were left untouched.

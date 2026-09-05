@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, time::Instant};
 use anyhow::{Context, ensure};
 use clap::Parser;
 use le_wm_nv::{
-    models::skyjepa::{SkyJepaControllerSession, SkyJepaSessionConfig},
+    models::skyjepa::{SkyJepaControllerSession, SkyJepaSessionConfig, SkyJepaWarmStart},
     runtime::DeviceSpec,
     skyjepa_sim::{SkyJepaDomain, SkyJepaRotorPlant, SkyJepaRotorState},
     skyjepa_task::{SkyJepaReferenceKind, skyjepa_reference_horizon, skyjepa_reference_state},
@@ -27,6 +27,9 @@ struct Args {
 
     #[arg(long, default_value_t = 15)]
     horizon: usize,
+
+    #[arg(long, value_enum, default_value_t = SkyJepaWarmStart::FreshPrior)]
+    warm_start: SkyJepaWarmStart,
 
     #[arg(long, default_value_t = 200)]
     simulation_rate_hz: usize,
@@ -101,6 +104,8 @@ fn main() -> anyhow::Result<()> {
         samples: args.samples,
         horizon: args.horizon,
         planner_seed: args.planner_seed,
+        warm_start: args.warm_start,
+        ..SkyJepaSessionConfig::default()
     };
     let mut controller =
         SkyJepaControllerSession::load(&checkpoint_dir, device, session_cfg, plant.state())?;

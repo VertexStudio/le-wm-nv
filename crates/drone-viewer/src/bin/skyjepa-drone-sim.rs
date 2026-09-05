@@ -7,7 +7,7 @@ use bevy::{
 };
 use bevy_camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState};
 use le_wm_nv::{
-    models::skyjepa::{SkyJepaControllerSession, SkyJepaSessionConfig},
+    models::skyjepa::{SkyJepaControllerSession, SkyJepaSessionConfig, SkyJepaWarmStart},
     runtime::DeviceSpec,
     skyjepa_sim::{SkyJepaDomain, SkyJepaRotorPlant, SkyJepaRotorState},
     skyjepa_task::{SkyJepaReferenceKind, skyjepa_reference_horizon, skyjepa_reference_state},
@@ -32,6 +32,8 @@ fn main() -> anyhow::Result<()> {
             samples: args.samples,
             horizon: args.horizon,
             planner_seed: args.planner_seed,
+            warm_start: args.warm_start,
+            ..SkyJepaSessionConfig::default()
         },
         initial_state,
     )?;
@@ -91,6 +93,7 @@ struct Args {
     samples: usize,
     horizon: usize,
     planner_seed: u64,
+    warm_start: SkyJepaWarmStart,
     randomize_domain: bool,
     domain_seed: u64,
     simulation_rate_hz: usize,
@@ -109,6 +112,7 @@ impl Args {
             samples: 512,
             horizon: 15,
             planner_seed: 7,
+            warm_start: SkyJepaWarmStart::FreshPrior,
             randomize_domain: false,
             domain_seed: 9001,
             simulation_rate_hz: 200,
@@ -126,6 +130,13 @@ impl Args {
                 "--samples" => args.samples = next_parse(&mut iter, &flag)?,
                 "--horizon" => args.horizon = next_parse(&mut iter, &flag)?,
                 "--planner-seed" => args.planner_seed = next_parse(&mut iter, &flag)?,
+                "--warm-start" => {
+                    args.warm_start = match iter.next().as_deref() {
+                        Some("fresh-prior") => SkyJepaWarmStart::FreshPrior,
+                        Some("shifted-residual") => SkyJepaWarmStart::ShiftedResidual,
+                        _ => anyhow::bail!("--warm-start requires fresh-prior or shifted-residual"),
+                    };
+                }
                 "--randomize-domain" => args.randomize_domain = true,
                 "--domain-seed" => args.domain_seed = next_parse(&mut iter, &flag)?,
                 "--simulation-rate-hz" => args.simulation_rate_hz = next_parse(&mut iter, &flag)?,

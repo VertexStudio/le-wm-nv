@@ -18,7 +18,9 @@ pub use prober::{
     SkyJepaProber, SkyJepaProberConfig, SkyJepaProberLoss, SkyJepaProberLossScalars,
     SkyJepaProberOutput, skyjepa_prober_loss,
 };
-pub use session::{SkyJepaControllerPlan, SkyJepaControllerSession, SkyJepaSessionConfig};
+pub use session::{
+    SkyJepaControllerPlan, SkyJepaControllerSession, SkyJepaSessionConfig, SkyJepaWarmStart,
+};
 pub use tcn::TemporalConvEncoder;
 pub use training::{
     SKYJEPA_SIGREG_KNOTS, SKYJEPA_SIGREG_NUM_PROJ, SKYJEPA_SIGREG_WEIGHT, SkyJepaBatchLoss,
