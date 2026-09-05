@@ -208,6 +208,7 @@ fn print_help() {
          --device <cuda[:idx]>        default cuda:0\n\
          --samples <n>                MPPI samples, default 512\n\
          --horizon <n>                MPPI horizon, default 15\n\
+         --warm-start <mode>          fresh-prior (default) or shifted-residual\n\
          --scenario <name>            hover, circle, or figure-eight\n\
          --radius-m <meters>           default 2\n\
          --period-seconds <seconds>    default 8\n\

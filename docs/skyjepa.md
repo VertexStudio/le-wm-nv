@@ -35,7 +35,9 @@ The control path encodes a state history once, flattens all sampled rolling
 action windows into one TCN batch, unrolls the GRU over the short horizon, and
 passes all candidates through the prober/integrator without a host-side sample
 loop. The native MPPI implementation supports a per-action noise vector and
-persists a shifted warm start between control cycles. MPPI optimizes learned
+an optional shifted-residual warm start (`--warm-start shifted-residual`).
+The default is `fresh-prior`; carried residuals are bounded to +/-2 N per rotor,
+shifted only after executing an action, and cleared on reset. MPPI optimizes learned
 corrections around a trim-aware geometric flight prior instead of rediscovering
 basic stabilization from noise on every cycle. Prober training uses the fully
 differentiable Candle integrator; control uses an equivalent fused CUDA forward
@@ -81,8 +83,11 @@ State order is position in world `[3]`, velocity in world `[3]`, row-major
 world-from-body rotation matrix `[9]`, and body angular velocity `[3]`. The
 canonical action is four commanded rotor forces in newtons. `metadata.json`
 declares the action space, dimensions, sample rate, row/episode counts, and
-schema version. Normalization is fit only on training episodes, and deterministic
-episode splits are 80/10/10.
+schema version. Normalization is fit only on the training partition. The trainer
+defaults to deterministic, domain-disjoint 80/10/10 splits (`--split-by domains`);
+`--split-by episodes` is an explicit diagnostic alternative that can share
+physical domains across partitions. The model/controller rate is fixed at
+20 Hz. Higher-rate raw data must be explicitly strided to this rate.
 
 The loader can also compose state18 from the existing LeWM drone import. That
 legacy route must explicitly select `--action-space body-rates-throttle`; it is
@@ -114,6 +119,9 @@ The audit is a required training gate. It validates schema and shapes, finite
 values, episode/domain indices, sample interval, SO(3) orthogonality and
 determinant, reference tracking, ground contact, command saturation, per-rotor
 variance, rotor-about-collective variance, and within-episode command deltas.
+Audit version 2 also requires both hover and moving trajectories and adequate
+command excitation in every domain. Generator scheduling changes flight type
+on successive visits to a domain, avoiding domain/trajectory-type aliasing.
 It also records a SHA-256 fingerprint over the dataset artifact. Training
 refuses a failed, missing, or stale audit unless `--skip-audit` is explicitly
 used for a developer smoke test.
@@ -149,12 +157,27 @@ cargo run --release --locked --bin lewm-train-skyjepa -- \
   --latent-checkpoint "$SKYJEPA_LATENT"
 ```
 
-Each stage writes latest weights, optimizer state, deterministic global step,
-best-validation weights, and JSONL metrics through atomic file replacement.
-The best checkpoint is promoted to `latent.safetensors` or
-`prober.safetensors`. Restart an interrupted explicit stage with the same
-arguments plus `--resume`; the run manifest rejects a changed dataset,
-normalization, model, seed, batch size, or optimizer schedule.
+Deployable packages use version-2 `checkpoint.json` and content-addressed,
+immutable safetensors in `objects/`. The manifest binds architecture,
+normalization, timestep, action semantics, prober physics, latent ancestry and
+weight hashes. Controller/evaluator loading rejects incomplete, changed or
+loose legacy checkpoints. Historical artifacts remain untouched; these new
+tools do not automatically migrate them.
+
+Each training snapshot is a complete immutable generation under `snapshots/`:
+weights, optimizer, progress, numerical contract and metrics byte boundary.
+Atomic `{stage}-current.json` publication selects a complete generation; the
+previous one remains recoverable. Best-validation publication uses the same
+package contract. Restart an interrupted explicit stage with identical training
+arguments plus `--resume`. Changes to data, preprocessing, parent latent model,
+physics, loss, seed, batch size or optimizer schedule are rejected before any
+existing run is modified. A completed-stage resume can recover package export.
+
+`--stop-after-step N` pauses an explicit stage without changing its training
+target or adding artificial validation. Step-addressed SIGReg randomness and
+metrics-tail recovery make resumed updates bit-exact on the tested CUDA stack,
+including interruption across validation/epoch boundaries. This is not a
+cross-hardware or cross-library-version determinism guarantee.
 
 Report latent RMSE and metric position, velocity, attitude-geodesic, and angular
 velocity RMSE at each requested open-loop horizon:
@@ -168,7 +191,14 @@ cargo run --release --locked --bin lewm-eval-skyjepa -- \
 ```
 
 Evaluation always uses the checkpoint's fixed training normalization, including
-when `--dataset-dir` points at an independently generated OOD dataset. Reports
+when `--dataset-dir` points at independent data. For an external dataset, pass
+`--split all` to evaluate every valid window; the default `test` is only its
+held-out partition. Reports state actual episode/domain IDs, physical-domain
+overlap, artifact hashes, window counts and whether evaluation was truncated.
+Training-episode overlap is rejected. Independently sampled domains within
+training ranges are not automatically a distribution shift. Generate a named
+stress population with `--domain-distribution extended-mass-and-motor-lag` to
+place mass and motor lag outside training support. Reports
 include constant-velocity and zero-residual kinematic baselines so learned
 rollout error is not interpreted without context.
 
@@ -188,12 +218,27 @@ the learned corrections against the exact same flight prior:
 
 ```bash
 cargo run --release --locked --bin lewm-bench-skyjepa -- \
-  --checkpoint-dir "$SKYJEPA_RUN" --controller sky-jepa \
+  --checkpoint-dir "$SKYJEPA_RUN" --controller trained-mppi \
   --random-domains 20 --output "$SKYJEPA_RUN/bench-skyjepa.json"
 cargo run --release --locked --bin lewm-bench-skyjepa -- \
   --checkpoint-dir "$SKYJEPA_RUN" --controller prior \
   --random-domains 20 --output "$SKYJEPA_RUN/bench-prior.json"
 ```
+
+Also compare `--controller nominal-physics-mppi` and `--controller untrained-mppi`.
+All MPPI modes share the candidate budget, cost, prior and actuator bounds.
+Nominal physics uses a fused CUDA rigid-body model with motor lag/drag and only
+nominal parameters, not hidden test-domain parameters. Untrained MPPI has the
+same architecture/normalization but fixed random weights (`--ablation-seed 7`).
+All modes use observed hover trim; `--trim-multiplier 0.9` or `1.1` perturbs
+calibration without falsifying observed command history. This remains a
+trim-initialized state-feedback test, not unknown-trim or visual flight.
+
+Benchmark v2 reports tracking and timing separately, incomplete/failed runs,
+raw per-cycle planning times, p50/p95/p99/max, 10 ms budget exceedances and
+50 ms control-deadline misses. Checkpoint/executable hashes, full configuration
+and GPU/process snapshots accompany each result. Simulated time does not model
+wall-clock overruns; passing these gates is not hard real-time certification.
 
 Run the dedicated Bevy rotor-force simulator (the existing LeWM simulator is a
 different binary and remains available):
@@ -214,15 +259,23 @@ the flight.
 
 Inference loads immutable safetensors directly rather than creating trainable
 variables. Candidate tensors, latent rollouts, metric rollouts, costs, MPPI
-weights, and selected actions remain on the Candle CUDA path; only the executed
-action and final reports are materialized on the host.
+weights, and selected actions remain on the Candle CUDA path until selection.
+The selected action sequence and optional single predicted path are copied to
+the host for control/visualization; the full candidate population is not.
 
 The simulator reports both cold-start and steady planning latency. NVRTC and
 library initialization make the first cycle intentionally visible in
 `mean_plan_ms`/`max_plan_ms`; `steady_mean_plan_ms`, p50, and p95 are the useful
 control-loop measures after that first compile cycle.
 
-## Trained pilot evidence
+## Historical pilot evidence (2026-09-03)
+
+These results and the README GIF refer to the preserved historical checkpoint,
+not the corrected three-seed pilot. The historical episode-disjoint split shared
+physical domains, and a later audit found domain/flight-type coverage aliasing.
+The corrected generator, domain-disjoint splits, checkpoint/resume safeguards,
+and preregistered follow-up are documented in
+[skyjepa-remediation.md](skyjepa-remediation.md).
 
 The 2026-09-03 RTX 4090 pilot is an end-to-end implementation validation, not a
 claim of reproducing the authors' unreleased 20,000-trajectory checkpoint. It
@@ -236,7 +289,9 @@ fingerprint is
   delta standard deviations `0.0724`-`0.0727 N`.
 - The latent best validation loss was `0.2383`; all 24 latent dimensions were
   active. The prober best validation loss was `0.07390`.
-- A separate 500-trajectory/100-domain OOD artifact passed the same audit. At
+- A separate 500-trajectory/100-domain artifact sampled within the training
+  parameter ranges passed the then-current audit. The original report evaluated
+  its test partition, not all 500 trajectories. At
   5 steps (`0.25 s`), SkyJEPA position-vector RMSE was `0.0519 m` versus
   `0.0535 m` for constant velocity. At 20 steps (`1.0 s`), it was `0.818 m`
   versus `0.769 m`; at 60 steps it degraded to `10.30 m` versus `3.43 m`.
@@ -249,9 +304,9 @@ fingerprint is
   `0.888 m` and worst error `1.394 m`; learned corrections materially improved
   the worst randomized case while mean RMSE moved from `0.2245` to `0.2210 m`.
 
-This is the present acceptance boundary: the checkpoint is fast and robust in
-the included closed-loop plant, while longer-horizon dataset generalization is
-a measured area for more data and training rather than a hidden success claim.
+This historical control result did not isolate the benefit of learning against
+nominal-physics MPPI or untrained MPPI. The corrected experiment adds those
+comparators and imperfect-trim tests before making a stronger learning claim.
 
 ## Explicit clean-room choices
 
