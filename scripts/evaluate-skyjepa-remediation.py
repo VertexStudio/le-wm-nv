@@ -23,7 +23,18 @@ def read(path):
 
 
 def sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def dataset_sha(root):
+    digest = hashlib.sha256()
+    for name in ("metadata.json", "data.h5", "domains.json"):
+        digest.update(name.encode())
+        with (root / name).open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def save_new(path, value):
@@ -58,6 +69,13 @@ def execute(root, binary, arguments, output):
         sidecar = read(output.with_suffix(".invocation.json"))
         checkpoint = Path(command[command.index("--checkpoint-dir") + 1]) / "checkpoint.json"
         assert sidecar["checkpoint_file_sha256"] == sha(checkpoint), output
+        manifest = read(checkpoint)
+        for field in ("latent_sha256", "prober_sha256"):
+            weight_hash = manifest[field]
+            assert sha(checkpoint.parent / "objects" / f"{weight_hash}.safetensors") == weight_hash, output
+        if "--dataset-dir" in command:
+            dataset = Path(command[command.index("--dataset-dir") + 1])
+            assert report["dataset_artifact_sha256"] == dataset_sha(dataset), output
         print(f"reuse {output.name}", flush=True)
         return report
     checkpoint = Path(command[command.index("--checkpoint-dir") + 1]) / "checkpoint.json"
@@ -154,8 +172,8 @@ def test(root):
                     control(root, seed, mode, selected[mode], trim, population, "test", domain_seed, 20)
 
 
-def open_loop(root):
-    for seed in SEEDS:
+def open_loop(root, seeds=SEEDS):
+    for seed in seeds:
         for data, split in (("data-pilot", "test"), ("data-external", "all"), ("data-shift", "all")):
             execute(root, "lewm-eval-skyjepa", [
                 "--checkpoint-dir", root / f"seed-{seed}" / "prober", "--dataset-dir", root / data,
@@ -167,8 +185,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact_root", type=Path)
     parser.add_argument("phase", choices=("validation", "test", "open-loop"))
+    parser.add_argument("--training-seeds", type=int, nargs="+", choices=SEEDS,
+                        help="open-loop only: evaluate completed seeds while other seeds train; full summary still requires all three")
     args = parser.parse_args()
-    {"validation": validate, "test": test, "open-loop": open_loop}[args.phase](args.artifact_root.resolve())
+    if args.training_seeds is not None and args.phase != "open-loop":
+        parser.error("partial seed evaluation is only supported for non-timing open-loop reports")
+    if args.phase == "open-loop":
+        open_loop(args.artifact_root.resolve(), args.training_seeds or SEEDS)
+    else:
+        {"validation": validate, "test": test}[args.phase](args.artifact_root.resolve())
 
 
 if __name__ == "__main__":
