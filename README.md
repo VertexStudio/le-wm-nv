@@ -21,8 +21,10 @@ UAV state18/action4 -> SkyJEPA TCN/GRU -> physics prober -> metric MPPI -> rotor
 
 ![SkyJEPA pipeline from simulation data synthesis through latent dynamics and physics-inspired probing to sampling-based control](docs/skyjepa-pipeline.jpg)
 
-This is a real capture from the dedicated Bevy simulator running the trained
-pilot checkpoint on a held-out randomized rotor plant. Yellow is the executed
+This is a preserved **2026-09-03 pilot** capture from the dedicated Bevy simulator
+running a trained checkpoint on a held-out randomized rotor plant. It predates
+the corrected domain-disjoint dataset and versioned checkpoint contracts.
+Yellow is the executed
 trajectory, cyan is the current reference horizon, magenta is SkyJEPA's metric
 prediction, and the green bars are the four commanded rotor forces. The HUD
 shows the geometric prior and the learned correction separately; this is not a
@@ -34,10 +36,10 @@ scripted animation.
 at normal simulation speed. Yellow is executed, cyan is reference, magenta is
 predicted, and green shows rotor force.
 
-The model in this capture was trained locally on an RTX 4090 from 2,000
+The historical model in this capture was trained locally on an RTX 4090 from 2,000
 ten-second trajectories across 100 randomized domains (402,000 state/action
 rows). At the paper's controller setting of 512 candidates and horizon 15, the
-automated gate passed all 63 nominal and held-out hover, circle, and
+historical automated gate passed all 63 nominal and held-out hover, circle, and
 figure-eight runs:
 
 | Closed-loop result | SkyJEPA + prior | Matched prior only |
@@ -51,9 +53,10 @@ figure-eight runs:
 The prior-only column is important: SkyJEPA is not being credited for the
 geometric stabilization shared by both controllers. It measures whether the
 learned dynamics correction improves the same nominal flight sequence. The
-learned controller eliminated the one prior-only failure and substantially
-reduced the worst-domain error. The screenshots use accelerated visualization,
-so their render-contended HUD latency is not the headless benchmark above.
+historical learned controller eliminated the one prior-only failure and
+substantially reduced the worst-domain error. This two-controller comparison
+does not establish an advantage over nonlearned model-predictive control.
+Render-contended HUD latency is not the headless benchmark above.
 
 ### How this was built without released implementation code
 
@@ -84,13 +87,16 @@ The implementation/evidence loop was:
 1. Define a canonical HDF5 contract for state, commanded rotor force, realized
    motor force, reference state, episode, time step, and randomized domain.
 2. Build a 200 Hz rigid-body/SO(3) rotor plant and collect control-rich data at
-   20 Hz. The first pilot was rejected after a new audit showed that its
-   differential rotor excitation was too small; the generator was strengthened
-   before the accepted data was trained.
+   20 Hz. Audits first caught insufficient differential rotor excitation and
+   later caught hover/motion coverage aliased to domain IDs. The corrected
+   dataset includes both flight types in every domain, with domain-disjoint
+   training, validation and test partitions.
 3. Reconstruct the paper's latent TCN/GRU objective and physics prober natively
    in Candle. Training is staged, deterministic, resumable with optimizer
    state, guarded by the audited dataset SHA-256, and promotes best-validation
-   safetensors rather than merely the last step.
+   weights rather than merely the last step. Versioned packages bind model,
+   normalization, physics and latent ancestry; atomic snapshot publication and
+   interrupted-versus-continuous CUDA tests protect resume correctness.
 4. Keep the control hot path on CUDA: encode state history once, flatten all
    sampled rolling action windows into one action-TCN batch, recursively unroll
    the GRU, and advance each metric candidate with a fused CUDA integrator.
@@ -103,15 +109,20 @@ The implementation/evidence loop was:
    against unseen domains, and an interactive simulator using the same reusable
    checkpoint-backed controller session as the headless tools.
 
-This process also found a real boundary rather than only successes. On an
-independently generated 500-trajectory OOD dataset, SkyJEPA slightly beat the
-constant-velocity position baseline at 0.25 seconds (`0.0519 m` versus
-`0.0535 m`), but lost at 1 second (`0.818 m` versus `0.769 m`) and degraded
-further by 3 seconds. The current checkpoint demonstrates a working, fast,
-learned closed-loop stack; it does not yet establish superior long-horizon
-open-loop prediction. Reproduction commands, audit thresholds, checkpoint
-contents, simulator controls, and the full pilot evidence are in
-[docs/skyjepa.md](docs/skyjepa.md).
+The corrected three-seed experiment also found a clear limitation. On the full
+1,000-episode independent **in-range** population, one-second position RMSE is
+`0.636 / 0.999 / 0.635 m`, versus `0.740 m` for constant velocity. All three
+seeds lose at three seconds and under deliberately out-of-support mass/motor
+lag. Fresh random seeds alone are not distribution shift; the historical
+500-trajectory external dataset was in-range and its old evaluator measured
+only the selected test partition, not all 500 trajectories.
+
+The stack runs learned closed-loop control, but these results do not establish
+consistently superior long-horizon prediction or sim-to-real transfer.
+Reproduction commands, audit thresholds, checkpoint contents, simulator
+controls and historical evidence are in [docs/skyjepa.md](docs/skyjepa.md).
+The corrected experiment protocol and implementation checks are in
+[the remediation log](docs/skyjepa-remediation.md).
 
 ## Mandate
 
