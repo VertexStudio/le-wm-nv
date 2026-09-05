@@ -6,6 +6,24 @@ use crate::data::drone_racing::{
 
 pub const SKYJEPA_ROTORS: usize = 4;
 
+/// Explicit experiment populations; the shifted population is not training data.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SkyJepaDomainDistribution {
+    #[default]
+    TrainingRanges,
+    ExtendedMassAndMotorLag,
+}
+
+impl SkyJepaDomainDistribution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TrainingRanges => "training_ranges",
+            Self::ExtendedMassAndMotorLag => "extended_mass_and_motor_lag",
+        }
+    }
+}
+
 /// One physically coherent member of the domain-randomized quadrotor family.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct SkyJepaDomain {
@@ -41,12 +59,20 @@ impl SkyJepaDomain {
     /// drag 0.1–0.5, and thrust/torque coefficients ±50%. The paper does
     /// not report an arm-length range, so this clean-room simulator uses ±20%.
     pub fn sample(seed: u64) -> Self {
+        Self::sample_with_distribution(seed, SkyJepaDomainDistribution::TrainingRanges)
+    }
+
+    pub fn sample_with_distribution(seed: u64, distribution: SkyJepaDomainDistribution) -> Self {
         let nominal = Self::default();
         let mut rng = SplitMix64::new(seed);
+        let (mass_range, lag_range) = match distribution {
+            SkyJepaDomainDistribution::TrainingRanges => ((0.5, 1.5), (0.01, 0.1)),
+            SkyJepaDomainDistribution::ExtendedMassAndMotorLag => ((1.55, 1.75), (0.11, 0.14)),
+        };
         Self {
-            mass: nominal.mass * rng.range(0.5, 1.5),
+            mass: nominal.mass * rng.range(mass_range.0, mass_range.1),
             inertia: nominal.inertia.map(|value| value * rng.range(0.7, 1.3)),
-            motor_time_constant: rng.range(0.01, 0.1),
+            motor_time_constant: rng.range(lag_range.0, lag_range.1),
             drag: [
                 rng.range(0.1, 0.5),
                 rng.range(0.1, 0.5),
@@ -262,6 +288,35 @@ fn normalize(value: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
         [value[0] / norm, value[1] / norm, value[2] / norm]
     } else {
         fallback
+    }
+}
+
+#[cfg(test)]
+mod distribution_tests {
+    use super::*;
+
+    #[test]
+    fn deliberate_shift_is_outside_training_mass_and_lag_only() {
+        for seed in 0..1000 {
+            let standard = SkyJepaDomain::sample(seed);
+            let shifted = SkyJepaDomain::sample_with_distribution(
+                seed,
+                SkyJepaDomainDistribution::ExtendedMassAndMotorLag,
+            );
+            assert!((0.65..=1.95).contains(&standard.mass));
+            assert!((0.01..=0.1).contains(&standard.motor_time_constant));
+            assert!((1.3 * 1.55..=1.3 * 1.75).contains(&shifted.mass));
+            assert!((0.11..=0.14).contains(&shifted.motor_time_constant));
+            assert_eq!(
+                SkyJepaDomain {
+                    mass: standard.mass,
+                    motor_time_constant: standard.motor_time_constant,
+                    ..shifted
+                },
+                standard
+            );
+            shifted.validate().unwrap();
+        }
     }
 }
 

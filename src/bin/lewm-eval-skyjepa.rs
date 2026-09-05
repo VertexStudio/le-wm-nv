@@ -7,7 +7,8 @@ use le_wm_nv::{
     checkpoint::var_builder_from_path,
     data::skyjepa::{SkyJepaDroneDataset, SkyJepaSplitBy, skyjepa_artifact_fingerprint},
     models::skyjepa::{
-        SkyJepaConfig, SkyJepaModel, SkyJepaProber, checkpoint::SkyJepaCheckpoint,
+        SkyJepaConfig, SkyJepaModel, SkyJepaProber,
+        checkpoint::{SkyJepaCheckpoint, file_sha256},
         integrate_metric_rollout_inference, skyjepa_latent_rollout,
     },
     runtime::DeviceSpec,
@@ -78,6 +79,10 @@ struct BaselineHorizonMetrics {
 
 #[derive(Debug, Serialize)]
 struct EvaluationReport {
+    report_version: u32,
+    executable_sha256: String,
+    configuration: serde_json::Value,
+    domain_distribution: Option<String>,
     split: String,
     split_by: SkyJepaSplitBy,
     scope: String,
@@ -289,11 +294,15 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|hash| training_domains.contains(*hash))
         .count();
-    let scope = match (same_artifact, training_domain_overlap == 0) {
-        (true, true) => "held_out_domains",
-        (true, false) => "held_out_episodes",
-        (false, true) => "external_unseen_domains",
-        (false, false) => "external_shared_domains",
+    let scope = if evaluated_domain_fingerprints.is_empty() || training_domains.is_empty() {
+        "unknown_domain_overlap"
+    } else {
+        match (same_artifact, training_domain_overlap == 0) {
+            (true, true) => "held_out_domains",
+            (true, false) => "held_out_episodes",
+            (false, true) => "external_unseen_domains",
+            (false, false) => "external_shared_domains",
+        }
     }
     .to_owned();
     let device = args.device.resolve()?;
@@ -384,6 +393,15 @@ fn main() -> anyhow::Result<()> {
     }
     ensure!(accumulator.count > 0, "evaluation processed zero windows");
     let report = EvaluationReport {
+        report_version: 2,
+        executable_sha256: file_sha256(&std::env::current_exe()?)?,
+        configuration: serde_json::json!({"argv":std::env::args().collect::<Vec<_>>(),
+            "dataset":dataset_cfg,"model":model_cfg,"prober":prober.config()}),
+        domain_distribution: serde_json::from_str::<serde_json::Value>(&fs::read_to_string(
+            dataset_dir.join("metadata.json"),
+        )?)?["domain_distribution"]
+            .as_str()
+            .map(str::to_owned),
         split: match args.split {
             EvalSplit::Validation => "validation",
             EvalSplit::Test => "test",

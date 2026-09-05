@@ -76,6 +76,9 @@ pub struct SkyJepaDatasetMetadata {
     /// dataset, when known.
     #[serde(default)]
     pub domains: Option<usize>,
+    /// Named generation population; an unseen seed is not necessarily a shift.
+    #[serde(default)]
+    pub domain_distribution: Option<String>,
     /// Whether `data.h5` contains the optional `reference_state [N,18]`
     /// diagnostic dataset.
     #[serde(default)]

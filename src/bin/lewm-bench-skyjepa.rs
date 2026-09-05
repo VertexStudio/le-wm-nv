@@ -13,7 +13,7 @@ use le_wm_nv::{
         checkpoint::{SkyJepaCheckpoint, file_sha256},
     },
     runtime::DeviceSpec,
-    skyjepa_sim::{SkyJepaDomain, SkyJepaRotorPlant, SkyJepaRotorState},
+    skyjepa_sim::{SkyJepaDomain, SkyJepaDomainDistribution, SkyJepaRotorPlant, SkyJepaRotorState},
     skyjepa_task::{SkyJepaReferenceKind, skyjepa_reference_horizon, skyjepa_reference_state},
 };
 use serde::Serialize;
@@ -50,6 +50,10 @@ struct Args {
 
     #[arg(long, default_value_t = 9001)]
     domain_seed: u64,
+
+    /// Applies to randomized cases; the three nominal anchor cases stay nominal.
+    #[arg(long, value_enum, default_value_t = SkyJepaDomainDistribution::TrainingRanges)]
+    domain_distribution: SkyJepaDomainDistribution,
 
     #[arg(long, default_value_t = 7)]
     planner_seed: u64,
@@ -221,7 +225,11 @@ fn main() -> anyhow::Result<()> {
     let mut domains = vec![(false, None, SkyJepaDomain::default())];
     domains.extend((0..args.random_domains).map(|index| {
         let seed = mix_seed(args.domain_seed, index as u64);
-        (true, Some(seed), SkyJepaDomain::sample(seed))
+        (
+            true,
+            Some(seed),
+            SkyJepaDomain::sample_with_distribution(seed, args.domain_distribution),
+        )
     }));
     let mut results = Vec::with_capacity(references.len() * domains.len());
     let mut all_plan_times = Vec::new();
@@ -289,6 +297,7 @@ fn main() -> anyhow::Result<()> {
         configuration: serde_json::json!({"argv":std::env::args().collect::<Vec<_>>(),"session":session_config,"control":controller.control_config(),
             "simulation_rate_hz":args.simulation_rate_hz,"duration_seconds":args.duration_seconds,
             "radius_m":args.radius_m,"period_seconds":args.period_seconds,"domain_seed":args.domain_seed,
+            "domain_distribution":args.domain_distribution,
             "max_position_rmse_m":args.max_position_rmse_m,"max_position_error_m":args.max_position_error_m,
             "max_p95_plan_ms":args.max_p95_plan_ms,"min_success_rate":args.min_success_rate,
             "trim_history":"true observed commands; multiplier changes calibration only",

@@ -142,6 +142,7 @@ fn opens_canonical_rotor_force_schema() -> Result<()> {
         generator: Some("test".into()),
         seed: Some(7),
         domains: Some(3),
+        domain_distribution: None,
         has_reference_state: false,
         has_motor_force: false,
     };

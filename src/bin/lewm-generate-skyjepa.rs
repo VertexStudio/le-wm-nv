@@ -11,7 +11,7 @@ use le_wm_nv::{
             SkyJepaDatasetMetadata,
         },
     },
-    skyjepa_sim::{SkyJepaDomain, SkyJepaRotorPlant, SkyJepaRotorState},
+    skyjepa_sim::{SkyJepaDomain, SkyJepaDomainDistribution, SkyJepaRotorPlant, SkyJepaRotorState},
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -24,6 +24,9 @@ struct Args {
 
     #[arg(long, default_value_t = 500)]
     domains: usize,
+
+    #[arg(long, value_enum, default_value_t = SkyJepaDomainDistribution::TrainingRanges)]
+    domain_distribution: SkyJepaDomainDistribution,
 
     #[arg(long, default_value_t = 20_000)]
     trajectories: usize,
@@ -91,7 +94,7 @@ fn main() -> anyhow::Result<()> {
             DomainRecord {
                 index,
                 seed,
-                parameters: SkyJepaDomain::sample(seed),
+                parameters: SkyJepaDomain::sample_with_distribution(seed, args.domain_distribution),
             }
         })
         .collect::<Vec<_>>();
@@ -175,6 +178,7 @@ fn main() -> anyhow::Result<()> {
         ),
         seed: Some(args.seed),
         domains: Some(args.domains),
+        domain_distribution: Some(args.domain_distribution.as_str().into()),
         has_reference_state: true,
         has_motor_force: true,
     };

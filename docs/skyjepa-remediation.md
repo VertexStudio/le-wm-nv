@@ -158,3 +158,13 @@ checkpoint/executable hashes, the full controller configuration, domain seeds,
 GPU/process snapshots, p50/p95/p99/max latency, 10 ms budget exceedances and
 50 ms control-deadline misses. Simulation time still does not model scheduling
 overruns; this is not a hard real-time certification.
+
+External evaluation data is generated and audit-v2 clean: 1,000 trajectories
+across 100 domains per population, each domain with one hover and nine moving
+trajectories. The ordinary external population uses training parameter ranges
+(seed 90001; artifact SHA-256
+`afbc11b19ce91cf60a4d600e5dd47f551f4974f03a9f99c22aff4199494c81b3`).
+The deliberate shift (seed 90002) uses mass 1.55–1.75 times nominal and motor
+lag 0.11–0.14 s, both outside training support. Other parameter draws are
+unchanged; a 1,000-seed regression verifies this. Metadata, audits and control
+reports explicitly label the population; unseen seeds alone are not called OOD.
