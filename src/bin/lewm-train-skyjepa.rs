@@ -14,14 +14,14 @@ use le_wm_nv::{
     data::{
         drone_racing::epoch_seed,
         skyjepa::{
-            SkyJepaActionSpace, SkyJepaDatasetConfig, SkyJepaDroneDataset,
+            SkyJepaActionSpace, SkyJepaDatasetConfig, SkyJepaDroneDataset, SkyJepaNormalization,
             skyjepa_artifact_fingerprint,
         },
     },
     models::skyjepa::{
         SkyJepaConfig, SkyJepaLossConfig, SkyJepaLossScalars, SkyJepaModel, SkyJepaProber,
         SkyJepaProberConfig, SkyJepaProberLossScalars,
-        checkpoint::{ModelContract, SkyJepaCheckpoint},
+        checkpoint::{ModelContract, SkyJepaCheckpoint, TrainingSnapshot},
         skyjepa_batch_loss_with_config, skyjepa_latent_rollout, skyjepa_prober_loss,
     },
     optim::StatefulAdamW,
@@ -183,7 +183,7 @@ struct RunManifest {
     grad_clip: f64,
     model_config: SkyJepaConfig,
     dataset_config: SkyJepaDatasetConfig,
-    normalization: serde_json::Value,
+    normalization: SkyJepaNormalization,
     prober_config: SkyJepaProberConfig,
     parent_latent_identity: Option<String>,
     loss_config: serde_json::Value,
@@ -205,6 +205,7 @@ struct StageProgress {
     global_step: usize,
     best_validation: Option<f64>,
     best_epoch: Option<usize>,
+    best_step: Option<usize>,
     completed_requested_steps: bool,
     updated_at_unix: u64,
 }
@@ -296,7 +297,7 @@ fn main() -> anyhow::Result<()> {
         grad_clip: args.grad_clip,
         model_config: model_cfg.clone(),
         dataset_config: dataset_cfg,
-        normalization: serde_json::to_value(dataset.normalization())?,
+        normalization: dataset.normalization().clone(),
         prober_config: prober_cfg.clone(),
         parent_latent_identity: parent
             .as_ref()
@@ -330,6 +331,31 @@ fn main() -> anyhow::Result<()> {
         args.resume,
         args.overwrite,
     )?;
+    if args.resume {
+        let snapshot = TrainingSnapshot::load(&output_dir, first_stage)?;
+        let snapshot_contract: RunManifest =
+            serde_json::from_value(snapshot.manifest.training_contract.clone())?;
+        ensure!(
+            manifest_compatibility(&snapshot_contract)? == manifest_compatibility(&manifest)?,
+            "snapshot training contract disagrees with resume settings"
+        );
+        let batches = batch_count(train_rows.len(), args.batch_size);
+        let progress = load_or_create_progress(
+            &args,
+            args.stage,
+            &dataset_dir,
+            batches,
+            manifest.stage_epochs,
+            manifest.stage_max_steps,
+            &output_dir,
+        )?;
+        ensure!(
+            progress.global_step
+                <= requested_steps(manifest.stage_epochs, batches, manifest.stage_max_steps)?,
+            "stage is past its requested target"
+        );
+        manifest = read_json(&output_dir.join(format!("{first_stage}-run-manifest.json")))?;
+    }
     if args.overwrite {
         clear_stage_artifacts(&output_dir, first_stage)?;
         if args.stage == TrainingStage::Both {
@@ -377,7 +403,7 @@ fn main() -> anyhow::Result<()> {
         }
     } else {
         if args.resume {
-            let checkpoint = output_dir.join("latent-latest.safetensors");
+            let checkpoint = TrainingSnapshot::load(&output_dir, "latent")?.weights_path();
             latent_vars
                 .load(&checkpoint)
                 .with_context(|| format!("failed to load {}", checkpoint.display()))?;
@@ -423,7 +449,7 @@ fn main() -> anyhow::Result<()> {
             VarBuilder::from_varmap(&prober_vars, dtype, &device),
         )?;
         if args.resume {
-            let checkpoint = output_dir.join("prober-latest.safetensors");
+            let checkpoint = TrainingSnapshot::load(&output_dir, "prober")?.weights_path();
             prober_vars
                 .load(&checkpoint)
                 .with_context(|| format!("failed to load {}", checkpoint.display()))?;
@@ -476,7 +502,6 @@ fn train_latent(
     let batches_per_epoch = batch_count(train_rows.len(), args.batch_size);
     let requested_steps =
         requested_steps(args.latent_epochs, batches_per_epoch, args.latent_max_steps)?;
-    let state_path = output_dir.join("latent-training-state.json");
     let mut progress = load_or_create_progress(
         args,
         TrainingStage::Latent,
@@ -484,10 +509,10 @@ fn train_latent(
         batches_per_epoch,
         args.latent_epochs,
         args.latent_max_steps,
-        &state_path,
+        output_dir,
     )?;
     ensure!(
-        progress.global_step < requested_steps,
+        progress.global_step <= requested_steps,
         "latent resume step {} is already at requested target {requested_steps}",
         progress.global_step
     );
@@ -501,7 +526,7 @@ fn train_latent(
     )?;
     if args.resume {
         optimizer.load_state(
-            output_dir.join("latent-optimizer.safetensors"),
+            TrainingSnapshot::load(output_dir, "latent")?.optimizer_path(),
             progress.global_step,
         )?;
     }
@@ -578,7 +603,7 @@ fn train_latent(
             {
                 progress.best_validation = Some(validation.prediction_loss);
                 progress.best_epoch = Some(epoch + 1);
-                atomic_save_weights(vars, &output_dir.join("latent-best.safetensors"))?;
+                progress.best_step = Some(progress.global_step);
             }
         }
         if requested_end
@@ -612,7 +637,6 @@ fn train_prober(
     let batches_per_epoch = batch_count(train_rows.len(), args.batch_size);
     let requested_steps =
         requested_steps(args.prober_epochs, batches_per_epoch, args.prober_max_steps)?;
-    let state_path = output_dir.join("prober-training-state.json");
     let mut progress = load_or_create_progress(
         args,
         TrainingStage::Prober,
@@ -620,10 +644,10 @@ fn train_prober(
         batches_per_epoch,
         args.prober_epochs,
         args.prober_max_steps,
-        &state_path,
+        output_dir,
     )?;
     ensure!(
-        progress.global_step < requested_steps,
+        progress.global_step <= requested_steps,
         "prober resume step {} is already at requested target {requested_steps}",
         progress.global_step
     );
@@ -637,7 +661,7 @@ fn train_prober(
     )?;
     if args.resume {
         optimizer.load_state(
-            output_dir.join("prober-optimizer.safetensors"),
+            TrainingSnapshot::load(output_dir, "prober")?.optimizer_path(),
             progress.global_step,
         )?;
     }
@@ -720,7 +744,7 @@ fn train_prober(
             {
                 progress.best_validation = Some(validation);
                 progress.best_epoch = Some(epoch + 1);
-                atomic_save_weights(vars, &output_dir.join("prober-best.safetensors"))?;
+                progress.best_step = Some(progress.global_step);
             }
         }
         if requested_end
@@ -864,7 +888,7 @@ fn prepare_output_dir(args: &Args, output_dir: &Path) -> anyhow::Result<()> {
         TrainingStage::Latent => vec!["latent"],
         TrainingStage::Prober => vec!["prober"],
     } {
-        let state = output_dir.join(format!("{stage}-training-state.json"));
+        let state = output_dir.join(format!("{stage}-current.json"));
         if state.exists() && !args.overwrite {
             anyhow::bail!(
                 "{} already contains a {stage} run; pass --resume or --overwrite",
@@ -882,6 +906,7 @@ fn clear_stage_artifacts(output_dir: &Path, stage: &str) -> anyhow::Result<()> {
         format!("{stage}-latest.safetensors"),
         format!("{stage}-optimizer.safetensors"),
         format!("{stage}-training-state.json"),
+        format!("{stage}-current.json"),
         format!("{stage}-metrics.jsonl"),
     ] {
         let path = output_dir.join(name);
@@ -903,9 +928,19 @@ fn ensure_or_write_manifest(
     let path = output_dir.join(format!("{stage}-run-manifest.json"));
     if resume {
         let saved: RunManifest = read_json(&path)?;
+        let saved_key = manifest_compatibility(&saved)?;
+        let requested_key = manifest_compatibility(manifest)?;
+        let changed = saved_key
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(key, value)| requested_key.get(*key) != Some(*value))
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>();
         ensure!(
-            manifest_compatibility(&saved)? == manifest_compatibility(manifest)?,
-            "resume settings disagree with {stage}-run-manifest.json (data, normalization, parent, physics, or training configuration changed)"
+            changed.is_empty(),
+            "resume settings disagree with {stage}-run-manifest.json: {}",
+            changed.join(", ")
         );
         Ok(())
     } else {
@@ -934,10 +969,16 @@ fn load_or_create_progress(
     batches_per_epoch: usize,
     epochs: usize,
     max_steps: Option<usize>,
-    state_path: &Path,
+    output_dir: &Path,
 ) -> anyhow::Result<StageProgress> {
     if args.resume {
-        let saved: StageProgress = read_json(state_path)?;
+        let name = if stage == TrainingStage::Latent {
+            "latent"
+        } else {
+            "prober"
+        };
+        let snapshot = TrainingSnapshot::load(output_dir, name)?;
+        let saved: StageProgress = serde_json::from_value(snapshot.manifest.progress)?;
         ensure!(
             saved.stage == stage
                 && saved.dataset_dir == dataset_dir
@@ -946,13 +987,12 @@ fn load_or_create_progress(
                 && saved.max_steps == max_steps
                 && saved.seed == args.seed
                 && saved.batches_per_epoch == batches_per_epoch,
-            "resume state {} is incompatible with current arguments",
-            state_path.display()
+            "resume state is incompatible with current arguments"
         );
         Ok(saved)
     } else {
         Ok(StageProgress {
-            format_version: 1,
+            format_version: 2,
             stage,
             dataset_dir: dataset_dir.to_path_buf(),
             batch_size: args.batch_size,
@@ -963,6 +1003,7 @@ fn load_or_create_progress(
             global_step: 0,
             best_validation: None,
             best_epoch: None,
+            best_step: None,
             completed_requested_steps: false,
             updated_at_unix: unix_seconds(),
         })
@@ -976,26 +1017,32 @@ fn save_stage_state(
     optimizer: &StatefulAdamW,
     progress: &StageProgress,
 ) -> anyhow::Result<()> {
-    atomic_save_weights(
-        vars,
-        &output_dir.join(format!("{stage}-latest.safetensors")),
+    ensure!(
+        optimizer.step_t() == progress.global_step,
+        "optimizer/progress step mismatch"
+    );
+    let contract: serde_json::Value =
+        read_json(&output_dir.join(format!("{stage}-run-manifest.json")))?;
+    TrainingSnapshot::publish(
+        output_dir,
+        stage,
+        progress.global_step,
+        serde_json::to_value(progress)?,
+        contract,
+        progress.best_step == Some(progress.global_step),
+        |directory| {
+            vars.save(directory.join("weights.safetensors"))?;
+            optimizer.save_state(directory.join("optimizer.safetensors"))?;
+            Ok(())
+        },
     )?;
-    atomic_save_optimizer(
-        optimizer,
-        &output_dir.join(format!("{stage}-optimizer.safetensors")),
-    )?;
-    atomic_write_json(
-        &output_dir.join(format!("{stage}-training-state.json")),
-        progress,
-    )
+    Ok(())
 }
 
 fn promote_best(output_dir: &Path, stage: &str) -> anyhow::Result<()> {
-    let source = output_dir.join(format!("{stage}-best.safetensors"));
-    ensure!(
-        source.is_file(),
-        "{stage} stage produced no best checkpoint"
-    );
+    let source = TrainingSnapshot::load(output_dir, stage)?
+        .best(output_dir)?
+        .weights_path();
     atomic_copy(&source, &output_dir.join(format!("{stage}.safetensors")))
 }
 
@@ -1121,53 +1168,11 @@ fn write_metric(writer: &mut BufWriter<File>, value: serde_json::Value) -> anyho
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    atomic_write(path, serde_json::to_vec_pretty(value)?)
-}
-
-fn atomic_write(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = temporary_path(path);
-    fs::write(&temporary, bytes)
-        .with_context(|| format!("failed to write {}", temporary.display()))?;
-    fs::rename(&temporary, path).with_context(|| format!("failed to publish {}", path.display()))
-}
-
-fn atomic_save_weights(vars: &VarMap, path: &Path) -> anyhow::Result<()> {
-    let temporary = temporary_path(path);
-    vars.save(&temporary)
-        .with_context(|| format!("failed to save {}", temporary.display()))?;
-    fs::rename(&temporary, path).with_context(|| format!("failed to publish {}", path.display()))
-}
-
-fn atomic_save_optimizer(optimizer: &StatefulAdamW, path: &Path) -> anyhow::Result<()> {
-    let temporary = temporary_path(path);
-    optimizer
-        .save_state(&temporary)
-        .with_context(|| format!("failed to save {}", temporary.display()))?;
-    fs::rename(&temporary, path).with_context(|| format!("failed to publish {}", path.display()))
+    le_wm_nv::models::skyjepa::checkpoint::atomic_json(path, value)
 }
 
 fn atomic_copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
-    let temporary = temporary_path(destination);
-    fs::copy(source, &temporary).with_context(|| {
-        format!(
-            "failed to copy {} to {}",
-            source.display(),
-            temporary.display()
-        )
-    })?;
-    fs::rename(&temporary, destination)
-        .with_context(|| format!("failed to publish {}", destination.display()))
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("artifact");
-    path.with_file_name(format!(".{name}.tmp-{}", std::process::id()))
+    le_wm_nv::models::skyjepa::checkpoint::atomic_bytes(destination, &fs::read(source)?)
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {

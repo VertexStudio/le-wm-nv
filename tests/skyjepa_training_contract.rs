@@ -1,6 +1,6 @@
 use le_wm_nv::{
     data::skyjepa::SkyJepaDroneDataset,
-    models::skyjepa::checkpoint::{SkyJepaCheckpoint, file_sha256, json_sha256},
+    models::skyjepa::checkpoint::{SkyJepaCheckpoint, TrainingSnapshot, file_sha256, json_sha256},
 };
 use std::{
     fs,
@@ -145,5 +145,30 @@ fn prober_reuses_parent_normalization_and_rejects_resume_changes_without_writes(
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("resume settings disagree"));
     assert_eq!(before, tree_fingerprint(&prober)?);
+    // Re-publication after the last training snapshot is idempotent, including
+    // recovery from interruption between the last update and package export.
+    successful(
+        trainer(&data_b, &prober, "prober")
+            .arg("--resume")
+            .output()?,
+    );
+    assert_eq!(
+        trained.fingerprint()?,
+        SkyJepaCheckpoint::load(&prober)?.fingerprint()?
+    );
+    let snapshot = TrainingSnapshot::load(&prober, "prober")?;
+    fs::write(
+        snapshot.optimizer_path(),
+        b"interrupted or corrupted optimizer",
+    )?;
+    let corrupted = tree_fingerprint(&prober)?;
+    let rejected = trainer(&data_b, &prober, "prober")
+        .arg("--resume")
+        .output()?;
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("optimizer.safetensors fingerprint")
+    );
+    assert_eq!(corrupted, tree_fingerprint(&prober)?);
     Ok(())
 }

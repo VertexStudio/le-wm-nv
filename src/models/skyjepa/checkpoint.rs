@@ -1,6 +1,7 @@
 //! SkyJEPA packages are immutable content-addressed weights plus one atomic
 //! manifest. Loading never guesses preprocessing from neighbouring loose files.
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -220,5 +221,178 @@ pub fn atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     file.sync_all()?;
     fs::rename(&temp, path)?;
     File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotIndex {
+    format_version: u32,
+    generation: String,
+    manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotManifest {
+    pub format_version: u32,
+    pub stage: String,
+    pub step: usize,
+    pub progress: serde_json::Value,
+    pub training_contract: serde_json::Value,
+    pub best_generation: Option<String>,
+    files: BTreeMap<String, String>,
+}
+
+/// A verified immutable optimizer/weight/progress generation. Only the tiny
+/// stage-current.json pointer changes when publishing a new generation.
+#[derive(Debug)]
+pub struct TrainingSnapshot {
+    pub directory: PathBuf,
+    pub manifest: SnapshotManifest,
+}
+
+impl TrainingSnapshot {
+    pub fn load(root: &Path, stage: &str) -> anyhow::Result<Self> {
+        validate_stage(stage)?;
+        let index: SnapshotIndex = read_json(&root.join(format!("{stage}-current.json")))?;
+        ensure!(
+            index.format_version == CHECKPOINT_VERSION,
+            "unsupported snapshot index version"
+        );
+        let snapshot = Self::load_generation(root, stage, &index.generation)?;
+        ensure!(
+            file_sha256(&snapshot.directory.join("manifest.json"))? == index.manifest_sha256,
+            "snapshot manifest fingerprint mismatch"
+        );
+        Ok(snapshot)
+    }
+
+    fn load_generation(root: &Path, stage: &str, name: &str) -> anyhow::Result<Self> {
+        ensure!(
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "invalid snapshot generation name"
+        );
+        let directory = root.join("snapshots").join(name);
+        let manifest: SnapshotManifest = read_json(&directory.join("manifest.json"))?;
+        ensure!(
+            manifest.format_version == CHECKPOINT_VERSION && manifest.stage == stage,
+            "snapshot stage/version mismatch"
+        );
+        ensure!(
+            manifest.progress["global_step"].as_u64() == Some(manifest.step as u64),
+            "snapshot progress/optimizer step mismatch"
+        );
+        for name in ["weights.safetensors", "optimizer.safetensors"] {
+            let hash = manifest
+                .files
+                .get(name)
+                .context("snapshot missing required file fingerprint")?;
+            ensure!(
+                file_sha256(&directory.join(name))? == *hash,
+                "snapshot {name} fingerprint mismatch"
+            );
+        }
+        Ok(Self {
+            directory,
+            manifest,
+        })
+    }
+
+    pub fn best(&self, root: &Path) -> anyhow::Result<Self> {
+        let name = self
+            .manifest
+            .best_generation
+            .as_ref()
+            .context("stage has no validated best checkpoint")?;
+        let best = Self::load_generation(root, &self.manifest.stage, name)?;
+        ensure!(
+            json_sha256(&best.manifest.training_contract)?
+                == json_sha256(&self.manifest.training_contract)?,
+            "best checkpoint belongs to a different training contract"
+        );
+        Ok(best)
+    }
+
+    pub fn weights_path(&self) -> PathBuf {
+        self.directory.join("weights.safetensors")
+    }
+    pub fn optimizer_path(&self) -> PathBuf {
+        self.directory.join("optimizer.safetensors")
+    }
+
+    pub fn publish(
+        root: &Path,
+        stage: &str,
+        step: usize,
+        progress: serde_json::Value,
+        training_contract: serde_json::Value,
+        is_best: bool,
+        write_files: impl FnOnce(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
+        validate_stage(stage)?;
+        ensure!(
+            progress["global_step"].as_u64() == Some(step as u64),
+            "snapshot step/progress mismatch"
+        );
+        let previous = if root.join(format!("{stage}-current.json")).exists() {
+            Some(Self::load(root, stage)?)
+        } else {
+            None
+        };
+        if let Some(previous) = &previous {
+            ensure!(
+                previous.manifest.training_contract == training_contract,
+                "cannot append a snapshot to a different training contract"
+            );
+        }
+        let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{stage}-{step}-{}-{id}", std::process::id());
+        let snapshots = root.join("snapshots");
+        fs::create_dir_all(&snapshots)?;
+        File::open(root)?.sync_all()?;
+        let directory = snapshots.join(&name);
+        fs::create_dir(&directory)?;
+        // Files are not visible through the current pointer until every write
+        // and fsync succeeds. An error leaves an unreferenced generation only.
+        write_files(&directory)?;
+        let mut files = BTreeMap::new();
+        for filename in ["weights.safetensors", "optimizer.safetensors"] {
+            let path = directory.join(filename);
+            File::open(&path)?.sync_all()?;
+            files.insert(filename.to_owned(), file_sha256(&path)?);
+        }
+        let best_generation = if is_best {
+            Some(name.clone())
+        } else {
+            previous.and_then(|snapshot| snapshot.manifest.best_generation)
+        };
+        let manifest = SnapshotManifest {
+            format_version: CHECKPOINT_VERSION,
+            stage: stage.to_owned(),
+            step,
+            progress,
+            training_contract,
+            best_generation,
+            files,
+        };
+        atomic_json(&directory.join("manifest.json"), &manifest)?;
+        File::open(&snapshots)?.sync_all()?;
+        let index = SnapshotIndex {
+            format_version: CHECKPOINT_VERSION,
+            generation: name,
+            manifest_sha256: file_sha256(&directory.join("manifest.json"))?,
+        };
+        atomic_json(&root.join(format!("{stage}-current.json")), &index)?;
+        Ok(Self {
+            directory,
+            manifest,
+        })
+    }
+}
+
+fn validate_stage(stage: &str) -> anyhow::Result<()> {
+    ensure!(
+        matches!(stage, "latent" | "prober"),
+        "invalid training stage"
+    );
     Ok(())
 }

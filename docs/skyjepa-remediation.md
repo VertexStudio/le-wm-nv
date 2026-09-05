@@ -9,7 +9,7 @@ pilot artifacts are preserved.
 - [x] Versioned checkpoint contract: bind architecture, preprocessing, physics,
   latent parent, data fingerprint, and training settings; reject mismatches
   before modifying an existing run.
-- [ ] Crash-safe checkpoint generations: publish weights, optimizer, progress,
+- [x] Crash-safe checkpoint generations: publish weights, optimizer, progress,
   and contract together; retain the previous committed generation.
 - [ ] Deterministic resume: step-addressed SIGReg randomness and independent
   validation; uninterrupted/interrupted equivalence tests.
@@ -53,5 +53,14 @@ New checkpoints use `checkpoint.json` with immutable, hashed weights under
 `--latent-checkpoint` now takes a package directory. Stage-specific run
 manifests include preprocessing, latent identity, physics and loss settings.
 The historical baseline is not modified or automatically converted.
+
+Training snapshots now live in immutable `snapshots/` generations. A flushed,
+atomically replaced `{stage}-current.json` selects the complete generation.
+Snapshots bind the optimizer step, weights, progress and training contract;
+best selection retains a complete earlier generation. Failed writes leave only
+unreferenced directories, never a partially updated current generation.
+Fault-injection tests cover interruption before weights, between weights and
+optimizer, and before publication; corruption is rejected on load. Completed
+stages can be resumed to recover package export without repeating updates.
 
 Further experiment results pending.

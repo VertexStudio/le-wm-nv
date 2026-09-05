@@ -5,7 +5,7 @@ use le_wm_nv::{
     },
     models::skyjepa::{
         SkyJepaConfig, SkyJepaProberConfig,
-        checkpoint::{ModelContract, SkyJepaCheckpoint, atomic_json},
+        checkpoint::{ModelContract, SkyJepaCheckpoint, TrainingSnapshot, atomic_json},
     },
 };
 use std::{
@@ -142,6 +142,62 @@ fn invalid_publication_keeps_previous_package() -> anyhow::Result<()> {
     assert_eq!(
         original.fingerprint()?,
         SkyJepaCheckpoint::load(&scratch.0)?.fingerprint()?
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_snapshot_writes_never_replace_committed_generation() -> anyhow::Result<()> {
+    let scratch = Scratch::new();
+    let save = |step: usize, is_best: bool, fail_after: usize| {
+        TrainingSnapshot::publish(
+            &scratch.0,
+            "latent",
+            step,
+            serde_json::json!({"global_step":step}),
+            serde_json::json!({"seed":7}),
+            is_best,
+            |dir| {
+                if fail_after == 0 {
+                    anyhow::bail!("injected before weights");
+                }
+                fs::write(dir.join("weights.safetensors"), format!("weights-{step}"))?;
+                if fail_after == 1 {
+                    anyhow::bail!("injected after weights");
+                }
+                fs::write(
+                    dir.join("optimizer.safetensors"),
+                    format!("optimizer-{step}"),
+                )?;
+                if fail_after == 2 {
+                    anyhow::bail!("injected before publication");
+                }
+                Ok(())
+            },
+        )
+    };
+    let first = save(1, true, 3)?;
+    for boundary in 0..3 {
+        assert!(save(2, false, boundary).is_err());
+        let current = TrainingSnapshot::load(&scratch.0, "latent")?;
+        assert_eq!(current.manifest.step, 1);
+        assert_eq!(current.directory, first.directory);
+        assert_eq!(fs::read(current.weights_path())?, b"weights-1");
+        assert_eq!(fs::read(current.optimizer_path())?, b"optimizer-1");
+    }
+    let next = save(2, false, 3)?;
+    assert_eq!(
+        TrainingSnapshot::load(&scratch.0, "latent")?.manifest.step,
+        2
+    );
+    assert_eq!(next.best(&scratch.0)?.directory, first.directory);
+    assert!(first.weights_path().is_file());
+    fs::write(next.optimizer_path(), b"wrong generation")?;
+    assert!(
+        TrainingSnapshot::load(&scratch.0, "latent")
+            .unwrap_err()
+            .to_string()
+            .contains("optimizer.safetensors fingerprint")
     );
     Ok(())
 }
