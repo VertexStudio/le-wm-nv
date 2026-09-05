@@ -207,7 +207,7 @@ artifact root: 85 Rust tests pass, plus five local-uv protocol/summary tests.
 Clippy completes with existing warnings outside the newly introduced code.
 Evaluation uses frozen binaries with SHA-256:
 
-- Benchmark: `56462cf55bdaf2c96e42b830632d9e61f61608509996787764308c8839969c3c`
+- Benchmark (reporting revision before control validation): `9090e0031d9a6d2c918c79d2691e2d7a92d44a976a66653b401dc233004c2e89`
 - Open-loop evaluator: `e93a75b0aaaff2725bef0026d18db0dc4079b49f918c185cc28190c89afcae3a`
 - Headless simulator: `2a1c09f5c84cb76dd3c654f33ce6fb3778c2805832ad9bcfc5cdbbb97fcdf87d`
 
@@ -226,3 +226,13 @@ A preliminary seed-7, fresh-prior figure-eight simulation (raw domain seed
 0.3682 m position-vector RMSE and 0.9320 m maximum error. Its full trace is in
 `simulation/preliminary-seed-7-figure-eight.json`. It ran alongside training:
 its 17.49 ms p95 is explicitly contention-affected and excluded from timing gates.
+
+Before the first control-validation run, benchmark reporting was clarified to
+distinguish saturation at the planner's fixed bounds from saturation at the
+randomized plant's physical bounds. Exact planner bounds are now included in
+the configuration. No planning/scoring behavior changed. The original benchmark
+binary (`56462cf...`) is preserved as `bin/lewm-bench-skyjepa-initial`; the revised
+binary above is used for all validation/final control reports. A paired,
+perturbed-trim smoke test over all four comparators checks that tracking,
+correction and finite/ground-contact results are numerically identical between
+the two binaries (`reporting-regression/`).
