@@ -305,22 +305,150 @@ impl CandidateScorer for SkyJepaMppiScorer<'_> {
 
     fn score_candidates(&self, action_candidates: &Tensor) -> Result<Tensor> {
         let predicted = self.predict_candidates(action_candidates)?;
-        let reference = self.reference_states.unsqueeze(1)?;
-        let position = grouped_squared_error(&predicted, &reference, 0, 3)?;
-        let velocity = grouped_squared_error(&predicted, &reference, 3, 3)?;
-        let attitude = grouped_squared_error(&predicted, &reference, 6, 9)?;
-        let angular_velocity = grouped_squared_error(&predicted, &reference, 15, 3)?;
-        let action_error = action_candidates
-            .broadcast_sub(&self.reference_actions.unsqueeze(1)?)?
-            .sqr()?
-            .broadcast_mul(&self.action_cost)?
-            .sum(3)?;
-        let state_cost =
-            (position * self.cost.position as f64)? + (velocity * self.cost.velocity as f64)?;
-        let state_cost = state_cost? + (attitude * self.cost.attitude as f64)?;
-        let state_cost = state_cost? + (angular_velocity * self.cost.angular_velocity as f64)?;
-        (state_cost? + action_error)?.mean(2)
+        tracking_scores(
+            &predicted,
+            action_candidates,
+            &self.reference_states,
+            &self.reference_actions,
+            &self.action_cost,
+            &self.cost,
+        )
     }
+}
+
+pub(crate) trait MetricCandidateScorer: CandidateScorer {
+    fn predict_metric_candidates(&self, actions: &Tensor) -> Result<Tensor>;
+}
+
+impl MetricCandidateScorer for SkyJepaMppiScorer<'_> {
+    fn predict_metric_candidates(&self, actions: &Tensor) -> Result<Tensor> {
+        self.predict_candidates(actions)
+    }
+}
+
+/// A strong, trim-calibrated nominal rigid-body comparator. It receives only
+/// observable state, command-derived motor estimates and the same hover trim
+/// as the learned controller; never the randomized plant's hidden parameters.
+pub struct SkyJepaNominalScorer {
+    initial: Tensor,
+    motors: Tensor,
+    reference_states: Tensor,
+    reference_actions: Tensor,
+    action_cost: Tensor,
+    dt: f32,
+    trim_scale: f32,
+    cost: SkyJepaTrackingCost,
+}
+
+impl SkyJepaNominalScorer {
+    pub fn new(
+        initial: Tensor,
+        motors: Tensor,
+        reference_states: Tensor,
+        reference_actions: Tensor,
+        dt: f32,
+        trim_scale: f32,
+        cost: SkyJepaTrackingCost,
+    ) -> Result<Self> {
+        cost.validate()
+            .map_err(|error| candle::Error::Msg(error.to_string()))?;
+        if !trim_scale.is_finite()
+            || trim_scale <= 0.0
+            || initial.dims2()?.1 != 18
+            || motors.dims() != [initial.dim(0)?, 4]
+            || reference_states.dims3()?.2 != 18
+            || reference_actions.dims() != [initial.dim(0)?, reference_states.dim(1)?, 4]
+        {
+            candle::bail!("invalid nominal scorer context");
+        }
+        let action_cost = Tensor::from_vec(cost.action.clone(), (1, 1, 1, 4), initial.device())?;
+        Ok(Self {
+            initial,
+            motors,
+            reference_states,
+            reference_actions,
+            action_cost,
+            dt,
+            trim_scale,
+            cost,
+        })
+    }
+}
+
+impl MetricCandidateScorer for SkyJepaNominalScorer {
+    fn predict_metric_candidates(&self, actions: &Tensor) -> Result<Tensor> {
+        let (batch, samples, horizon, dim) = actions.dims4()?;
+        if batch != self.initial.dim(0)? || horizon != self.reference_states.dim(1)? || dim != 4 {
+            candle::bail!("nominal candidate shape mismatch");
+        }
+        let initial = self
+            .initial
+            .unsqueeze(1)?
+            .broadcast_as((batch, samples, 18))?
+            .reshape((batch * samples, 18))?;
+        let motors = self
+            .motors
+            .unsqueeze(1)?
+            .broadcast_as((batch, samples, 4))?
+            .reshape((batch * samples, 4))?;
+        let calibrated_actions =
+            (actions / self.trim_scale as f64)?.reshape((batch * samples, horizon, 4))?;
+        super::nominal_physics_rollout(
+            &initial,
+            &calibrated_actions,
+            &motors,
+            self.dt,
+            10,
+            crate::skyjepa_sim::SkyJepaDomain::default(),
+        )?
+        .reshape((batch, samples, horizon, 18))
+    }
+}
+
+impl CandidateScorer for SkyJepaNominalScorer {
+    fn device(&self) -> &Device {
+        self.initial.device()
+    }
+    fn dtype(&self) -> DType {
+        self.initial.dtype()
+    }
+    fn batch_size(&self) -> Option<usize> {
+        Some(self.initial.dims()[0])
+    }
+    fn score_candidates(&self, actions: &Tensor) -> Result<Tensor> {
+        tracking_scores(
+            &self.predict_metric_candidates(actions)?,
+            actions,
+            &self.reference_states,
+            &self.reference_actions,
+            &self.action_cost,
+            &self.cost,
+        )
+    }
+}
+
+fn tracking_scores(
+    predicted: &Tensor,
+    action_candidates: &Tensor,
+    reference_states: &Tensor,
+    reference_actions: &Tensor,
+    action_cost: &Tensor,
+    cost: &SkyJepaTrackingCost,
+) -> Result<Tensor> {
+    let reference = reference_states.unsqueeze(1)?;
+    let position = grouped_squared_error(&predicted, &reference, 0, 3)?;
+    let velocity = grouped_squared_error(&predicted, &reference, 3, 3)?;
+    let attitude = grouped_squared_error(&predicted, &reference, 6, 9)?;
+    let angular_velocity = grouped_squared_error(&predicted, &reference, 15, 3)?;
+    let action_error = action_candidates
+        .broadcast_sub(&reference_actions.unsqueeze(1)?)?
+        .sqr()?
+        .broadcast_mul(action_cost)?
+        .sum(3)?;
+    let state_cost = (position * cost.position as f64)? + (velocity * cost.velocity as f64)?;
+    let state_cost = state_cost? + (attitude * cost.attitude as f64)?;
+    let state_cost = state_cost? + (angular_velocity * cost.angular_velocity as f64)?;
+    (state_cost? + action_error)?.mean(2)
 }
 
 fn validate_stats(stats: &RunningStats, dim: usize, name: &str) -> Result<()> {

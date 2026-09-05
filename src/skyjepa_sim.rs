@@ -161,6 +161,18 @@ impl SkyJepaRotorPlant {
         self.motor_forces
     }
 
+    /// Restore an estimated motor state without advancing the rigid body.
+    pub fn with_motor_forces(mut self, forces: [f32; SKYJEPA_ROTORS]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            forces
+                .iter()
+                .all(|force| force.is_finite() && *force >= 0.0),
+            "motor forces must be finite and nonnegative"
+        );
+        self.motor_forces = forces;
+        Ok(self)
+    }
+
     pub fn nominal_hover_action(&self) -> [f32; SKYJEPA_ROTORS] {
         [self.domain.mass * self.domain.gravity / (4.0 * self.domain.thrust_scale); 4]
     }

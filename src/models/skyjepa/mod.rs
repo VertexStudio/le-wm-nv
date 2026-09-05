@@ -3,17 +3,21 @@ mod config;
 mod control;
 mod kinematics;
 mod model;
+mod nominal;
 mod prober;
 mod session;
 mod tcn;
 mod training;
 
 pub use config::{SkyJepaConfig, TemporalConvConfig};
-pub use control::{SkyJepaControlConfig, SkyJepaMppiScorer, SkyJepaTrackingCost};
+pub use control::{
+    SkyJepaControlConfig, SkyJepaMppiScorer, SkyJepaNominalScorer, SkyJepaTrackingCost,
+};
 pub use kinematics::{
     KinematicConfig, integrate_metric_rollout, integrate_metric_rollout_inference, so3_exp,
 };
 pub use model::SkyJepaModel;
+pub use nominal::nominal_physics_rollout;
 pub use prober::{
     SkyJepaProber, SkyJepaProberConfig, SkyJepaProberLoss, SkyJepaProberLossScalars,
     SkyJepaProberOutput, skyjepa_prober_loss,

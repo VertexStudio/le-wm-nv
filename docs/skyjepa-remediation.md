@@ -130,3 +130,17 @@ The pilot runner uses a frozen trainer binary with SHA-256
 is the authority for this experiment's training implementation. Training started
 with approximately 11 GiB GPU memory occupied by other workloads, including
 Isaac Sim; those workloads were left untouched.
+
+Nominal-physics baseline: a batched CUDA rigid-body rollout now mirrors the CPU
+plant's motor lag, gyroscopic torque, angular damping, SO(3) update, body-axis
+drag, semi-implicit translation, actuator limits, and ground plane. It uses ten
+substeps per 20 Hz action. CPU/CUDA agreement is tested over thirty-step,
+five-candidate rollouts in nominal and randomized parameter fixtures (maximum
+state-component tolerance 0.002). The controller comparator itself only uses
+nominal parameters, command-derived motor estimates and the same observable
+hover trim; randomized test-plant parameters are never passed to it.
+
+Learned and nominal scorers share exactly the same tracking/action cost code.
+A calibrated-hover test verifies both unit trim and non-unit trim have effectively
+zero cost at their corresponding hover command. All three new nominal tests and
+the eight existing SkyJEPA model/integrator tests pass.
