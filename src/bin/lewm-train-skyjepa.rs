@@ -799,7 +799,7 @@ fn train_prober(
         if epoch_end || requested_end {
             model
                 .device()
-                .set_seed(epoch_seed(args.seed ^ 0x5052_4f42_5641_4c, epoch))?;
+                .set_seed(epoch_seed(args.seed ^ 0x0050_524f_4256_414c, epoch))?;
             let validation = validate_prober(
                 dataset,
                 validation_rows,

@@ -651,35 +651,6 @@ fn split_domains(episodes: &[i64], domains: &[i64]) -> anyhow::Result<SkyJepaEpi
     })
 }
 
-#[cfg(test)]
-mod split_tests {
-    use super::*;
-    #[test]
-    fn domain_splits_do_not_share_domains_even_for_interleaved_episodes() -> anyhow::Result<()> {
-        let episodes = (0..200).collect::<Vec<_>>();
-        let domains = episodes
-            .iter()
-            .map(|episode| episode % 10)
-            .collect::<Vec<_>>();
-        let split = split_domains(&episodes, &domains)?;
-        assert_eq!(
-            (split.train.len(), split.validation.len(), split.test.len()),
-            (160, 20, 20)
-        );
-        let domain_set = |episodes: &[i64]| {
-            episodes
-                .iter()
-                .map(|episode| episode % 10)
-                .collect::<BTreeSet<_>>()
-        };
-        assert!(domain_set(&split.train).is_disjoint(&domain_set(&split.validation)));
-        assert!(domain_set(&split.train).is_disjoint(&domain_set(&split.test)));
-        assert!(domain_set(&split.validation).is_disjoint(&domain_set(&split.test)));
-        assert!(split_domains(&[0, 0, 1, 2], &[0, 1, 1, 2]).is_err());
-        Ok(())
-    }
-}
-
 fn valid_sequence_rows(
     episode_idx: &[i64],
     step_idx: &[i64],
@@ -849,5 +820,34 @@ fn shuffle(values: &mut [usize], mut state: u64) {
         state ^= state << 17;
         let swap = (state as usize) % (idx + 1);
         values.swap(idx, swap);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    #[test]
+    fn domain_splits_do_not_share_domains_even_for_interleaved_episodes() -> anyhow::Result<()> {
+        let episodes = (0..200).collect::<Vec<_>>();
+        let domains = episodes
+            .iter()
+            .map(|episode| episode % 10)
+            .collect::<Vec<_>>();
+        let split = split_domains(&episodes, &domains)?;
+        assert_eq!(
+            (split.train.len(), split.validation.len(), split.test.len()),
+            (160, 20, 20)
+        );
+        let domain_set = |episodes: &[i64]| {
+            episodes
+                .iter()
+                .map(|episode| episode % 10)
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(domain_set(&split.train).is_disjoint(&domain_set(&split.validation)));
+        assert!(domain_set(&split.train).is_disjoint(&domain_set(&split.test)));
+        assert!(domain_set(&split.validation).is_disjoint(&domain_set(&split.test)));
+        assert!(split_domains(&[0, 0, 1, 2], &[0, 1, 1, 2]).is_err());
+        Ok(())
     }
 }

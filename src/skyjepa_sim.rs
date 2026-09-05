@@ -291,6 +291,32 @@ fn normalize(value: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
     }
 }
 
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(state: u64) -> Self {
+        Self { state }
+    }
+
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn unit(&mut self) -> f32 {
+        ((self.next() >> 40) as f32 + 0.5) / ((1u32 << 24) as f32)
+    }
+
+    fn range(&mut self, low: f32, high: f32) -> f32 {
+        low + (high - low) * self.unit()
+    }
+}
+
 #[cfg(test)]
 mod distribution_tests {
     use super::*;
@@ -317,31 +343,5 @@ mod distribution_tests {
             );
             shifted.validate().unwrap();
         }
-    }
-}
-
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    fn new(state: u64) -> Self {
-        Self { state }
-    }
-
-    fn next(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut value = self.state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        value ^ (value >> 31)
-    }
-
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 + 0.5) / ((1u32 << 24) as f32)
-    }
-
-    fn range(&mut self, low: f32, high: f32) -> f32 {
-        low + (high - low) * self.unit()
     }
 }
