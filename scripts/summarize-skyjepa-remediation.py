@@ -42,6 +42,8 @@ def control_summary(path, report):
             "aggregate_p99_plan_ms": report["aggregate_p99_plan_ms"], "maximum_plan_ms": report["maximum_plan_ms"],
             "control_deadline_misses": report["control_deadline_misses"],
             "planning_budget_exceedances": report["planning_budget_exceedances"],
+            "maximum_planner_high_command_fraction": max(case["planner_high_command_fraction"] for case in cases),
+            "maximum_plant_high_command_fraction": max(case["plant_high_command_fraction"] for case in cases),
             "ground_contact_runs": sum(case["ground_contact"] for case in cases),
             "nonfinite_runs": sum(not case["finite"] for case in cases),
             "errors": [case["failure"] for case in cases if case["failure"]],

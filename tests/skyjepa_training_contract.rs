@@ -417,11 +417,26 @@ fn domain_split_and_external_evaluation_report_the_actual_population() -> anyhow
         assert_eq!(bench["runs"], 3);
         assert!(bench["checkpoint_sha256"].as_str().unwrap().len() == 64);
         assert!(bench["executable_sha256"].as_str().unwrap().len() == 64);
+        assert_eq!(
+            bench["configuration"]["planner_action_bounds"]["high"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
         for scenario in bench["results"].as_array().unwrap() {
             assert!(scenario["tracking_passed"].is_boolean());
             assert!(scenario["timing_passed"].is_boolean());
             assert!((scenario["trim_scale"].as_f64().unwrap() - 0.9).abs() < 1e-6);
             assert_eq!(scenario["plan_times_ms"].as_array().unwrap().len(), 2);
+            for key in [
+                "plant_low_command_fraction",
+                "plant_high_command_fraction",
+                "planner_low_command_fraction",
+                "planner_high_command_fraction",
+            ] {
+                assert!((0.0..=1.0).contains(&scenario[key].as_f64().unwrap()));
+            }
         }
     }
     successful(

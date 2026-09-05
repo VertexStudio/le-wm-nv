@@ -489,6 +489,10 @@ impl SkyJepaControllerSession {
         &self.control_cfg
     }
 
+    pub fn action_bounds(&self) -> &ActionBounds {
+        &self.planner_cfg.action_bounds
+    }
+
     /// Identical trim calibration and actuator bounds for every comparator.
     pub fn prior_action_sequence(&self, reference: &[[f32; 18]]) -> Vec<[f32; 4]> {
         skyjepa_geometric_action_prior(

@@ -132,8 +132,10 @@ struct ScenarioResult {
     trim_scale: f32,
     mean_model_correction_l2: f64,
     maximum_model_correction_l2: f64,
-    low_action_fraction: f64,
-    high_action_fraction: f64,
+    plant_low_command_fraction: f64,
+    plant_high_command_fraction: f64,
+    planner_low_command_fraction: f64,
+    planner_high_command_fraction: f64,
     ground_contact: bool,
     finite: bool,
     failure: Option<String>,
@@ -296,6 +298,7 @@ fn main() -> anyhow::Result<()> {
         git_commit: command_stdout("git", &["rev-parse", "HEAD"]),
         started_unix,
         configuration: serde_json::json!({"argv":std::env::args().collect::<Vec<_>>(),"session":session_config,"control":controller.control_config(),
+            "planner_action_bounds":{"low":controller.action_bounds().low,"high":controller.action_bounds().high},
             "simulation_rate_hz":args.simulation_rate_hz,"duration_seconds":args.duration_seconds,
             "radius_m":args.radius_m,"period_seconds":args.period_seconds,"domain_seed":args.domain_seed,
             "domain_distribution":args.domain_distribution,
@@ -382,6 +385,8 @@ fn run_scenario(
     let mut plan_times = Vec::with_capacity(steps);
     let mut low_actions = 0usize;
     let mut high_actions = 0usize;
+    let mut planner_low_actions = 0usize;
+    let mut planner_high_actions = 0usize;
     let mut correction_sum = 0.0f64;
     let mut maximum_correction = 0.0f64;
     let mut ground_contact = false;
@@ -431,12 +436,18 @@ fn run_scenario(
         maximum_correction = maximum_correction.max(correction);
         plan_times.push(plan_ms);
         aggregate_plan_times.push(plan_ms);
-        for force in action {
+        for (axis, force) in action.into_iter().enumerate() {
             if force <= 1e-6 {
                 low_actions += 1;
             }
             if force >= maximum_force * 0.999 {
                 high_actions += 1;
+            }
+            if force <= controller.action_bounds().low[axis] + 1e-6 {
+                planner_low_actions += 1;
+            }
+            if force >= controller.action_bounds().high[axis] * 0.999 {
+                planner_high_actions += 1;
             }
         }
         for _ in 0..substeps {
@@ -503,8 +514,10 @@ fn run_scenario(
         trim_scale: controller.trim_scale(),
         mean_model_correction_l2: correction_sum / completed_steps.max(1) as f64,
         maximum_model_correction_l2: maximum_correction,
-        low_action_fraction: low_actions as f64 / action_count,
-        high_action_fraction: high_actions as f64 / action_count,
+        plant_low_command_fraction: low_actions as f64 / action_count,
+        plant_high_command_fraction: high_actions as f64 / action_count,
+        planner_low_command_fraction: planner_low_actions as f64 / action_count,
+        planner_high_command_fraction: planner_high_actions as f64 / action_count,
         ground_contact,
         finite,
         failure,
