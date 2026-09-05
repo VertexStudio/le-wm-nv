@@ -1,3 +1,4 @@
+pub mod checkpoint;
 mod config;
 mod control;
 mod kinematics;

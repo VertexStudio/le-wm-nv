@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, fs, path::Path, time::Instant};
+use std::{collections::VecDeque, path::Path, time::Instant};
 
 use anyhow::{Context, ensure};
 use candle::{DType, Device, Tensor};
@@ -6,13 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     SkyJepaConfig, SkyJepaControlConfig, SkyJepaModel, SkyJepaMppiScorer, SkyJepaProber,
-    SkyJepaProberConfig,
+    checkpoint::SkyJepaCheckpoint,
 };
 use crate::{
     checkpoint::var_builder_from_path,
     data::skyjepa::{
-        SKYJEPA_ACTION_DIM, SKYJEPA_STATE_DIM, SkyJepaActionSpace, SkyJepaDatasetConfig,
-        SkyJepaNormalization,
+        SKYJEPA_ACTION_DIM, SKYJEPA_STATE_DIM, SkyJepaActionSpace, SkyJepaNormalization,
     },
     planner::{ActionBounds, MppiConfig, MppiPlanner},
     skyjepa_sim::{SkyJepaDomain, SkyJepaRotorState},
@@ -89,13 +88,15 @@ impl SkyJepaControllerSession {
     ) -> anyhow::Result<Self> {
         cfg.validate()?;
         let checkpoint_dir = checkpoint_dir.as_ref();
-        let model_cfg: SkyJepaConfig = read_json(&checkpoint_dir.join("model-config.json"))?;
-        let prober_cfg: SkyJepaProberConfig =
-            read_json(&checkpoint_dir.join("prober-config.json"))?;
-        let dataset_cfg: SkyJepaDatasetConfig =
-            read_json(&checkpoint_dir.join("dataset-config.json"))?;
-        let normalization: SkyJepaNormalization =
-            read_json(&checkpoint_dir.join("normalization.json"))?;
+        let checkpoint = SkyJepaCheckpoint::load(checkpoint_dir)?;
+        let model_cfg = checkpoint.contract.model.clone();
+        let prober_cfg = checkpoint
+            .contract
+            .prober
+            .clone()
+            .context("control requires a trained prober")?;
+        let dataset_cfg = checkpoint.contract.dataset;
+        let normalization = checkpoint.contract.normalization.clone();
         ensure!(
             dataset_cfg.action_space == SkyJepaActionSpace::RotorForces,
             "SkyJEPA control requires a rotor-force checkpoint"
@@ -106,16 +107,12 @@ impl SkyJepaControllerSession {
         );
         let model = SkyJepaModel::new(
             model_cfg.clone(),
-            var_builder_from_path(
-                &checkpoint_dir.join("latent.safetensors"),
-                DType::F32,
-                &device,
-            )?,
+            var_builder_from_path(&checkpoint.latent_path(checkpoint_dir), DType::F32, &device)?,
         )?;
         let prober = SkyJepaProber::new(
             prober_cfg,
             var_builder_from_path(
-                &checkpoint_dir.join("prober.safetensors"),
+                &checkpoint.prober_path(checkpoint_dir)?,
                 DType::F32,
                 &device,
             )?,
@@ -365,11 +362,4 @@ impl SkyJepaControllerSession {
     pub fn device(&self) -> &Device {
         &self.device
     }
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
-    serde_json::from_str(
-        &fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?,
-    )
-    .with_context(|| format!("failed to parse {}", path.display()))
 }

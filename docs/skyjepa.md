@@ -146,7 +146,7 @@ cargo run --release --locked --bin lewm-train-skyjepa -- \
 cargo run --release --locked --bin lewm-train-skyjepa -- \
   --dataset-dir "$SKYJEPA_DATA" --output-dir "$SKYJEPA_RUN" \
   --stage prober --batch-size 2048 --prober-max-steps 20000 \
-  --latent-checkpoint "$SKYJEPA_LATENT/latent.safetensors"
+  --latent-checkpoint "$SKYJEPA_LATENT"
 ```
 
 Each stage writes latest weights, optimizer state, deterministic global step,

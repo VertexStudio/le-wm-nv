@@ -586,7 +586,7 @@ fn compute_normalization(
     })
 }
 
-fn validate_normalization(normalization: &SkyJepaNormalization) -> anyhow::Result<()> {
+pub fn validate_normalization(normalization: &SkyJepaNormalization) -> anyhow::Result<()> {
     for (name, stats, expected_dim) in [
         ("state", &normalization.state, SKYJEPA_STATE_DIM),
         ("action", &normalization.action, SKYJEPA_ACTION_DIM),

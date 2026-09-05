@@ -6,7 +6,7 @@ pilot artifacts are preserved.
 
 ## Implementation sequence
 
-- [ ] Versioned checkpoint contract: bind architecture, preprocessing, physics,
+- [x] Versioned checkpoint contract: bind architecture, preprocessing, physics,
   latent parent, data fingerprint, and training settings; reject mismatches
   before modifying an existing run.
 - [ ] Crash-safe checkpoint generations: publish weights, optimizer, progress,
@@ -42,5 +42,16 @@ artifacts in `/tmp/skyjepa-review.EmiA5v` remain unchanged.
 
 ## Results
 
-Pending. Record commands, artifact fingerprints, environment, tests, timings,
-and both successful and unsuccessful experiments here as work progresses.
+Checkpoint contract: `cargo check --locked --workspace --all-targets` passed.
+Three package tests and the CUDA trainer integration test passed. The latter
+trains the prober on a differently normalized dataset, verifies parent
+normalization is retained, and verifies changed mass/latent-parent resume
+requests leave the entire output directory byte-for-byte unchanged.
+
+New checkpoints use `checkpoint.json` with immutable, hashed weights under
+`objects/`. Evaluator and controller reject loose legacy artifacts. Parent
+`--latent-checkpoint` now takes a package directory. Stage-specific run
+manifests include preprocessing, latent identity, physics and loss settings.
+The historical baseline is not modified or automatically converted.
+
+Further experiment results pending.

@@ -20,8 +20,9 @@ use le_wm_nv::{
     },
     models::skyjepa::{
         SkyJepaConfig, SkyJepaLossConfig, SkyJepaLossScalars, SkyJepaModel, SkyJepaProber,
-        SkyJepaProberConfig, SkyJepaProberLossScalars, skyjepa_batch_loss_with_config,
-        skyjepa_latent_rollout, skyjepa_prober_loss,
+        SkyJepaProberConfig, SkyJepaProberLossScalars,
+        checkpoint::{ModelContract, SkyJepaCheckpoint},
+        skyjepa_batch_loss_with_config, skyjepa_latent_rollout, skyjepa_prober_loss,
     },
     optim::StatefulAdamW,
     runtime::DeviceSpec,
@@ -74,7 +75,7 @@ struct Args {
     #[arg(long)]
     overwrite: bool,
 
-    /// Required for --stage prober unless output-dir/latent.safetensors exists.
+    /// Parent checkpoint PACKAGE DIRECTORY for --stage prober. Defaults to output-dir.
     #[arg(long)]
     latent_checkpoint: Option<PathBuf>,
 
@@ -182,6 +183,13 @@ struct RunManifest {
     grad_clip: f64,
     model_config: SkyJepaConfig,
     dataset_config: SkyJepaDatasetConfig,
+    normalization: serde_json::Value,
+    prober_config: SkyJepaProberConfig,
+    parent_latent_identity: Option<String>,
+    loss_config: serde_json::Value,
+    validation_batches: usize,
+    stage_epochs: usize,
+    stage_max_steps: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,9 +225,7 @@ fn main() -> anyhow::Result<()> {
     let output_dir =
         absolute_output_path(&args.output_dir.clone().unwrap_or_else(default_output_dir))?;
     prepare_output_dir(&args, &output_dir)?;
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("failed to create {}", output_dir.display()))?;
-    let (audit_path, audit) = load_audit(&args, &dataset_dir)?;
+    let (audit_path, _audit) = load_audit(&args, &dataset_dir)?;
 
     let model_cfg = SkyJepaConfig::paper_derived();
     let dataset_cfg = SkyJepaDatasetConfig {
@@ -231,7 +237,30 @@ fn main() -> anyhow::Result<()> {
         normalize_actions: true,
         action_space: args.action_space.into(),
     };
-    let dataset = SkyJepaDroneDataset::open(&dataset_dir, dataset_cfg)?;
+    // Verify the parent before writing any run metadata or interpreting inputs.
+    let parent_root = args
+        .latent_checkpoint
+        .clone()
+        .unwrap_or_else(|| output_dir.clone());
+    let parent = if args.stage == TrainingStage::Prober {
+        let package = SkyJepaCheckpoint::load(&parent_root)?;
+        ensure!(
+            package.contract.model == model_cfg
+                && package.contract.dataset.action_space == dataset_cfg.action_space
+                && package.contract.dataset.model_rate_hz == dataset_cfg.model_rate_hz,
+            "parent latent checkpoint is incompatible with requested model/data contract"
+        );
+        Some(package)
+    } else {
+        None
+    };
+    let dataset = SkyJepaDroneDataset::open_with_normalization(
+        &dataset_dir,
+        dataset_cfg,
+        parent
+            .as_ref()
+            .map(|package| package.contract.normalization.clone()),
+    )?;
     let train_rows = dataset.train_rows();
     let validation_rows = dataset.validation_rows();
     ensure!(
@@ -242,12 +271,16 @@ fn main() -> anyhow::Result<()> {
         !validation_rows.is_empty(),
         "SkyJEPA validation split contains no windows"
     );
-    let manifest = RunManifest {
-        format_version: 1,
+    let mut prober_cfg = SkyJepaProberConfig::paper_derived(model_cfg.latent_dim);
+    prober_cfg.kinematics.mass = args.mass;
+    prober_cfg.kinematics.hover_throttle = args.hover_throttle;
+    prober_cfg.kinematics.action_space = dataset_cfg.action_space;
+    let mut manifest = RunManifest {
+        format_version: 2,
         created_at_unix: unix_seconds(),
         git_commit: git_commit(),
         dataset_dir: dataset_dir.clone(),
-        dataset_artifact_sha256: audit.as_ref().map(|audit| audit.artifact_sha256.clone()),
+        dataset_artifact_sha256: Some(skyjepa_artifact_fingerprint(&dataset_dir)?),
         audit_report: audit_path,
         audit_skipped: args.skip_audit,
         device: args.device.to_string(),
@@ -263,15 +296,55 @@ fn main() -> anyhow::Result<()> {
         grad_clip: args.grad_clip,
         model_config: model_cfg.clone(),
         dataset_config: dataset_cfg,
+        normalization: serde_json::to_value(dataset.normalization())?,
+        prober_config: prober_cfg.clone(),
+        parent_latent_identity: parent
+            .as_ref()
+            .map(|package| package.latent_identity())
+            .transpose()?,
+        loss_config: json!({"latent_mse_weight":1.0,"sigreg_weight":0.02,
+            "sigreg_knots":17,"sigreg_projections":64,"prober_objective":"state18_elementwise_mse",
+            "randomness_version":1,"dtype":"f32","optimizer":"adamw",
+            "beta1":0.9,"beta2":0.999,"epsilon":1e-8}),
+        validation_batches: args.validation_batches,
+        stage_epochs: if args.stage == TrainingStage::Prober {
+            args.prober_epochs
+        } else {
+            args.latent_epochs
+        },
+        stage_max_steps: if args.stage == TrainingStage::Prober {
+            args.prober_max_steps
+        } else {
+            args.latent_max_steps
+        },
     };
-    ensure_or_write_manifest(&output_dir, &manifest, args.resume)?;
-    atomic_write_json(&output_dir.join("model-config.json"), &model_cfg)?;
-    atomic_write_json(
-        &output_dir.join("normalization.json"),
-        dataset.normalization(),
+    let first_stage = if args.stage == TrainingStage::Prober {
+        "prober"
+    } else {
+        "latent"
+    };
+    ensure_or_write_manifest(
+        &output_dir,
+        first_stage,
+        &manifest,
+        args.resume,
+        args.overwrite,
     )?;
-    atomic_write_json(&output_dir.join("episode-splits.json"), dataset.splits())?;
-    atomic_write_json(&output_dir.join("dataset-config.json"), &dataset_cfg)?;
+    if args.overwrite {
+        clear_stage_artifacts(&output_dir, first_stage)?;
+        if args.stage == TrainingStage::Both {
+            clear_stage_artifacts(&output_dir, "prober")?;
+        }
+    }
+    if !args.resume {
+        atomic_write_json(&output_dir.join("episode-splits.json"), dataset.splits())?;
+    }
+    let mut contract = ModelContract {
+        model: model_cfg.clone(),
+        dataset: dataset_cfg,
+        normalization: dataset.normalization().clone(),
+        prober: None,
+    };
 
     let device = args.device.resolve()?;
     device.set_seed(args.seed)?;
@@ -294,10 +367,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     if args.stage == TrainingStage::Prober {
-        let checkpoint = args
-            .latent_checkpoint
-            .clone()
-            .unwrap_or_else(|| output_dir.join("latent.safetensors"));
+        let checkpoint = parent.as_ref().unwrap().latent_path(&parent_root);
         latent_vars
             .load(&checkpoint)
             .with_context(|| format!("failed to load {}", checkpoint.display()))?;
@@ -325,17 +395,27 @@ fn main() -> anyhow::Result<()> {
             &mut metrics,
             started,
         )?;
+        SkyJepaCheckpoint::publish(
+            &output_dir,
+            contract.clone(),
+            &output_dir.join("latent.safetensors"),
+            None,
+            serde_json::to_value(&manifest)?,
+        )?;
     }
 
     if args.stage != TrainingStage::Latent {
         if args.stage == TrainingStage::Both {
             latent_vars.load(output_dir.join("latent.safetensors"))?;
         }
-        let mut prober_cfg = SkyJepaProberConfig::paper_derived(model_cfg.latent_dim);
-        prober_cfg.kinematics.mass = args.mass;
-        prober_cfg.kinematics.hover_throttle = args.hover_throttle;
-        prober_cfg.kinematics.action_space = dataset_cfg.action_space;
-        atomic_write_json(&output_dir.join("prober-config.json"), &prober_cfg)?;
+        if args.stage == TrainingStage::Both {
+            manifest.parent_latent_identity =
+                Some(SkyJepaCheckpoint::load(&output_dir)?.latent_identity()?);
+            manifest.stage_epochs = args.prober_epochs;
+            manifest.stage_max_steps = args.prober_max_steps;
+            ensure_or_write_manifest(&output_dir, "prober", &manifest, false, args.overwrite)?;
+        }
+        contract.prober = Some(prober_cfg.clone());
         device.set_seed(args.seed ^ 0x5052_4f42_4552_5f53)?;
         let mut prober_vars = VarMap::new();
         let prober = SkyJepaProber::new(
@@ -362,6 +442,13 @@ fn main() -> anyhow::Result<()> {
             &dataset_dir,
             &mut metrics,
             started,
+        )?;
+        SkyJepaCheckpoint::publish(
+            &output_dir,
+            contract,
+            &output_dir.join("latent.safetensors"),
+            Some(&output_dir.join("prober.safetensors")),
+            serde_json::to_value(&manifest)?,
         )?;
     }
 
@@ -784,9 +871,6 @@ fn prepare_output_dir(args: &Args, output_dir: &Path) -> anyhow::Result<()> {
                 output_dir.display()
             );
         }
-        if args.overwrite {
-            clear_stage_artifacts(output_dir, stage)?;
-        }
     }
     Ok(())
 }
@@ -811,42 +895,35 @@ fn clear_stage_artifacts(output_dir: &Path, stage: &str) -> anyhow::Result<()> {
 
 fn ensure_or_write_manifest(
     output_dir: &Path,
+    stage: &str,
     manifest: &RunManifest,
     resume: bool,
+    overwrite: bool,
 ) -> anyhow::Result<()> {
-    let path = output_dir.join("run-manifest.json");
+    let path = output_dir.join(format!("{stage}-run-manifest.json"));
     if resume {
         let saved: RunManifest = read_json(&path)?;
         ensure!(
-            saved.dataset_dir == manifest.dataset_dir
-                && saved.dataset_artifact_sha256 == manifest.dataset_artifact_sha256
-                && saved.device == manifest.device
-                && saved.action_space == manifest.action_space
-                && saved.batch_size == manifest.batch_size
-                && saved.model_rate_hz == manifest.model_rate_hz
-                && saved.seed == manifest.seed
-                && saved.max_lr == manifest.max_lr
-                && saved.min_lr == manifest.min_lr
-                && saved.warmup_steps == manifest.warmup_steps
-                && saved.cosine_steps == manifest.cosine_steps
-                && saved.weight_decay == manifest.weight_decay
-                && saved.grad_clip == manifest.grad_clip
-                && saved.model_config == manifest.model_config,
-            "resume settings disagree with run-manifest.json"
-        );
-        Ok(())
-    } else if path.exists() {
-        let saved: RunManifest = read_json(&path)?;
-        ensure!(
-            saved.dataset_dir == manifest.dataset_dir
-                && saved.dataset_artifact_sha256 == manifest.dataset_artifact_sha256
-                && saved.model_config == manifest.model_config,
-            "output directory manifest belongs to a different dataset/model"
+            manifest_compatibility(&saved)? == manifest_compatibility(manifest)?,
+            "resume settings disagree with {stage}-run-manifest.json (data, normalization, parent, physics, or training configuration changed)"
         );
         Ok(())
     } else {
+        ensure!(
+            !path.exists() || overwrite,
+            "stage manifest already exists; use --resume or --overwrite"
+        );
         atomic_write_json(&path, manifest)
     }
+}
+
+fn manifest_compatibility(manifest: &RunManifest) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(manifest)?;
+    // These describe invocation provenance, not the experiment's numerical contract.
+    for field in ["created_at_unix", "git_commit", "audit_report"] {
+        value.as_object_mut().unwrap().remove(field);
+    }
+    Ok(value)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -5,9 +5,9 @@ use candle::{DType, Tensor};
 use clap::{Parser, ValueEnum};
 use le_wm_nv::{
     checkpoint::var_builder_from_path,
-    data::skyjepa::{SkyJepaDatasetConfig, SkyJepaDroneDataset, SkyJepaNormalization},
+    data::skyjepa::SkyJepaDroneDataset,
     models::skyjepa::{
-        SkyJepaConfig, SkyJepaModel, SkyJepaProber, SkyJepaProberConfig,
+        SkyJepaConfig, SkyJepaModel, SkyJepaProber, checkpoint::SkyJepaCheckpoint,
         integrate_metric_rollout_inference, skyjepa_latent_rollout,
     },
     runtime::DeviceSpec,
@@ -209,10 +209,14 @@ fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     let dataset_dir = args.dataset_dir.unwrap_or_else(default_dataset_dir);
     let checkpoint_dir = args.checkpoint_dir.unwrap_or_else(default_checkpoint_dir);
-    let mut model_cfg: SkyJepaConfig = read_json(checkpoint_dir.join("model-config.json"))?;
-    let prober_cfg: SkyJepaProberConfig = read_json(checkpoint_dir.join("prober-config.json"))?;
-    let mut dataset_cfg: SkyJepaDatasetConfig =
-        read_json(checkpoint_dir.join("dataset-config.json"))?;
+    let checkpoint = SkyJepaCheckpoint::load(&checkpoint_dir)?;
+    let mut model_cfg = checkpoint.contract.model.clone();
+    let prober_cfg = checkpoint
+        .contract
+        .prober
+        .clone()
+        .context("evaluation requires a trained prober")?;
+    let mut dataset_cfg = checkpoint.contract.dataset;
     ensure!(
         dataset_cfg.history_steps == model_cfg.history_steps
             && dataset_cfg.rollout_steps == model_cfg.rollout_steps,
@@ -221,7 +225,7 @@ fn main() -> anyhow::Result<()> {
     model_cfg.rollout_steps = args.rollout_steps;
     dataset_cfg.batch_size = args.batch_size;
     dataset_cfg.rollout_steps = args.rollout_steps;
-    let normalization: SkyJepaNormalization = read_json(checkpoint_dir.join("normalization.json"))?;
+    let normalization = checkpoint.contract.normalization.clone();
     let dataset = SkyJepaDroneDataset::open_with_normalization(
         &dataset_dir,
         dataset_cfg,
@@ -236,7 +240,7 @@ fn main() -> anyhow::Result<()> {
     let model = SkyJepaModel::new(
         model_cfg.clone(),
         var_builder_from_path(
-            &checkpoint_dir.join("latent.safetensors"),
+            &checkpoint.latent_path(&checkpoint_dir),
             DType::F32,
             &device,
         )?,
@@ -244,7 +248,7 @@ fn main() -> anyhow::Result<()> {
     let prober = SkyJepaProber::new(
         prober_cfg,
         var_builder_from_path(
-            &checkpoint_dir.join("prober.safetensors"),
+            &checkpoint.prober_path(&checkpoint_dir)?,
             DType::F32,
             &device,
         )?,
@@ -329,10 +333,7 @@ fn main() -> anyhow::Result<()> {
         batches,
         model_rate_hz: dataset_cfg.model_rate_hz,
         elapsed_seconds: started.elapsed().as_secs_f64(),
-        normalization_source: checkpoint_dir
-            .join("normalization.json")
-            .display()
-            .to_string(),
+        normalization_source: checkpoint_dir.join("checkpoint.json").display().to_string(),
         skyjepa: accumulator.finish(&model_cfg, dataset_cfg.model_rate_hz),
         constant_velocity_baseline: constant_velocity.finish(dataset_cfg.model_rate_hz),
         kinematic_baseline: kinematic.finish(dataset_cfg.model_rate_hz),
@@ -394,13 +395,6 @@ fn rotation_distance(lhs: &[f32], rhs: &[f32]) -> f64 {
         .map(|(lhs, rhs)| f64::from(*lhs) * f64::from(*rhs))
         .sum::<f64>();
     ((frobenius_inner - 1.0) * 0.5).clamp(-1.0, 1.0).acos()
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: PathBuf) -> anyhow::Result<T> {
-    serde_json::from_str(
-        &fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?,
-    )
-    .with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn default_dataset_dir() -> PathBuf {
