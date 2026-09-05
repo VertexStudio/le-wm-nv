@@ -21,6 +21,42 @@ UAV state18/action4 -> SkyJEPA TCN/GRU -> physics prober -> metric MPPI -> rotor
 
 ![SkyJEPA pipeline from simulation data synthesis through latent dynamics and physics-inspired probing to sampling-based control](docs/skyjepa-pipeline.jpg)
 
+### Corrected pilot (2026-09-05)
+
+Three independent training seeds now use audited, domain-disjoint data and
+validated checkpoint/resume contracts. Each model trains in approximately
+**34 minutes on a shared RTX 4090**, using 1,600 ten-second training episodes
+(4.44 simulated hours) from a 2,000-episode dataset. This is a measured pilot
+budget, not the minimum data needed or an RL-policy sample-efficiency result.
+
+At 512 MPPI candidates, horizon 15 and 20 Hz control, the exact-trim comparison
+on the same 63 nominal/held-out-domain cases is:
+
+| Controller | Tracking passes | Mean RMSE | Worst RMSE | Planning p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Geometric prior | 63/63 | 0.2153 m | 0.5706 m | 0.0015 ms |
+| Nominal-physics MPPI | 63/63 | 0.1609 m | 0.3038 m | 3.215 ms |
+| Fixed untrained MPPI | 51/63 | 0.6035 m | 1.8637 m | 8.931 ms |
+| Trained SkyJEPA, three seeds | 63/63 each | 0.2009–0.2059 m | 0.3781–0.4231 m | 8.818–8.936 ms |
+
+Training improves on random weights and reduces the prior's mean error by
+4.4–6.7% and worst trajectory RMSE by 25.9–33.7%. However, **nominal-physics MPPI
+is more accurate and faster here**. This validates working learned control,
+not an advantage over a nonlearned predictive controller. All exact-trim rows
+pass the timing criterion; tracking and timing are reported separately for the
+trim and distribution stress tests, including failures.
+
+Across exact/±10% trim and deliberately shifted mass/motor lag, trained models
+pass **756/756 tracking cases** and 741/756 timing cases. Two seed/trim reports
+fail the combined gate; no controller records a 50 ms deadline miss. Under the
+mass/lag shift, trained mean error is slightly worse than the prior's.
+
+See the [complete three-seed results](docs/skyjepa-remediation-results.md) for
+the frozen warm-start decision, all stress conditions, long-horizon limitations,
+reproduction commands and local-only simulator recording.
+
+### Simulator capture (historical pilot)
+
 This is a preserved **2026-09-03 pilot** capture from the dedicated Bevy simulator
 running a trained checkpoint on a held-out randomized rotor plant. It predates
 the corrected domain-disjoint dataset and versioned checkpoint contracts.
@@ -36,27 +72,11 @@ scripted animation.
 at normal simulation speed. Yellow is executed, cyan is reference, magenta is
 predicted, and green shows rotor force.
 
-The historical model in this capture was trained locally on an RTX 4090 from 2,000
-ten-second trajectories across 100 randomized domains (402,000 state/action
-rows). At the paper's controller setting of 512 candidates and horizon 15, the
-historical automated gate passed all 63 nominal and held-out hover, circle, and
-figure-eight runs:
-
-| Closed-loop result | SkyJEPA + prior | Matched prior only |
-| --- | ---: | ---: |
-| Successful runs | **63 / 63** | 62 / 63 |
-| Mean trajectory RMSE | **0.2210 m** | 0.2245 m |
-| Worst trajectory RMSE | **0.407 m** | 0.888 m |
-| Worst position error | **0.984 m** | 1.394 m |
-| Aggregate p95 planning latency | **8.64 ms** | 0.0013 ms |
-
-The prior-only column is important: SkyJEPA is not being credited for the
-geometric stabilization shared by both controllers. It measures whether the
-learned dynamics correction improves the same nominal flight sequence. The
-historical learned controller eliminated the one prior-only failure and
-substantially reduced the worst-domain error. This two-controller comparison
-does not establish an advantage over nonlearned model-predictive control.
-Render-contended HUD latency is not the headless benchmark above.
+The historical checkpoint, results and GIF remain preserved; its original
+two-controller comparison is documented in
+[the historical pilot notes](docs/skyjepa.md#historical-pilot-evidence-2026-09-03).
+Render-contended HUD latency is not the headless benchmark above. The new
+corrected-checkpoint recording stays local, outside the website assets.
 
 ### How this was built without released implementation code
 
@@ -167,8 +187,8 @@ drone evaluation paths.
   batch-loss API, AdamW training CLIs, PushT HDF5 dataset streaming, drone
   vector-observation dataset training, and safetensors save/reload.
 - Native SkyJEPA surface: full UAV state18/rotor-force action4 schema,
-  causal-TCN encoders, recursive GRU latent dynamics, SIGReg, frozen
-  physics-inspired prober, differentiable SO(3) integration, batched MPPI,
+  causal-TCN encoders, recursive GRU latent dynamics, SIGReg, frozen-latent
+  physics-inspired prober training, differentiable SO(3) integration, batched MPPI,
   audited domain-randomized data generation, resumable best-checkpoint staged
   training, fixed-normalization long-horizon evaluation with baselines,
   trim-aware low-latency control, closed-loop scenario gating, and a dedicated

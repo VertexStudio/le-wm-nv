@@ -271,6 +271,10 @@ control-loop measures after that first compile cycle.
 
 ## Historical pilot evidence (2026-09-03)
 
+Current results are in [the corrected three-seed report](skyjepa-remediation-results.md),
+including nominal-physics/untrained baselines, trim stress, deliberate distribution
+shift, full-population prediction metrics and a new local simulator recording.
+
 These results and the README GIF refer to the preserved historical checkpoint,
 not the corrected three-seed pilot. The historical episode-disjoint split shared
 physical domains, and a later audit found domain/flight-type coverage aliasing.
