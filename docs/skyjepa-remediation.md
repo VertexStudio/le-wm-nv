@@ -1,8 +1,10 @@
 # SkyJEPA remediation and validation
 
-Status: implementation in progress. All commits stay local until the user
-reviews the results and explicitly authorizes a push. LeWM and the accepted
-pilot artifacts are preserved.
+Status: implementation and the corrected experiment are complete. All commits
+stay local until the user reviews the results and explicitly authorizes a push.
+LeWM and the historical pilot artifacts are preserved. See
+[the final evidence report](skyjepa-remediation-results.md): tracking succeeds,
+but nominal-physics MPPI is stronger and two trained stress reports fail timing.
 
 ## Implementation sequence
 
@@ -15,10 +17,10 @@ pilot artifacts are preserved.
   validation; uninterrupted/interrupted equivalence tests.
 - [x] Canonical 20 Hz contract across trainer, evaluator, and controller.
 - [x] Domain/trajectory coverage audit and explicit evaluation populations.
-- [ ] Compare fresh-prior and shifted-residual warm starts under matched settings.
-- [ ] Matched-budget nominal-physics/untrained/trained MPPI ablations, imperfect
+- [x] Compare fresh-prior and shifted-residual warm starts under matched settings.
+- [x] Matched-budget nominal-physics/untrained/trained MPPI ablations, imperfect
   trim tests, and separate tracking/timing reporting with artifact provenance.
-- [ ] Corrected pilot, multiple training seeds, held-out-domain and deliberate
+- [x] Corrected pilot, multiple training seeds, held-out-domain and deliberate
   distribution-shift evaluations, simulator verification, and evidence report.
 
 ## Acceptance rules
@@ -63,7 +65,8 @@ Fault-injection tests cover interruption before weights, between weights and
 optimizer, and before publication; corruption is rejected on load. Completed
 stages can be resumed to recover package export without repeating updates.
 
-Further experiment results pending.
+The implementation checks below precede the corrected experiment; all final
+numerical results are retained in the linked report, including negative findings.
 
 Resume regression: on the current CUDA environment, interrupted latent runs
 at steps 7, 8, and 9 (before/after epoch validation and into the next epoch)
@@ -120,8 +123,10 @@ Warm-start comparison support is implemented but no default change is promoted:
 previous correction around the new geometric prior, bounded to +/-2 N per rotor
 with a zero tail and actuator clamping. A correction becomes active only after
 the action is committed, and reset clears it. CPU tensor regression and workspace
-checks pass. The validation comparison will run after training, without GPU
-training contention, before any final-test evaluation.
+checks pass. Validation ran after training and before final testing: fresh-prior
+remains selected for trained and untrained MPPI; shifted residual is selected
+only for nominal-physics MPPI. Trained mean RMSE was 0.2037 m fresh versus
+0.2196 m shifted across all three validation seeds. No final-test tuning followed.
 
 The pilot runner uses a frozen trainer binary with SHA-256
 `057571a4afa52cde3ae5c4b258c18536716f91c4f60ab601286074244804096d`
@@ -186,7 +191,7 @@ are measured separately for every seed. The runner refuses concurrent training
 or compilation for timing measurements and preserves each invocation/report.
 
 Full `cargo test --locked --workspace -- --test-threads=1` passes, including
-LeWM CUDA training/runtime regressions. The three local-uv evaluation-protocol
+LeWM CUDA training/runtime regressions. The five local-uv evaluation-protocol
 tests also pass. Simulator reports now bind the checkpoint/executable and
 configuration, retain a per-control-step state/reference/action/correction trace,
 and report finite-state and substep ground-contact checks. Its new integration
@@ -199,11 +204,12 @@ prober 5,000 steps in 343.128 seconds. Best latent validation prediction loss
 0.259284 (24 active dimensions), best prober validation MSE 0.019535 at step
 4,860. Training checkpoint selection uses the recorded eight validation batches
 per epoch, not the complete validation population. Follow-up open-loop evaluation
-will cover the complete selected test populations. These validation numbers are
+covers the complete selected test populations for all three seeds. These validation numbers are
 not directly comparable to the historical pilot's different preprocessing/split.
 
-The final implementation verification log is `workspace-tests.log` in the
-artifact root: 85 Rust tests pass, plus five local-uv protocol/summary tests.
+The implementation verification log is `workspace-tests.log` in the artifact
+root, with a final post-experiment rerun in `final-workspace-tests.log`:
+85 Rust tests pass, plus five local-uv protocol/summary tests.
 Clippy completes with existing warnings outside the newly introduced code.
 Evaluation uses frozen binaries with SHA-256:
 
@@ -218,8 +224,8 @@ position-vector RMSE is 0.0398/0.0515 m at 0.25 s, 0.6360/0.7400 m at 1 s,
 and 10.399/3.300 m at 3 s. Under deliberate mass/lag shift, it is
 0.1164/0.0626 m, 2.1450/0.8805 m and 21.260/3.655 m respectively. Thus the first
 seed improves short-horizon in-range prediction but fails long-horizon and
-shifted-dynamics comparisons. Other seeds and all control comparisons remain
-pending; these are not promoted as final multi-seed results.
+shifted-dynamics comparisons. The other seeds and all control comparisons are
+now complete and individually reported in the final evidence report.
 
 A preliminary seed-7, fresh-prior figure-eight simulation (raw domain seed
 31415, 160 control steps) completes with finite state, no ground contact,
@@ -236,3 +242,21 @@ binary above is used for all validation/final control reports. A paired,
 perturbed-trim smoke test over all four comparators checks that tracking,
 correction and finite/ground-contact results are numerically identical between
 the two binaries (`reporting-regression/`).
+
+## Completed corrected experiment
+
+All three training seeds finish the fixed 1,000/5,000-step budgets, taking
+102.47 minutes total on the shared RTX 4090. Nine complete-population open-loop
+reports cover 871,200 overlapping evaluation windows in total. The validation
+selection uses 270 control runs; 24 final reports cover 1,512 further runs under
+the preregistered settings. Trained controllers pass 756/756 tracking cases and
+741/756 timing cases; two seed-29 perturbed-trim reports fail the combined gate.
+Nominal-physics MPPI has lower mean error and latency in every final condition.
+All three learned models fail the long-horizon and shifted open-loop comparisons.
+
+Two additional 20-second headless demonstrations and a real 20-second Bevy
+capture use the selected seed-7 package and fresh-prior warm start. The local
+video, exact commands, executable/checkpoint hashes, individual seed results,
+paired comparisons, timing failures and interpretation limits are documented
+in [skyjepa-remediation-results.md](skyjepa-remediation-results.md) and its
+[machine-readable evidence](skyjepa-remediation-results.json).
