@@ -16,6 +16,7 @@ use super::drone_racing::{DroneRacingMetadata, RunningStats, mat3_mul_vec3};
 pub const SKYJEPA_STATE_DIM: usize = 18;
 pub const SKYJEPA_ACTION_DIM: usize = 4;
 pub const SKYJEPA_SCHEMA_VERSION: u32 = 1;
+pub const SKYJEPA_MODEL_RATE_HZ: usize = 20;
 
 /// Content fingerprint for the canonical files that define one generated
 /// SkyJEPA artifact. Audit reports and training manifests use the same routine
@@ -129,7 +130,7 @@ impl SkyJepaDatasetConfig {
             batch_size,
             history_steps: 10,
             rollout_steps: 20,
-            model_rate_hz: 20,
+            model_rate_hz: SKYJEPA_MODEL_RATE_HZ,
             normalize_states: true,
             normalize_actions: true,
             action_space: SkyJepaActionSpace::BodyRatesThrottle,
@@ -147,8 +148,8 @@ impl SkyJepaDatasetConfig {
             "rollout_steps must be greater than zero"
         );
         ensure!(
-            self.model_rate_hz > 0,
-            "model_rate_hz must be greater than zero"
+            self.model_rate_hz == SKYJEPA_MODEL_RATE_HZ,
+            "SkyJEPA requires the canonical {SKYJEPA_MODEL_RATE_HZ} Hz model rate"
         );
         Ok(())
     }

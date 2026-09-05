@@ -120,6 +120,7 @@ impl SkyJepaControllerSession {
         let nominal = SkyJepaDomain::default();
         let hover_action = [nominal.mass * nominal.gravity / 4.0; SKYJEPA_ACTION_DIM];
         let mut control_cfg = SkyJepaControlConfig::paper_derived();
+        control_cfg.dt = 1.0 / dataset_cfg.model_rate_hz as f32;
         control_cfg.samples = cfg.samples;
         control_cfg.horizon = cfg.horizon;
         let max_rotor_force = nominal.mass * nominal.gravity * nominal.max_thrust_weight / 4.0;

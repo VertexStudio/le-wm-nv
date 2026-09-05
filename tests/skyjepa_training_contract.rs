@@ -285,3 +285,18 @@ fn cuda_resume_matches_uninterrupted_updates_across_validation_and_epoch_boundar
     );
     Ok(())
 }
+
+#[test]
+fn trainer_rejects_noncanonical_rate_before_creating_a_run() -> anyhow::Result<()> {
+    let scratch = Scratch::new();
+    let output_dir = scratch.0.join("must-not-exist");
+    let output = Command::new(env!("CARGO_BIN_EXE_lewm-train-skyjepa"))
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .args(["--model-rate-hz", "10"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("20 Hz"));
+    assert!(!output_dir.exists());
+    Ok(())
+}

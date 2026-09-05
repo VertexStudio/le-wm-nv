@@ -14,8 +14,8 @@ use le_wm_nv::{
     data::{
         drone_racing::epoch_seed,
         skyjepa::{
-            SkyJepaActionSpace, SkyJepaDatasetConfig, SkyJepaDroneDataset, SkyJepaNormalization,
-            skyjepa_artifact_fingerprint,
+            SKYJEPA_MODEL_RATE_HZ, SkyJepaActionSpace, SkyJepaDatasetConfig, SkyJepaDroneDataset,
+            SkyJepaNormalization, skyjepa_artifact_fingerprint,
         },
     },
     models::skyjepa::{
@@ -1193,7 +1193,10 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     ensure!(args.latent_epochs > 0, "latent_epochs must be positive");
     ensure!(args.prober_epochs > 0, "prober_epochs must be positive");
     ensure!(args.batch_size > 1, "batch_size must be at least two");
-    ensure!(args.model_rate_hz > 0, "model_rate_hz must be positive");
+    ensure!(
+        args.model_rate_hz == SKYJEPA_MODEL_RATE_HZ,
+        "SkyJEPA requires the canonical {SKYJEPA_MODEL_RATE_HZ} Hz model rate"
+    );
     ensure!(args.log_every > 0, "log_every must be positive");
     ensure!(
         args.latent_max_steps.is_none_or(|steps| steps > 0),

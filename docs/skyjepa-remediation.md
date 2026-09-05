@@ -13,7 +13,7 @@ pilot artifacts are preserved.
   and contract together; retain the previous committed generation.
 - [x] Deterministic resume: step-addressed SIGReg randomness and independent
   validation; uninterrupted/interrupted equivalence tests.
-- [ ] Canonical 20 Hz contract across trainer, evaluator, and controller.
+- [x] Canonical 20 Hz contract across trainer, evaluator, and controller.
 - [ ] Domain/trajectory coverage audit and explicit evaluation populations.
 - [ ] Compare fresh-prior and shifted-residual warm starts under matched settings.
 - [ ] Matched-budget nominal-physics/untrained/trained MPPI ablations, imperfect
@@ -79,3 +79,9 @@ uncommitted/partial log tails in separate files and restores the committed log
 before appending, so replay does not duplicate updates in reported metrics.
 This is a same-hardware/software determinism guarantee, not a claim of bitwise
 equivalence across GPU models or CUDA/library versions.
+
+The dataset/model contract now requires 20 Hz; raw higher-rate data can still
+be explicitly strided into that model rate. Trainer rejection occurs before
+creating a run. Package validation rejects noncanonical rates even when the
+package hash is internally consistent, and the controller derives its timestep
+from validated metadata. Existing strided-data tests remain passing.

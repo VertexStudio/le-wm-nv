@@ -201,3 +201,28 @@ fn failed_snapshot_writes_never_replace_committed_generation() -> anyhow::Result
     );
     Ok(())
 }
+
+#[test]
+fn noncanonical_model_rates_are_rejected_even_with_matching_hashes() -> anyhow::Result<()> {
+    let scratch = Scratch::new();
+    let weights = scratch.0.join("weights");
+    fs::write(&weights, b"weight fixture")?;
+    let mut package = SkyJepaCheckpoint::publish(
+        &scratch.0,
+        contract(),
+        &weights,
+        None,
+        serde_json::json!({}),
+    )?;
+    package.contract.dataset.model_rate_hz = 10;
+    package.contract_sha256 =
+        le_wm_nv::models::skyjepa::checkpoint::json_sha256(&package.contract)?;
+    atomic_json(&scratch.0.join("checkpoint.json"), &package)?;
+    assert!(
+        SkyJepaCheckpoint::load(&scratch.0)
+            .unwrap_err()
+            .to_string()
+            .contains("20 Hz")
+    );
+    Ok(())
+}
