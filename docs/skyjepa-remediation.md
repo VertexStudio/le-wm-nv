@@ -168,3 +168,19 @@ The deliberate shift (seed 90002) uses mass 1.55–1.75 times nominal and motor
 lag 0.11–0.14 s, both outside training support. Other parameter draws are
 unchanged; a 1,000-seed regression verifies this. Metadata, audits and control
 reports explicitly label the population; unseen seeds alone are not called OOD.
+
+The serial evaluation runner is `scripts/evaluate-skyjepa-remediation.py`, run
+with local `uv run --locked`. Before looking at validation results, its warm-start
+selection rule is fixed: shifted residuals must improve mean RMSE by at least
+1%, lose no tracking or timing successes, keep aggregate p95 <=10 ms, and worsen
+worst-case RMSE by no more than 5%. Otherwise fresh-prior remains selected.
+Nominal and untrained MPPI get their own matched validation comparison; trained
+MPPI selection aggregates all three training seeds. The final seed is never
+used for this choice. Final tests cover all four comparators at trim multipliers
+1.0/0.9/1.1, plus the deliberately shifted population at unit trim.
+
+Nonlearned and fixed-initialization baselines are executed once, not presented
+as three independent training-seed measurements. Reuse requires exact equality
+of all three packages' model/preprocessing/physics contracts. Trained results
+are measured separately for every seed. The runner refuses concurrent training
+or compilation for timing measurements and preserves each invocation/report.
