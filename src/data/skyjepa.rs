@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufReader, Read},
     path::{Path, PathBuf},
@@ -113,6 +113,13 @@ impl SkyJepaDatasetMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SkyJepaSplitBy {
+    Episodes,
+    Domains,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SkyJepaDatasetConfig {
     pub batch_size: usize,
@@ -122,6 +129,7 @@ pub struct SkyJepaDatasetConfig {
     pub normalize_states: bool,
     pub normalize_actions: bool,
     pub action_space: SkyJepaActionSpace,
+    pub split_by: SkyJepaSplitBy,
 }
 
 impl SkyJepaDatasetConfig {
@@ -134,6 +142,7 @@ impl SkyJepaDatasetConfig {
             normalize_states: true,
             normalize_actions: true,
             action_space: SkyJepaActionSpace::BodyRatesThrottle,
+            split_by: SkyJepaSplitBy::Episodes,
         }
     }
 
@@ -204,6 +213,7 @@ pub struct SkyJepaDroneDataset {
     actions_raw: Vec<f32>,
     actions_normalized: Vec<f32>,
     episode_idx: Vec<i64>,
+    domain_idx: Option<Vec<i64>>,
     step_idx: Vec<i64>,
     dt: Vec<f32>,
     splits: SkyJepaEpisodeSplit,
@@ -304,7 +314,20 @@ impl SkyJepaDroneDataset {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let splits = split_episodes(&episodes)?;
+        let domain_idx = if file.link_exists("domain_idx") {
+            Some(read_i64_dataset(&file, "domain_idx", rows)?)
+        } else {
+            None
+        };
+        let splits = match config.split_by {
+            SkyJepaSplitBy::Episodes => split_episodes(&episodes)?,
+            SkyJepaSplitBy::Domains => split_domains(
+                &episode_idx,
+                domain_idx
+                    .as_deref()
+                    .context("domain split requires domain_idx")?,
+            )?,
+        };
         let normalization = match fixed_normalization {
             Some(normalization) => {
                 validate_normalization(&normalization)?;
@@ -343,6 +366,7 @@ impl SkyJepaDroneDataset {
             actions_raw,
             actions_normalized,
             episode_idx,
+            domain_idx,
             step_idx,
             dt,
             splits,
@@ -385,6 +409,60 @@ impl SkyJepaDroneDataset {
 
     pub fn test_rows(&self) -> Vec<usize> {
         self.rows_for_episodes(&self.splits.test)
+    }
+
+    pub fn all_rows(&self) -> Vec<usize> {
+        self.valid_rows.clone()
+    }
+
+    pub fn domain_fingerprints_for_rows(&self, rows: &[usize]) -> anyhow::Result<Vec<String>> {
+        if self.domain_idx.is_none() {
+            return Ok(Vec::new());
+        }
+        #[derive(Deserialize)]
+        struct DomainRecord {
+            index: usize,
+            parameters: crate::skyjepa_sim::SkyJepaDomain,
+        }
+        let records: Vec<DomainRecord> =
+            serde_json::from_slice(&fs::read(self.root.join("domains.json"))?)?;
+        let mut fingerprints = BTreeSet::new();
+        for domain in self.domain_ids_for_rows(rows) {
+            let record = records
+                .get(domain as usize)
+                .context("missing physical domain parameters")?;
+            ensure!(
+                record.index == domain as usize,
+                "domain parameter index mismatch"
+            );
+            record.parameters.validate()?;
+            fingerprints.insert(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&record.parameters)?)
+            ));
+        }
+        Ok(fingerprints.into_iter().collect())
+    }
+
+    pub fn episode_ids_for_rows(&self, rows: &[usize]) -> Vec<i64> {
+        rows.iter()
+            .map(|row| self.episode_idx[*row])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn domain_ids_for_rows(&self, rows: &[usize]) -> Vec<i64> {
+        self.domain_idx
+            .as_ref()
+            .map(|domains| {
+                rows.iter()
+                    .map(|row| domains[*row])
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn shuffled_rows(&self, rows: &[usize], seed: u64) -> Vec<usize> {
@@ -535,6 +613,68 @@ fn split_episodes(episodes: &[i64]) -> anyhow::Result<SkyJepaEpisodeSplit> {
         validation: episodes[train_end..validation_end].to_vec(),
         test: episodes[validation_end..].to_vec(),
     })
+}
+
+fn split_domains(episodes: &[i64], domains: &[i64]) -> anyhow::Result<SkyJepaEpisodeSplit> {
+    let mut episode_domains = BTreeMap::new();
+    for (&episode, &domain) in episodes.iter().zip(domains) {
+        ensure!(domain >= 0, "negative domain index");
+        if let Some(previous) = episode_domains.insert(episode, domain) {
+            ensure!(previous == domain, "episode {episode} changes domain");
+        }
+    }
+    let unique = domains
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ensure!(
+        unique.len() >= 3,
+        "domain-disjoint splits require at least three domains"
+    );
+    let groups = split_episodes(&unique)?;
+    let select = |domain_ids: &[i64]| {
+        episode_domains
+            .iter()
+            .filter(|(_, domain)| domain_ids.binary_search(domain).is_ok())
+            .map(|(episode, _)| *episode)
+            .collect::<Vec<_>>()
+    };
+    Ok(SkyJepaEpisodeSplit {
+        train: select(&groups.train),
+        validation: select(&groups.validation),
+        test: select(&groups.test),
+    })
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    #[test]
+    fn domain_splits_do_not_share_domains_even_for_interleaved_episodes() -> anyhow::Result<()> {
+        let episodes = (0..200).collect::<Vec<_>>();
+        let domains = episodes
+            .iter()
+            .map(|episode| episode % 10)
+            .collect::<Vec<_>>();
+        let split = split_domains(&episodes, &domains)?;
+        assert_eq!(
+            (split.train.len(), split.validation.len(), split.test.len()),
+            (160, 20, 20)
+        );
+        let domain_set = |episodes: &[i64]| {
+            episodes
+                .iter()
+                .map(|episode| episode % 10)
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(domain_set(&split.train).is_disjoint(&domain_set(&split.validation)));
+        assert!(domain_set(&split.train).is_disjoint(&domain_set(&split.test)));
+        assert!(domain_set(&split.validation).is_disjoint(&domain_set(&split.test)));
+        assert!(split_domains(&[0, 0, 1, 2], &[0, 1, 1, 2]).is_err());
+        Ok(())
+    }
 }
 
 fn valid_sequence_rows(

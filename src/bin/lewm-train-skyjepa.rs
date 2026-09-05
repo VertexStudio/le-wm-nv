@@ -15,7 +15,7 @@ use le_wm_nv::{
         drone_racing::epoch_seed,
         skyjepa::{
             SKYJEPA_MODEL_RATE_HZ, SkyJepaActionSpace, SkyJepaDatasetConfig, SkyJepaDroneDataset,
-            SkyJepaNormalization, skyjepa_artifact_fingerprint,
+            SkyJepaNormalization, SkyJepaSplitBy, skyjepa_artifact_fingerprint,
         },
     },
     models::skyjepa::{
@@ -103,6 +103,10 @@ struct Args {
 
     #[arg(long, default_value_t = 20)]
     model_rate_hz: usize,
+
+    /// Hold complete physical domains out of training by default.
+    #[arg(long, value_enum, default_value_t = SkyJepaSplitBy::Domains)]
+    split_by: SkyJepaSplitBy,
 
     /// Rotor forces are the canonical SkyJEPA action model. Select
     /// body-rates-throttle only for the legacy LeWM racing import.
@@ -193,6 +197,10 @@ struct RunManifest {
     normalization: SkyJepaNormalization,
     prober_config: SkyJepaProberConfig,
     parent_latent_identity: Option<String>,
+    parent_provenance: Option<serde_json::Value>,
+    training_episodes: Vec<i64>,
+    training_domains: Vec<i64>,
+    training_domain_fingerprints: Vec<String>,
     loss_config: serde_json::Value,
     validation_batches: usize,
     stage_epochs: usize,
@@ -245,6 +253,7 @@ fn main() -> anyhow::Result<()> {
         normalize_states: true,
         normalize_actions: true,
         action_space: args.action_space.into(),
+        split_by: args.split_by,
     };
     // Verify the parent before writing any run metadata or interpreting inputs.
     let parent_root = args
@@ -315,6 +324,12 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .map(|package| package.latent_identity())
             .transpose()?,
+        parent_provenance: parent
+            .as_ref()
+            .map(|package| package.latent_provenance().clone()),
+        training_episodes: dataset.episode_ids_for_rows(&train_rows),
+        training_domains: dataset.domain_ids_for_rows(&train_rows),
+        training_domain_fingerprints: dataset.domain_fingerprints_for_rows(&train_rows)?,
         loss_config: json!({"latent_mse_weight":1.0,"sigreg_weight":0.02,
             "sigreg_knots":17,"sigreg_projections":64,"prober_objective":"state18_elementwise_mse",
             "randomness_version":2,"batch_policy":"drop_singleton_tail_v1","dtype":"f32","optimizer":"adamw",
@@ -460,6 +475,11 @@ fn main() -> anyhow::Result<()> {
         if args.stage == TrainingStage::Both {
             manifest.parent_latent_identity =
                 Some(SkyJepaCheckpoint::load(&output_dir)?.latent_identity()?);
+            manifest.parent_provenance = Some(
+                SkyJepaCheckpoint::load(&output_dir)?
+                    .latent_provenance()
+                    .clone(),
+            );
             manifest.stage_epochs = args.prober_epochs;
             manifest.stage_max_steps = args.prober_max_steps;
             ensure_or_write_manifest(&output_dir, "prober", &manifest, false, args.overwrite)?;

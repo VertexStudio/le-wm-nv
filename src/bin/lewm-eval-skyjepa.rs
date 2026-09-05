@@ -1,11 +1,11 @@
-use std::{fs, path::PathBuf, time::Instant};
+use std::{collections::BTreeSet, fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, ensure};
 use candle::{DType, Tensor};
 use clap::{Parser, ValueEnum};
 use le_wm_nv::{
     checkpoint::var_builder_from_path,
-    data::skyjepa::SkyJepaDroneDataset,
+    data::skyjepa::{SkyJepaDroneDataset, SkyJepaSplitBy, skyjepa_artifact_fingerprint},
     models::skyjepa::{
         SkyJepaConfig, SkyJepaModel, SkyJepaProber, checkpoint::SkyJepaCheckpoint,
         integrate_metric_rollout_inference, skyjepa_latent_rollout,
@@ -18,6 +18,8 @@ use serde::Serialize;
 enum EvalSplit {
     Validation,
     Test,
+    /// Evaluate every valid window of an external dataset, never training episodes.
+    All,
 }
 
 #[derive(Debug, Parser)]
@@ -77,6 +79,16 @@ struct BaselineHorizonMetrics {
 #[derive(Debug, Serialize)]
 struct EvaluationReport {
     split: String,
+    split_by: SkyJepaSplitBy,
+    scope: String,
+    dataset_artifact_sha256: String,
+    checkpoint_sha256: String,
+    available_windows: usize,
+    complete_population: bool,
+    evaluated_episode_ids: Vec<i64>,
+    evaluated_domain_ids: Vec<i64>,
+    evaluated_domain_fingerprints: Vec<String>,
+    training_domain_overlap: usize,
     windows: usize,
     batches: usize,
     model_rate_hz: usize,
@@ -231,11 +243,59 @@ fn main() -> anyhow::Result<()> {
         dataset_cfg,
         Some(normalization),
     )?;
-    let rows = match args.split {
+    let mut rows = match args.split {
         EvalSplit::Validation => dataset.validation_rows(),
         EvalSplit::Test => dataset.test_rows(),
+        EvalSplit::All => dataset.all_rows(),
     };
     ensure!(!rows.is_empty(), "selected SkyJEPA split has no windows");
+    let available_windows = rows.len();
+    if args.max_batches > 0 {
+        rows.truncate(args.max_batches.saturating_mul(args.batch_size));
+    }
+    let evaluated_episode_ids = dataset.episode_ids_for_rows(&rows);
+    let evaluated_domain_ids = dataset.domain_ids_for_rows(&rows);
+    let evaluated_domain_fingerprints = dataset.domain_fingerprints_for_rows(&rows)?;
+    let dataset_artifact_sha256 = skyjepa_artifact_fingerprint(&dataset_dir)?;
+    let mut training_domains = BTreeSet::new();
+    let mut same_artifact = false;
+    for provenance in [&checkpoint.provenance, checkpoint.latent_provenance()] {
+        if provenance["dataset_artifact_sha256"].as_str() == Some(&dataset_artifact_sha256) {
+            same_artifact = true;
+            let training = provenance["training_episodes"]
+                .as_array()
+                .context("checkpoint lacks training episode provenance")?;
+            let training = training
+                .iter()
+                .filter_map(|id| id.as_i64())
+                .collect::<BTreeSet<_>>();
+            ensure!(
+                evaluated_episode_ids
+                    .iter()
+                    .all(|id| !training.contains(id)),
+                "evaluation population overlaps training episodes; choose a held-out split or an external dataset"
+            );
+        }
+        if let Some(domains) = provenance["training_domain_fingerprints"].as_array() {
+            training_domains.extend(
+                domains
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    let training_domain_overlap = evaluated_domain_fingerprints
+        .iter()
+        .filter(|hash| training_domains.contains(*hash))
+        .count();
+    let scope = match (same_artifact, training_domain_overlap == 0) {
+        (true, true) => "held_out_domains",
+        (true, false) => "held_out_episodes",
+        (false, true) => "external_unseen_domains",
+        (false, false) => "external_shared_domains",
+    }
+    .to_owned();
     let device = args.device.resolve()?;
     let model = SkyJepaModel::new(
         model_cfg.clone(),
@@ -327,8 +387,19 @@ fn main() -> anyhow::Result<()> {
         split: match args.split {
             EvalSplit::Validation => "validation",
             EvalSplit::Test => "test",
+            EvalSplit::All => "all",
         }
         .to_string(),
+        split_by: dataset_cfg.split_by,
+        scope,
+        dataset_artifact_sha256,
+        checkpoint_sha256: checkpoint.fingerprint()?,
+        available_windows,
+        complete_population: rows.len() == available_windows,
+        evaluated_episode_ids,
+        evaluated_domain_ids,
+        evaluated_domain_fingerprints,
+        training_domain_overlap,
         windows: accumulator.count,
         batches,
         model_rate_hz: dataset_cfg.model_rate_hz,

@@ -137,6 +137,7 @@ impl SkyJepaCheckpoint {
     pub fn latent_identity(&self) -> anyhow::Result<String> {
         let mut dataset = self.contract.dataset;
         dataset.batch_size = 1;
+        dataset.split_by = crate::data::skyjepa::SkyJepaSplitBy::Episodes;
         json_sha256(
             &serde_json::json!({"model": self.contract.model, "dataset": dataset,
             "normalization": self.contract.normalization, "weights": self.latent_sha256}),
@@ -145,6 +146,13 @@ impl SkyJepaCheckpoint {
 
     pub fn fingerprint(&self) -> anyhow::Result<String> {
         json_sha256(self)
+    }
+
+    pub fn latent_provenance(&self) -> &serde_json::Value {
+        self.provenance
+            .get("parent_provenance")
+            .filter(|value| !value.is_null())
+            .unwrap_or(&self.provenance)
     }
 }
 

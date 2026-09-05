@@ -14,7 +14,7 @@ pilot artifacts are preserved.
 - [x] Deterministic resume: step-addressed SIGReg randomness and independent
   validation; uninterrupted/interrupted equivalence tests.
 - [x] Canonical 20 Hz contract across trainer, evaluator, and controller.
-- [ ] Domain/trajectory coverage audit and explicit evaluation populations.
+- [x] Domain/trajectory coverage audit and explicit evaluation populations.
 - [ ] Compare fresh-prior and shifted-residual warm starts under matched settings.
 - [ ] Matched-budget nominal-physics/untrained/trained MPPI ablations, imperfect
   trim tests, and separate tracking/timing reporting with artifact provenance.
@@ -99,3 +99,18 @@ requires audit version 2. Generator/auditor coverage regression tests pass.
 The corrected-pilot budgets, training seeds, validation/test control seeds,
 comparators, trim perturbations, and deliberate distribution shift are frozen
 in `skyjepa-remediation-experiment.json` before pilot training or final testing.
+
+Domain-disjoint training is now the default (`--split-by domains`): 80/10/10
+physical domains for this pilot. Episode-disjoint splitting remains an explicit
+diagnostic option, not a claim of unseen dynamics. Normalization is fit on the
+selected training partition only. Checkpoints preserve both stages' training
+episode IDs and physical-domain fingerprints, including latent ancestry.
+JSON float round-trip parsing is enabled so nested numerical provenance is
+stable through publication and resume.
+
+Evaluation supports `--split all` for external data, reports the actual episode
+and domain IDs/fingerprints and population completeness, and rejects training
+episode overlap with either stage. A batch-limited report is explicitly marked
+incomplete. The integration test verifies domain-disjoint splits, full external
+evaluation, overlap rejection, and accurate reporting of truncated evaluation.
+All four trainer/evaluator integration tests and existing data/package tests pass.

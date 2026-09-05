@@ -10,7 +10,7 @@ use le_wm_nv::data::{
     drone_racing::{ImportedDroneData, RunningStats},
     skyjepa::{
         SKYJEPA_SCHEMA_VERSION, SKYJEPA_STATE_DIM, SkyJepaActionSpace, SkyJepaDatasetConfig,
-        SkyJepaDatasetMetadata, SkyJepaDroneDataset, SkyJepaNormalization,
+        SkyJepaDatasetMetadata, SkyJepaDroneDataset, SkyJepaNormalization, SkyJepaSplitBy,
     },
 };
 
@@ -44,6 +44,7 @@ fn builds_strided_full_state_batches_from_imported_data() -> Result<()> {
     let dataset = SkyJepaDroneDataset::open(
         &root,
         SkyJepaDatasetConfig {
+            split_by: SkyJepaSplitBy::Episodes,
             batch_size: 2,
             history_steps: 2,
             rollout_steps: 2,
@@ -152,6 +153,7 @@ fn opens_canonical_rotor_force_schema() -> Result<()> {
     let dataset = SkyJepaDroneDataset::open(
         &root,
         SkyJepaDatasetConfig {
+            split_by: SkyJepaSplitBy::Episodes,
             batch_size: 2,
             history_steps: 2,
             rollout_steps: 2,
@@ -182,6 +184,7 @@ fn opens_canonical_rotor_force_schema() -> Result<()> {
     let fixed_dataset = SkyJepaDroneDataset::open_with_normalization(
         &root,
         SkyJepaDatasetConfig {
+            split_by: SkyJepaSplitBy::Episodes,
             batch_size: 2,
             history_steps: 2,
             rollout_steps: 2,

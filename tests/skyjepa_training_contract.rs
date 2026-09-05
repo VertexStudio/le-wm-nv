@@ -70,6 +70,8 @@ fn trainer_with_steps(data: &Path, output: &Path, stage: &str, steps: &str) -> C
             stage,
             "--batch-size",
             "16",
+            "--split-by",
+            "episodes",
             "--latent-max-steps",
             steps,
             "--prober-max-steps",
@@ -298,5 +300,88 @@ fn trainer_rejects_noncanonical_rate_before_creating_a_run() -> anyhow::Result<(
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("20 Hz"));
     assert!(!output_dir.exists());
+    Ok(())
+}
+
+#[test]
+fn domain_split_and_external_evaluation_report_the_actual_population() -> anyhow::Result<()> {
+    let scratch = Scratch::new();
+    let data = scratch.0.join("data");
+    let external = scratch.0.join("external");
+    let run = scratch.0.join("run");
+    generate(&data, "71");
+    generate(&external, "72");
+    successful(
+        Command::new(env!("CARGO_BIN_EXE_lewm-train-skyjepa"))
+            .arg("--dataset-dir")
+            .arg(&data)
+            .arg("--output-dir")
+            .arg(&run)
+            .args([
+                "--stage",
+                "both",
+                "--batch-size",
+                "16",
+                "--latent-max-steps",
+                "2",
+                "--prober-max-steps",
+                "2",
+                "--warmup-steps",
+                "1",
+                "--cosine-steps",
+                "3",
+                "--validation-batches",
+                "1",
+                "--skip-audit",
+            ])
+            .output()?,
+    );
+    let package = SkyJepaCheckpoint::load(&run)?;
+    let dataset = SkyJepaDroneDataset::open(&data, package.contract.dataset)?;
+    let train = dataset.domain_ids_for_rows(&dataset.train_rows());
+    let validation = dataset.domain_ids_for_rows(&dataset.validation_rows());
+    let test = dataset.domain_ids_for_rows(&dataset.test_rows());
+    assert_eq!((train.len(), validation.len(), test.len()), (1, 1, 1));
+    assert!(
+        train
+            .iter()
+            .all(|id| !test.contains(id) && !validation.contains(id))
+    );
+    let report = scratch.0.join("eval.json");
+    let evaluate = |dataset: &Path, split: &str, limit: &str| {
+        Command::new(env!("CARGO_BIN_EXE_lewm-eval-skyjepa"))
+            .arg("--dataset-dir")
+            .arg(dataset)
+            .arg("--checkpoint-dir")
+            .arg(&run)
+            .arg("--output")
+            .arg(&report)
+            .args([
+                "--split",
+                split,
+                "--rollout-steps",
+                "5",
+                "--batch-size",
+                "16",
+                "--max-batches",
+                limit,
+            ])
+            .output()
+    };
+    assert!(!evaluate(&data, "all", "0")?.status.success());
+    successful(evaluate(&data, "test", "0")?);
+    let own: serde_json::Value = serde_json::from_slice(&fs::read(&report)?)?;
+    assert_eq!(own["scope"], "held_out_domains");
+    assert_eq!(own["evaluated_episode_ids"].as_array().unwrap().len(), 4);
+    assert_eq!(own["training_domain_overlap"], 0);
+    successful(evaluate(&external, "all", "0")?);
+    let full: serde_json::Value = serde_json::from_slice(&fs::read(&report)?)?;
+    assert_eq!(full["evaluated_episode_ids"].as_array().unwrap().len(), 12);
+    assert_eq!(full["complete_population"], true);
+    assert_eq!(full["training_domain_overlap"], 0);
+    successful(evaluate(&external, "all", "1")?);
+    let limited: serde_json::Value = serde_json::from_slice(&fs::read(&report)?)?;
+    assert_eq!(limited["windows"], 16);
+    assert_eq!(limited["complete_population"], false);
     Ok(())
 }
