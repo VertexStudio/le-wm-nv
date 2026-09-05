@@ -1,7 +1,7 @@
 # SkyJEPA remediation and validation
 
-Status: implementation and the corrected experiment are complete. All commits
-stay local until the user reviews the results and explicitly authorizes a push.
+Status: implementation and the corrected experiment are complete. Publication
+to `origin/main` was explicitly authorized by the user on 2026-09-05.
 LeWM and the historical pilot artifacts are preserved. See
 [the final evidence report](skyjepa-remediation-results.md): tracking succeeds,
 but nominal-physics MPPI is stronger and two trained stress reports fail timing.
@@ -255,8 +255,9 @@ Nominal-physics MPPI has lower mean error and latency in every final condition.
 All three learned models fail the long-horizon and shifted open-loop comparisons.
 
 Two additional 20-second headless demonstrations and a real 20-second Bevy
-capture use the selected seed-7 package and fresh-prior warm start. The local
-video, exact commands, executable/checkpoint hashes, individual seed results,
+capture use the selected seed-7 package and fresh-prior warm start. The original
+local video, README media copies, exact commands, executable/checkpoint hashes,
+individual seed results,
 paired comparisons, timing failures and interpretation limits are documented
 in [skyjepa-remediation-results.md](skyjepa-remediation-results.md) and its
 [machine-readable evidence](skyjepa-remediation-results.json).

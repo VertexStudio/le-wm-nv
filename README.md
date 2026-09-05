@@ -53,30 +53,24 @@ mass/lag shift, trained mean error is slightly worse than the prior's.
 
 See the [complete three-seed results](docs/skyjepa-remediation-results.md) for
 the frozen warm-start decision, all stress conditions, long-horizon limitations,
-reproduction commands and local-only simulator recording.
+reproduction commands and simulator recording provenance.
 
-### Simulator capture (historical pilot)
+### Simulator capture (corrected pilot)
 
-This is a preserved **2026-09-03 pilot** capture from the dedicated Bevy simulator
-running a trained checkpoint on a held-out randomized rotor plant. It predates
-the corrected domain-disjoint dataset and versioned checkpoint contracts.
-Yellow is the executed
-trajectory, cyan is the current reference horizon, magenta is SkyJEPA's metric
-prediction, and the green bars are the four commanded rotor forces. The HUD
-shows the geometric prior and the learned correction separately; this is not a
-scripted animation.
+The dedicated Bevy simulator runs the **2026-09-05 corrected seed-7 checkpoint**
+on a held-out randomized in-range rotor plant, using the validation-selected
+fresh-prior controller. This is an actual simulator capture, not a scripted animation.
 
-[![Animated preview of trained SkyJEPA controlling a randomized UAV on a figure-eight; click for the full video](docs/skyjepa-trained-figure-eight.gif)](docs/skyjepa-trained-figure-eight.mp4)
+[![Eight-second preview of corrected SkyJEPA seed 7 controlling a randomized UAV on a figure-eight; click for the full video](docs/skyjepa-v3-figure-eight.gif)](docs/skyjepa-v3-figure-eight.mp4)
 
-**Video:** [watch the 20-second trained SkyJEPA figure-eight flight](docs/skyjepa-trained-figure-eight.mp4)
-at normal simulation speed. Yellow is executed, cyan is reference, magenta is
-predicted, and green shows rotor force.
+**Video:** [full 20-second corrected SkyJEPA flight](docs/skyjepa-v3-figure-eight.mp4),
+at normal simulation speed. Yellow: executed. Cyan: reference. Magenta:
+prediction. Green bars: commanded rotor forces.
 
-The historical checkpoint, results and GIF remain preserved; its original
-two-controller comparison is documented in
-[the historical pilot notes](docs/skyjepa.md#historical-pilot-evidence-2026-09-03).
-Render-contended HUD latency is not the headless benchmark above. The new
-corrected-checkpoint recording stays local, outside the website assets.
+The HUD separates prior action and learned correction; its render-contended
+latency is not the headless benchmark above. See [media provenance and GIF
+reproduction](docs/skyjepa-v3-media.md). The older recording and results remain
+preserved in [the historical pilot notes](docs/skyjepa.md#historical-pilot-evidence-2026-09-03).
 
 ### How this was built without released implementation code
 

@@ -273,10 +273,13 @@ control-loop measures after that first compile cycle.
 
 Current results are in [the corrected three-seed report](skyjepa-remediation-results.md),
 including nominal-physics/untrained baselines, trim stress, deliberate distribution
-shift, full-population prediction metrics and a new local simulator recording.
+shift, full-population prediction metrics and the
+[corrected simulator recording](skyjepa-v3-media.md) now shown in the README.
 
-These results and the README GIF refer to the preserved historical checkpoint,
-not the corrected three-seed pilot. The historical episode-disjoint split shared
+The results in this section and the preserved historical
+[MP4](skyjepa-trained-figure-eight.mp4)/[GIF](skyjepa-trained-figure-eight.gif)
+refer to the older checkpoint, not the corrected three-seed pilot.
+The historical episode-disjoint split shared
 physical domains, and a later audit found domain/flight-type coverage aliasing.
 The corrected generator, domain-disjoint splits, checkpoint/resume safeguards,
 and preregistered follow-up are documented in

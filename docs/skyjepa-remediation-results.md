@@ -2,7 +2,8 @@
 
 Status: training, full-population open-loop evaluation, warm-start selection,
 final control measurements and simulator capture are complete.
-Nothing has been pushed; LeWM and historical pilot artifacts remain intact.
+Publication to `origin/main` was authorized on 2026-09-05. LeWM and historical
+pilot artifacts remain intact.
 
 The corrected stack works end to end and all trained controllers pass tracking.
 It does **not** beat nominal-physics MPPI in mean error or latency, and two
@@ -254,7 +255,9 @@ predicted paths and nonzero rotor corrections visible. The GUI log contains no
 warnings or errors. HUD p95 is about 17.69 ms in that frame, with rendering
 and prediction export active; it is not the headless timing claim.
 
-The recording is local only:
+The [full recording](skyjepa-v3-figure-eight.mp4) and an eight-second
+[GIF preview](skyjepa-v3-figure-eight.gif) are now versioned for the README.
+The repository MP4 is byte-identical to the original local recording:
 
 ```text
 /home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3/simulation/seed-7-figure-eight.mp4
@@ -274,8 +277,9 @@ All model, dataset and raw report artifacts are local under:
 /home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3
 ```
 
-The README GIF remains the preserved historical pilot capture, not evidence
-that its older checkpoint has the corrected contracts or data split.
+The README GIF now shows this corrected checkpoint. The older MP4/GIF remain
+unchanged and linked from the historical pilot notes. Exact preview settings
+and hashes are in [the media provenance notes](skyjepa-v3-media.md).
 
 ## Rechecking the evidence
 
