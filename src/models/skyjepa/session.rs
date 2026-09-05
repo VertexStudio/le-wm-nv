@@ -2,18 +2,19 @@ use std::{collections::VecDeque, path::Path, time::Instant};
 
 use anyhow::{Context, ensure};
 use candle::{DType, Device, Tensor};
+use candle_nn::{VarBuilder, VarMap};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    SkyJepaConfig, SkyJepaControlConfig, SkyJepaModel, SkyJepaMppiScorer, SkyJepaProber,
-    checkpoint::SkyJepaCheckpoint,
+    SkyJepaConfig, SkyJepaControlConfig, SkyJepaModel, SkyJepaMppiScorer, SkyJepaNominalScorer,
+    SkyJepaProber, checkpoint::SkyJepaCheckpoint, control::MetricCandidateScorer,
 };
 use crate::{
     checkpoint::var_builder_from_path,
     data::skyjepa::{
         SKYJEPA_ACTION_DIM, SKYJEPA_STATE_DIM, SkyJepaActionSpace, SkyJepaNormalization,
     },
-    planner::{ActionBounds, MppiConfig, MppiPlanner},
+    planner::{ActionBounds, MppiConfig, MppiPlanner, PlanDeviceResult},
     skyjepa_sim::{SkyJepaDomain, SkyJepaRotorState},
     skyjepa_task::skyjepa_geometric_action_prior,
 };
@@ -26,6 +27,15 @@ pub enum SkyJepaWarmStart {
     ShiftedResidual,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SkyJepaDynamics {
+    #[default]
+    Trained,
+    Untrained,
+    NominalPhysics,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkyJepaSessionConfig {
     pub samples: usize,
@@ -33,6 +43,9 @@ pub struct SkyJepaSessionConfig {
     pub planner_seed: u64,
     pub warm_start: SkyJepaWarmStart,
     pub residual_limit_n: f32,
+    pub dynamics: SkyJepaDynamics,
+    pub ablation_seed: u64,
+    pub trim_multiplier: f32,
 }
 
 impl SkyJepaSessionConfig {
@@ -44,6 +57,9 @@ impl SkyJepaSessionConfig {
             planner_seed: 7,
             warm_start: SkyJepaWarmStart::FreshPrior,
             residual_limit_n: 2.0,
+            dynamics: SkyJepaDynamics::Trained,
+            ablation_seed: 7,
+            trim_multiplier: 1.0,
         }
     }
 
@@ -53,6 +69,10 @@ impl SkyJepaSessionConfig {
         ensure!(
             self.residual_limit_n.is_finite() && self.residual_limit_n > 0.0,
             "warm-start residual limit must be finite and positive"
+        );
+        ensure!(
+            self.trim_multiplier.is_finite() && self.trim_multiplier > 0.0,
+            "trim multiplier must be finite and positive"
         );
         Ok(())
     }
@@ -97,6 +117,9 @@ pub struct SkyJepaControllerSession {
     residual_limit_n: f32,
     active_residual: Option<Tensor>,
     pending_residual: Option<Tensor>,
+    dynamics: SkyJepaDynamics,
+    trim_multiplier: f32,
+    nominal_motor_forces: [f32; 4],
 }
 
 impl SkyJepaControllerSession {
@@ -125,18 +148,56 @@ impl SkyJepaControllerSession {
             dataset_cfg.history_steps == model_cfg.history_steps,
             "checkpoint model/dataset history dimensions disagree"
         );
-        let model = SkyJepaModel::new(
-            model_cfg.clone(),
-            var_builder_from_path(&checkpoint.latent_path(checkpoint_dir), DType::F32, &device)?,
-        )?;
-        let prober = SkyJepaProber::new(
-            prober_cfg,
-            var_builder_from_path(
-                &checkpoint.prober_path(checkpoint_dir)?,
-                DType::F32,
-                &device,
-            )?,
-        )?;
+        let (model, prober) = if cfg.dynamics == SkyJepaDynamics::Untrained {
+            device.set_seed(cfg.ablation_seed)?;
+            let latent_vars = VarMap::new();
+            let _ = SkyJepaModel::new(
+                model_cfg.clone(),
+                VarBuilder::from_varmap(&latent_vars, DType::F32, &device),
+            )?;
+            device.set_seed(cfg.ablation_seed ^ 0x5052_4f42_4552_5f53)?;
+            let prober_vars = VarMap::new();
+            let _ = SkyJepaProber::new(
+                prober_cfg.clone(),
+                VarBuilder::from_varmap(&prober_vars, DType::F32, &device),
+            )?;
+            // Freeze random weights too: the ablation must not pay for a
+            // training graph that the loaded, trained model does not build.
+            let frozen = |vars: &VarMap| {
+                VarBuilder::from_tensors(
+                    vars.data()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, var)| (name.clone(), var.as_tensor().detach()))
+                        .collect(),
+                    DType::F32,
+                    &device,
+                )
+            };
+            (
+                SkyJepaModel::new(model_cfg.clone(), frozen(&latent_vars))?,
+                SkyJepaProber::new(prober_cfg, frozen(&prober_vars))?,
+            )
+        } else {
+            let model = SkyJepaModel::new(
+                model_cfg.clone(),
+                var_builder_from_path(
+                    &checkpoint.latent_path(checkpoint_dir),
+                    DType::F32,
+                    &device,
+                )?,
+            )?;
+            let prober = SkyJepaProber::new(
+                prober_cfg,
+                var_builder_from_path(
+                    &checkpoint.prober_path(checkpoint_dir)?,
+                    DType::F32,
+                    &device,
+                )?,
+            )?;
+            (model, prober)
+        };
         let nominal = SkyJepaDomain::default();
         let hover_action = [nominal.mass * nominal.gravity / 4.0; SKYJEPA_ACTION_DIM];
         let mut control_cfg = SkyJepaControlConfig::paper_derived();
@@ -168,6 +229,9 @@ impl SkyJepaControllerSession {
             residual_limit_n: cfg.residual_limit_n,
             active_residual: None,
             pending_residual: None,
+            dynamics: cfg.dynamics,
+            trim_multiplier: cfg.trim_multiplier,
+            nominal_motor_forces: hover_action,
         };
         session.reset(initial_state)?;
         Ok(session)
@@ -197,7 +261,14 @@ impl SkyJepaControllerSession {
             initial_action.iter().sum::<f32>() > 0.0,
             "initial trim must have positive collective force"
         );
-        self.trim_scale = initial_action.iter().sum::<f32>() / nominal_collective;
+        let trim_scale =
+            initial_action.iter().sum::<f32>() / nominal_collective * self.trim_multiplier;
+        ensure!(
+            trim_scale.is_finite() && trim_scale > 0.0,
+            "invalid calibrated trim"
+        );
+        self.trim_scale = trim_scale;
+        self.nominal_motor_forces = initial_action.map(|force| force / trim_scale);
         self.active_residual = None;
         self.pending_residual = None;
         self.state_history = VecDeque::from(vec![
@@ -227,6 +298,13 @@ impl SkyJepaControllerSession {
         // Shift only after an action was actually executed, not on every call
         // to plan (e.g. visualization or a repeated plan at the same state).
         self.active_residual = self.pending_residual.take();
+        let response =
+            1.0 - (-self.control_cfg.dt / SkyJepaDomain::default().motor_time_constant).exp();
+        for (motor, command) in self.nominal_motor_forces.iter_mut().zip(action) {
+            let target =
+                (command / self.trim_scale).clamp(0.0, self.planner_cfg.action_bounds.high[0]);
+            *motor += (target - *motor) * response;
+        }
         self.state_history.pop_front();
         self.state_history.push_back(state.as_state18());
         self.action_history.pop_front();
@@ -278,18 +356,7 @@ impl SkyJepaControllerSession {
             (1, self.model_cfg.history_steps - 1, SKYJEPA_ACTION_DIM),
             &self.device,
         )?;
-        let prior_actions = skyjepa_geometric_action_prior(
-            *self
-                .state_history
-                .back()
-                .expect("SkyJEPA state history is initialized"),
-            reference_states,
-            self.control_cfg.dt,
-            SkyJepaDomain::default(),
-        )
-        .into_iter()
-        .map(|action| action.map(|force| force * self.trim_scale))
-        .collect::<Vec<_>>();
+        let prior_actions = self.prior_action_sequence(reference_states);
         let prior_tensor = Tensor::from_vec(
             prior_actions.iter().flatten().copied().collect::<Vec<_>>(),
             (1, self.control_cfg.horizon, SKYJEPA_ACTION_DIM),
@@ -311,33 +378,35 @@ impl SkyJepaControllerSession {
             &self.device,
         )?;
         let reference_actions = prior_tensor.clone();
-        let scorer = SkyJepaMppiScorer::new(
-            &self.model,
-            &self.prober,
-            &state_tensor,
-            &action_tensor,
-            reference_states,
-            reference_actions,
-            &self.normalization,
-            self.control_cfg.dt,
-            self.control_cfg.cost.clone(),
-        )?;
-        let result = self.planner.plan_device(&scorer)?;
-        let predicted = if include_prediction {
-            scorer
-                .predict_candidates(&result.sequence.unsqueeze(1)?)?
-                .squeeze(1)?
-                .to_vec3::<f32>()?[0]
-                .iter()
-                .map(|state| {
-                    state
-                        .as_slice()
-                        .try_into()
-                        .expect("predicted state has eighteen values")
-                })
-                .collect()
+        let (result, predicted) = if self.dynamics == SkyJepaDynamics::NominalPhysics {
+            let initial = state_tensor
+                .narrow(1, self.model_cfg.history_steps - 1, 1)?
+                .squeeze(1)?;
+            let motors =
+                Tensor::from_vec(self.nominal_motor_forces.to_vec(), (1, 4), &self.device)?;
+            let scorer = SkyJepaNominalScorer::new(
+                initial,
+                motors,
+                reference_states,
+                reference_actions,
+                self.control_cfg.dt,
+                self.trim_scale,
+                self.control_cfg.cost.clone(),
+            )?;
+            plan_metric_candidates(&mut self.planner, &scorer, include_prediction)?
         } else {
-            Vec::new()
+            let scorer = SkyJepaMppiScorer::new(
+                &self.model,
+                &self.prober,
+                &state_tensor,
+                &action_tensor,
+                reference_states,
+                reference_actions,
+                &self.normalization,
+                self.control_cfg.dt,
+                self.control_cfg.cost.clone(),
+            )?;
+            plan_metric_candidates(&mut self.planner, &scorer, include_prediction)?
         };
         let actions = result.sequence.to_vec3::<f32>()?;
         let first_action = result.first_action.to_vec2::<f32>()?;
@@ -415,6 +484,47 @@ impl SkyJepaControllerSession {
     pub fn device(&self) -> &Device {
         &self.device
     }
+
+    pub fn control_config(&self) -> &SkyJepaControlConfig {
+        &self.control_cfg
+    }
+
+    /// Identical trim calibration and actuator bounds for every comparator.
+    pub fn prior_action_sequence(&self, reference: &[[f32; 18]]) -> Vec<[f32; 4]> {
+        skyjepa_geometric_action_prior(
+            *self.state_history.back().expect("initialized history"),
+            reference,
+            self.control_cfg.dt,
+            SkyJepaDomain::default(),
+        )
+        .into_iter()
+        .map(|action| {
+            action.map(|force| {
+                (force * self.trim_scale).clamp(0.0, self.planner_cfg.action_bounds.high[0])
+            })
+        })
+        .collect()
+    }
+}
+
+fn plan_metric_candidates<S: MetricCandidateScorer>(
+    planner: &mut MppiPlanner,
+    scorer: &S,
+    include_prediction: bool,
+) -> candle::Result<(PlanDeviceResult, Vec<[f32; 18]>)> {
+    let result = planner.plan_device(scorer)?;
+    let predicted = if include_prediction {
+        scorer
+            .predict_metric_candidates(&result.sequence.unsqueeze(1)?)?
+            .squeeze(1)?
+            .to_vec3::<f32>()?[0]
+            .iter()
+            .map(|state| state.as_slice().try_into().expect("state18 rollout"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok((result, predicted))
 }
 
 fn shifted_residual(sequence: &Tensor, prior: &Tensor, limit: f32) -> candle::Result<Tensor> {

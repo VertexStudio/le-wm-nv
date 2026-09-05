@@ -144,3 +144,17 @@ Learned and nominal scorers share exactly the same tracking/action cost code.
 A calibrated-hover test verifies both unit trim and non-unit trim have effectively
 zero cost at their corresponding hover command. All three new nominal tests and
 the eight existing SkyJEPA model/integrator tests pass.
+
+All four controller modes now run through the benchmark: geometric prior,
+nominal-physics MPPI, deterministic untrained MPPI, and trained MPPI. They share
+the prior, action bounds and trim calibration. Untrained weights are detached
+from autodiff and use a recorded initialization seed. Trim perturbations change
+calibration only; observed command histories remain the actual hover commands.
+The integration smoke test exercises every mode with perturbed trim.
+
+Benchmark report v2 separates tracking and timing success, records incomplete
+or non-finite runs explicitly, and retains every planning latency. Reports bind
+checkpoint/executable hashes, the full controller configuration, domain seeds,
+GPU/process snapshots, p50/p95/p99/max latency, 10 ms budget exceedances and
+50 ms control-deadline misses. Simulation time still does not model scheduling
+overruns; this is not a hard real-time certification.

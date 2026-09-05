@@ -383,5 +383,46 @@ fn domain_split_and_external_evaluation_report_the_actual_population() -> anyhow
     let limited: serde_json::Value = serde_json::from_slice(&fs::read(&report)?)?;
     assert_eq!(limited["windows"], 16);
     assert_eq!(limited["complete_population"], false);
+    for mode in [
+        "prior",
+        "nominal-physics-mppi",
+        "untrained-mppi",
+        "trained-mppi",
+    ] {
+        successful(
+            Command::new(env!("CARGO_BIN_EXE_lewm-bench-skyjepa"))
+                .arg("--checkpoint-dir")
+                .arg(&run)
+                .arg("--output")
+                .arg(&report)
+                .args([
+                    "--controller",
+                    mode,
+                    "--random-domains",
+                    "0",
+                    "--duration-seconds",
+                    "0.1",
+                    "--samples",
+                    "8",
+                    "--horizon",
+                    "3",
+                    "--trim-multiplier",
+                    "0.9",
+                    "--allow-fail",
+                ])
+                .output()?,
+        );
+        let bench: serde_json::Value = serde_json::from_slice(&fs::read(&report)?)?;
+        assert_eq!(bench["controller"], mode.replace('-', "_"));
+        assert_eq!(bench["runs"], 3);
+        assert!(bench["checkpoint_sha256"].as_str().unwrap().len() == 64);
+        assert!(bench["executable_sha256"].as_str().unwrap().len() == 64);
+        for scenario in bench["results"].as_array().unwrap() {
+            assert!(scenario["tracking_passed"].is_boolean());
+            assert!(scenario["timing_passed"].is_boolean());
+            assert!((scenario["trim_scale"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+            assert_eq!(scenario["plan_times_ms"].as_array().unwrap().len(), 2);
+        }
+    }
     Ok(())
 }

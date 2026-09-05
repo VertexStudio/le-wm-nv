@@ -23,7 +23,8 @@ pub use prober::{
     SkyJepaProberOutput, skyjepa_prober_loss,
 };
 pub use session::{
-    SkyJepaControllerPlan, SkyJepaControllerSession, SkyJepaSessionConfig, SkyJepaWarmStart,
+    SkyJepaControllerPlan, SkyJepaControllerSession, SkyJepaDynamics, SkyJepaSessionConfig,
+    SkyJepaWarmStart,
 };
 pub use tcn::TemporalConvEncoder;
 pub use training::{
