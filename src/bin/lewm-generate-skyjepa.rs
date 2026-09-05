@@ -170,7 +170,9 @@ fn main() -> anyhow::Result<()> {
         state_dim: SKYJEPA_STATE_DIM,
         action_dim: SKYJEPA_ACTION_DIM,
         action_space: SkyJepaActionSpace::RotorForces,
-        generator: Some("lewm-generate-skyjepa clean-room RFF+geometric-PD simulator".into()),
+        generator: Some(
+            "lewm-generate-skyjepa v2 balanced-domain RFF+geometric-PD simulator".into(),
+        ),
         seed: Some(args.seed),
         domains: Some(args.domains),
         has_reference_state: true,
@@ -191,6 +193,10 @@ fn main() -> anyhow::Result<()> {
 
 fn validate_args(args: &Args) -> anyhow::Result<()> {
     ensure!(args.domains > 0, "domains must be positive");
+    ensure!(
+        args.trajectories / args.domains >= 2,
+        "coverage requires at least two trajectories per domain"
+    );
     ensure!(
         args.trajectories >= 3,
         "trajectories must be at least three"
@@ -220,7 +226,7 @@ fn generate_episode(episode: usize, domain: SkyJepaDomain, args: &Args) -> anyho
     let samples = transitions + 1;
     let trajectory = ReferenceTrajectory::sample(
         mix_seed(args.seed ^ 0x0053_4b59_4a45_5041, episode as u64),
-        episode.is_multiple_of(10),
+        is_hover_episode(episode, args.domains, args.trajectories, args.seed),
     );
     let initial_reference = trajectory.at(0.0);
     let initial_acceleration = [
@@ -294,6 +300,40 @@ fn generate_episode(episode: usize, domain: SkyJepaDomain, args: &Args) -> anyho
         "episode {episode} became non-finite"
     );
     Ok(result)
+}
+
+/// A domain's flight type changes on each visit. Every block of ten visits
+/// includes one hover and nine moving references, independent of domain count.
+/// Smaller artifacts reserve one hover per domain within their available visits.
+fn is_hover_episode(episode: usize, domains: usize, trajectories: usize, seed: u64) -> bool {
+    let domain = episode % domains;
+    let visit = episode / domains;
+    let period = (trajectories / domains).clamp(2, 10);
+    let offset = (mix_seed(seed ^ 0x484f_5645_525f_434f, domain as u64) % period as u64) as usize;
+    (visit + offset).is_multiple_of(period)
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    #[test]
+    fn every_domain_gets_hover_and_motion_even_when_domain_count_is_a_multiple_of_ten() {
+        for domains in [3, 10, 100, 500] {
+            for visits in [2, 5, 20] {
+                for domain in 0..domains {
+                    let hover = (0..visits)
+                        .filter(|visit| {
+                            is_hover_episode(visit * domains + domain, domains, visits * domains, 7)
+                        })
+                        .count();
+                    assert!(hover > 0 && hover < visits);
+                    if visits == 20 {
+                        assert_eq!(hover, 2);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

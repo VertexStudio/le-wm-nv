@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "status": "preregistered_before_corrected_pilot_training",
+  "artifact_root": "/home/rozgo/.stable_worldmodel/le-wm-nv-data/skyjepa-remediation-v3",
+  "training_data": {"seed": 7, "domains": 100, "trajectories": 2000, "duration_seconds": 10, "model_rate_hz": 20, "simulation_rate_hz": 200, "split_by": "domains"},
+  "training_seeds": [7, 17, 29],
+  "latent": {"steps": 1000, "batch_size": 2048, "warmup_steps": 200, "cosine_steps": 800, "max_lr": 0.005, "min_lr": 0.0001},
+  "prober": {"steps": 5000, "batch_size": 2048, "warmup_steps": 500, "cosine_steps": 4500, "max_lr": 0.005, "min_lr": 0.0001},
+  "selection": "best validation checkpoint within each stage; warm-start choice on validation control seeds only; report all training seeds on final tests",
+  "control_validation": {"domain_seed": 31415, "random_domains": 8},
+  "control_test": {"domain_seed": 271828, "random_domains": 20},
+  "control_common": {"planner_seed": 7, "samples": 512, "horizon": 15, "duration_seconds": 8, "radius_m": 2, "period_seconds": 8, "scenarios": ["hover", "circle", "figure_eight"]},
+  "control_comparators": ["prior", "nominal_physics_mppi", "untrained_mppi", "trained_mppi"],
+  "trim_conditions": ["exact", "exact_times_0.9", "exact_times_1.1"],
+  "open_loop": {"steps": 60, "batch_size": 512, "evaluation_seed": 90001, "trajectories": 1000, "domains": 100, "population": "all_external_episodes"},
+  "distribution_shift": {"name": "extended_mass_and_motor_lag", "seed": 90002, "mass_factor_range": [1.55, 1.75], "motor_time_constant_range_seconds": [0.11, 0.14], "other_parameters": "training_ranges"},
+  "acceptance": {"position_vector_rmse_m": 0.75, "maximum_position_error_m": 3, "p95_plan_ms": 10, "finite_required": true, "ground_contact_allowed": false, "report_tracking_and_timing_separately": true},
+  "notes": "Historical results remain unchanged. No larger run or stronger long-horizon claim is justified solely by completion. Shared-GPU contention must be recorded; no other users' workloads are stopped. Final-test seeds are not used for tuning."
+}

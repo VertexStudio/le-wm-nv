@@ -85,3 +85,17 @@ be explicitly strided into that model rate. Trainer rejection occurs before
 creating a run. Package validation rejects noncanonical rates even when the
 package hash is internally consistent, and the controller derives its timestep
 from validated metadata. Existing strided-data tests remain passing.
+
+Coverage correction: the new 2,000-trajectory/100-domain pilot contains exactly
+two hover and eighteen moving trajectories in every domain. Audit v2 passes
+with position tracking RMSE 0.257921 m, zero ground contact, and per-domain
+excitation checks passing. Dataset SHA-256:
+`77acffd68edbe3d5b352bb290693bfa86ef80045554488f2c94c2aaed72e5fe0`.
+Re-auditing the untouched historical dataset correctly reports missing flight
+type coverage in all 100 domains. Both reports are under the new artifact root;
+the historical audit remains unchanged. Training binds the audit file hash and
+requires audit version 2. Generator/auditor coverage regression tests pass.
+
+The corrected-pilot budgets, training seeds, validation/test control seeds,
+comparators, trim perturbations, and deliberate distribution shift are frozen
+in `skyjepa-remediation-experiment.json` before pilot training or final testing.

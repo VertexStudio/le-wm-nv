@@ -162,6 +162,7 @@ struct Args {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuditSummary {
+    audit_version: u32,
     passed: bool,
     artifact_sha256: String,
 }
@@ -175,6 +176,7 @@ struct RunManifest {
     dataset_artifact_sha256: Option<String>,
     audit_report: Option<PathBuf>,
     audit_skipped: bool,
+    audit_sha256: Option<String>,
     device: String,
     action_space: SkyJepaActionSpace,
     batch_size: usize,
@@ -288,6 +290,10 @@ fn main() -> anyhow::Result<()> {
         git_commit: git_commit(),
         dataset_dir: dataset_dir.clone(),
         dataset_artifact_sha256: Some(skyjepa_artifact_fingerprint(&dataset_dir)?),
+        audit_sha256: audit_path
+            .as_ref()
+            .map(|path| le_wm_nv::models::skyjepa::checkpoint::file_sha256(path))
+            .transpose()?,
         audit_report: audit_path,
         audit_skipped: args.skip_audit,
         device: args.device.to_string(),
@@ -911,6 +917,10 @@ fn load_audit(
             .unwrap_or_else(|| dataset_dir.join("audit.json")),
     )?;
     let audit: AuditSummary = read_json(&path)?;
+    ensure!(
+        audit.audit_version == 2,
+        "training requires a version-2 per-domain coverage audit"
+    );
     ensure!(
         audit.passed,
         "dataset audit {} did not pass",

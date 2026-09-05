@@ -15,7 +15,7 @@ use le_wm_nv::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Serialize)]
 #[command(about = "Audit canonical SkyJEPA data before training")]
 struct Args {
     #[arg(long)]
@@ -55,6 +55,8 @@ struct Args {
 
 #[derive(Debug, Serialize)]
 struct AuditReport {
+    audit_version: u32,
+    audit_config: serde_json::Value,
     passed: bool,
     dataset_dir: PathBuf,
     artifact_sha256: String,
@@ -78,7 +80,18 @@ struct AuditReport {
     action_transition_delta: ChannelStats,
     reference_state: Option<ChannelStats>,
     motor_force: Option<ChannelStats>,
+    domain_coverage: Vec<DomainCoverage>,
     failures: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+struct DomainCoverage {
+    domain: usize,
+    episodes: usize,
+    hover_episodes: usize,
+    moving_episodes: usize,
+    differential_action_std: Vec<f64>,
+    action_delta_std: Vec<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,6 +249,14 @@ fn main() -> anyhow::Result<()> {
     let mut motor_stats = motor_forces
         .as_ref()
         .map(|_| StatsAccumulator::new(SKYJEPA_ACTION_DIM));
+    let mut domain_coverage =
+        classify_domain_coverage(&episodes, &domain_idx, references.as_deref(), domains.len())?;
+    let mut domain_differential = (0..domains.len())
+        .map(|_| StatsAccumulator::new(4))
+        .collect::<Vec<_>>();
+    let mut domain_delta = (0..domains.len())
+        .map(|_| StatsAccumulator::new(4))
+        .collect::<Vec<_>>();
     let expected_dt = 1.0 / metadata.sample_rate_hz as f64;
     let mut max_dt_error = 0.0f64;
     let mut max_rotation_error = 0.0f64;
@@ -258,6 +279,7 @@ fn main() -> anyhow::Result<()> {
             .map(|value| *value - collective)
             .collect::<Vec<_>>();
         differential_action_stats.push(&differential);
+        domain_differential[domain_idx[row] as usize].push(&differential);
         if row > 0 && episodes[row] == episodes[row - 1] {
             let previous = &actions[(row - 1) * SKYJEPA_ACTION_DIM..row * SKYJEPA_ACTION_DIM];
             let delta = action
@@ -266,6 +288,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|(current, previous)| current - previous)
                 .collect::<Vec<_>>();
             action_delta_stats.push(&delta);
+            domain_delta[domain_idx[row] as usize].push(&delta);
         }
         max_dt_error = max_dt_error.max((f64::from(dt[row]) - expected_dt).abs());
         let rotation: [f32; 9] = state[6..15].try_into().expect("rotation has nine values");
@@ -313,6 +336,37 @@ fn main() -> anyhow::Result<()> {
     let low_fraction = low_commands as f64 / action_values as f64;
     let high_fraction = high_commands as f64 / action_values as f64;
     let mut failures = Vec::new();
+    if references.is_none() {
+        failures.push("reference_state is required to audit per-domain flight coverage".into());
+    }
+    for ((coverage, differential), delta) in domain_coverage
+        .iter_mut()
+        .zip(domain_differential)
+        .zip(domain_delta)
+    {
+        coverage.differential_action_std = differential.finish().std;
+        coverage.action_delta_std = delta.finish().std;
+        if coverage.hover_episodes == 0 || coverage.moving_episodes == 0 {
+            failures.push(format!(
+                "domain {} needs both hover and moving trajectories (hover={}, moving={})",
+                coverage.domain, coverage.hover_episodes, coverage.moving_episodes
+            ));
+        }
+        if coverage
+            .differential_action_std
+            .iter()
+            .any(|std| *std < args.min_differential_action_std)
+            || coverage
+                .action_delta_std
+                .iter()
+                .any(|std| *std < args.min_action_delta_std)
+        {
+            failures.push(format!(
+                "domain {} fails per-domain rotor excitation thresholds",
+                coverage.domain
+            ));
+        }
+    }
     if max_dt_error > 1e-6 {
         failures.push(format!(
             "maximum dt error {max_dt_error:.3e} exceeds 1e-6 s"
@@ -377,6 +431,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let report = AuditReport {
+        audit_version: 2,
+        audit_config: serde_json::to_value(&args)?,
         passed: failures.is_empty(),
         dataset_dir: fs::canonicalize(&args.dataset_dir).unwrap_or(args.dataset_dir.clone()),
         artifact_sha256: skyjepa_artifact_fingerprint(&args.dataset_dir)?,
@@ -400,6 +456,7 @@ fn main() -> anyhow::Result<()> {
         action_transition_delta,
         reference_state: reference_stats.map(StatsAccumulator::finish),
         motor_force: motor_stats.map(StatsAccumulator::finish),
+        domain_coverage,
         failures,
     };
     let json = serde_json::to_string_pretty(&report)?;
@@ -416,6 +473,50 @@ fn main() -> anyhow::Result<()> {
         report.failures.len()
     );
     Ok(())
+}
+
+fn classify_domain_coverage(
+    episodes: &[i64],
+    domains: &[i64],
+    references: Option<&[f32]>,
+    count: usize,
+) -> anyhow::Result<Vec<DomainCoverage>> {
+    let mut coverage = (0..count)
+        .map(|domain| DomainCoverage {
+            domain,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let mut start = 0;
+    while start < episodes.len() {
+        let mut end = start + 1;
+        while end < episodes.len() && episodes[end] == episodes[start] {
+            end += 1;
+        }
+        ensure!(
+            domains[start..end]
+                .iter()
+                .all(|domain| *domain == domains[start]),
+            "episode {} changes domain mid-flight",
+            episodes[start]
+        );
+        let domain = domains[start] as usize;
+        coverage[domain].episodes += 1;
+        if let Some(reference) = references {
+            let moving = (start + 1..end).any(|row| {
+                (0..3).any(|axis| {
+                    (reference[row * 18 + axis] - reference[start * 18 + axis]).abs() > 1e-4
+                })
+            });
+            if moving {
+                coverage[domain].moving_episodes += 1;
+            } else {
+                coverage[domain].hover_episodes += 1;
+            }
+        }
+        start = end;
+    }
+    Ok(coverage)
 }
 
 fn validate_args(args: &Args) -> anyhow::Result<()> {
@@ -573,5 +674,20 @@ mod tests {
     #[test]
     fn sequence_validation_rejects_repeated_episode_blocks() {
         assert!(validate_sequence_index(&[0, 0, 1, 1, 0], &[0, 1, 0, 1, 0]).is_err());
+    }
+
+    #[test]
+    fn coverage_detects_domain_task_aliasing_and_mid_episode_domain_changes() -> anyhow::Result<()>
+    {
+        let mut references = vec![0.0f32; 4 * 18];
+        references[3 * 18] = 1.0;
+        let coverage =
+            classify_domain_coverage(&[0, 0, 1, 1], &[0, 0, 1, 1], Some(&references), 2)?;
+        assert_eq!(coverage[0].hover_episodes, 1);
+        assert_eq!(coverage[0].moving_episodes, 0);
+        assert_eq!(coverage[1].hover_episodes, 0);
+        assert_eq!(coverage[1].moving_episodes, 1);
+        assert!(classify_domain_coverage(&[0, 0], &[0, 1], None, 2).is_err());
+        Ok(())
     }
 }
