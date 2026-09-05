@@ -120,6 +120,11 @@ struct Args {
     #[arg(long)]
     prober_max_steps: Option<usize>,
 
+    /// Checkpoint and pause at this absolute step without changing the training
+    /// target or adding validation. Resume the same explicit stage without it.
+    #[arg(long)]
+    stop_after_step: Option<usize>,
+
     #[arg(long, default_value_t = 5e-3)]
     max_lr: f64,
 
@@ -206,6 +211,7 @@ struct StageProgress {
     best_validation: Option<f64>,
     best_epoch: Option<usize>,
     best_step: Option<usize>,
+    metrics_bytes: u64,
     completed_requested_steps: bool,
     updated_at_unix: u64,
 }
@@ -305,7 +311,7 @@ fn main() -> anyhow::Result<()> {
             .transpose()?,
         loss_config: json!({"latent_mse_weight":1.0,"sigreg_weight":0.02,
             "sigreg_knots":17,"sigreg_projections":64,"prober_objective":"state18_elementwise_mse",
-            "randomness_version":1,"dtype":"f32","optimizer":"adamw",
+            "randomness_version":2,"batch_policy":"drop_singleton_tail_v1","dtype":"f32","optimizer":"adamw",
             "beta1":0.9,"beta2":0.999,"epsilon":1e-8}),
         validation_batches: args.validation_batches,
         stage_epochs: if args.stage == TrainingStage::Prober {
@@ -349,6 +355,11 @@ fn main() -> anyhow::Result<()> {
             manifest.stage_max_steps,
             &output_dir,
         )?;
+        ensure!(
+            args.stop_after_step
+                .is_none_or(|step| step > progress.global_step),
+            "stop-after-step must be greater than the saved step"
+        );
         ensure!(
             progress.global_step
                 <= requested_steps(manifest.stage_epochs, batches, manifest.stage_max_steps)?,
@@ -408,8 +419,8 @@ fn main() -> anyhow::Result<()> {
                 .load(&checkpoint)
                 .with_context(|| format!("failed to load {}", checkpoint.display()))?;
         }
-        let mut metrics = metrics_writer(&output_dir.join("latent-metrics.jsonl"), args.resume)?;
-        train_latent(
+        let mut metrics = metrics_writer(&output_dir, "latent", args.resume)?;
+        let completed = train_latent(
             &args,
             &dataset,
             &train_rows,
@@ -421,6 +432,12 @@ fn main() -> anyhow::Result<()> {
             &mut metrics,
             started,
         )?;
+        if !completed {
+            println!(
+                "latent stage checkpointed and paused; resume the same target without --stop-after-step"
+            );
+            return Ok(());
+        }
         SkyJepaCheckpoint::publish(
             &output_dir,
             contract.clone(),
@@ -455,8 +472,8 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to load {}", checkpoint.display()))?;
         }
         println!("skyjepa prober_params={}", parameter_count(&prober_vars));
-        let mut metrics = metrics_writer(&output_dir.join("prober-metrics.jsonl"), args.resume)?;
-        train_prober(
+        let mut metrics = metrics_writer(&output_dir, "prober", args.resume)?;
+        let completed = train_prober(
             &args,
             &dataset,
             &train_rows,
@@ -469,6 +486,12 @@ fn main() -> anyhow::Result<()> {
             &mut metrics,
             started,
         )?;
+        if !completed {
+            println!(
+                "prober stage checkpointed and paused; resume the same target without --stop-after-step"
+            );
+            return Ok(());
+        }
         SkyJepaCheckpoint::publish(
             &output_dir,
             contract,
@@ -498,7 +521,7 @@ fn train_latent(
     dataset_dir: &Path,
     metrics: &mut BufWriter<File>,
     started: Instant,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let batches_per_epoch = batch_count(train_rows.len(), args.batch_size);
     let requested_steps =
         requested_steps(args.latent_epochs, batches_per_epoch, args.latent_max_steps)?;
@@ -533,7 +556,11 @@ fn train_latent(
     let loss_cfg = SkyJepaLossConfig::default();
     let mut cached_epoch = None;
     let mut shuffled = Vec::new();
-    for step_index in progress.global_step..requested_steps {
+    let stop_step = args
+        .stop_after_step
+        .unwrap_or(requested_steps)
+        .min(requested_steps);
+    for step_index in progress.global_step..stop_step {
         let epoch = step_index / batches_per_epoch;
         let batch_index = step_index % batches_per_epoch;
         if cached_epoch != Some(epoch) {
@@ -541,9 +568,10 @@ fn train_latent(
             cached_epoch = Some(epoch);
         }
         let rows = batch_rows(&shuffled, batch_index, args.batch_size);
-        if rows.len() < 2 {
-            continue;
-        }
+        ensure!(
+            rows.len() >= 2,
+            "latent batch must contain at least two windows"
+        );
         let lr = scheduled_lr(
             step_index,
             args.warmup_steps,
@@ -553,6 +581,10 @@ fn train_latent(
         );
         set_optimizer_lr(&mut optimizer, lr);
         let batch = dataset.batch(rows, DType::F32, model.device())?;
+        // SIGReg is addressed by optimizer step, not process RNG history.
+        model
+            .device()
+            .set_seed(epoch_seed(args.seed ^ 0x5349_4752_4547, step_index))?;
         let loss = skyjepa_batch_loss_with_config(model, &batch.states, &batch.actions, loss_cfg)?;
         let scalars = SkyJepaLossScalars::from_loss(&loss)?;
         ensure_finite("latent", step_index, scalars.total)?;
@@ -578,6 +610,9 @@ fn train_latent(
         let epoch_end = batch_index + 1 == batches_per_epoch;
         let requested_end = progress.global_step == requested_steps;
         if epoch_end || requested_end {
+            model
+                .device()
+                .set_seed(epoch_seed(args.seed ^ 0x5641_4c49_4441_5445, epoch))?;
             let validation = validate_latent(
                 dataset,
                 validation_rows,
@@ -608,16 +643,23 @@ fn train_latent(
         }
         if requested_end
             || epoch_end
+            || progress.global_step == stop_step
             || (args.save_every > 0 && progress.global_step.is_multiple_of(args.save_every))
         {
             progress.completed_requested_steps = progress.global_step == requested_steps;
             progress.updated_at_unix = unix_seconds();
+            metrics.flush()?;
+            metrics.get_ref().sync_all()?;
+            progress.metrics_bytes = metrics.get_ref().metadata()?.len();
             save_stage_state(output_dir, "latent", vars, &optimizer, &progress)?;
         }
     }
-    promote_best(output_dir, "latent")?;
+    let completed = progress.global_step == requested_steps;
+    if completed {
+        promote_best(output_dir, "latent")?;
+    }
     metrics.flush()?;
-    Ok(())
+    Ok(completed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -633,7 +675,7 @@ fn train_prober(
     dataset_dir: &Path,
     metrics: &mut BufWriter<File>,
     started: Instant,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let batches_per_epoch = batch_count(train_rows.len(), args.batch_size);
     let requested_steps =
         requested_steps(args.prober_epochs, batches_per_epoch, args.prober_max_steps)?;
@@ -667,7 +709,11 @@ fn train_prober(
     }
     let mut cached_epoch = None;
     let mut shuffled = Vec::new();
-    for step_index in progress.global_step..requested_steps {
+    let stop_step = args
+        .stop_after_step
+        .unwrap_or(requested_steps)
+        .min(requested_steps);
+    for step_index in progress.global_step..stop_step {
         let epoch = step_index / batches_per_epoch;
         let batch_index = step_index % batches_per_epoch;
         if cached_epoch != Some(epoch) {
@@ -687,6 +733,9 @@ fn train_prober(
         );
         set_optimizer_lr(&mut optimizer, lr);
         let batch = dataset.batch(rows, DType::F32, model.device())?;
+        model
+            .device()
+            .set_seed(epoch_seed(args.seed ^ 0x5052_4f42_5354_4550, step_index))?;
         let loss = skyjepa_prober_loss(
             model,
             prober,
@@ -722,6 +771,9 @@ fn train_prober(
         let epoch_end = batch_index + 1 == batches_per_epoch;
         let requested_end = progress.global_step == requested_steps;
         if epoch_end || requested_end {
+            model
+                .device()
+                .set_seed(epoch_seed(args.seed ^ 0x5052_4f42_5641_4c, epoch))?;
             let validation = validate_prober(
                 dataset,
                 validation_rows,
@@ -749,16 +801,23 @@ fn train_prober(
         }
         if requested_end
             || epoch_end
+            || progress.global_step == stop_step
             || (args.save_every > 0 && progress.global_step.is_multiple_of(args.save_every))
         {
             progress.completed_requested_steps = progress.global_step == requested_steps;
             progress.updated_at_unix = unix_seconds();
+            metrics.flush()?;
+            metrics.get_ref().sync_all()?;
+            progress.metrics_bytes = metrics.get_ref().metadata()?.len();
             save_stage_state(output_dir, "prober", vars, &optimizer, &progress)?;
         }
     }
-    promote_best(output_dir, "prober")?;
+    let completed = progress.global_step == requested_steps;
+    if completed {
+        promote_best(output_dir, "prober")?;
+    }
     metrics.flush()?;
-    Ok(())
+    Ok(completed)
 }
 
 fn validate_latent(
@@ -1004,6 +1063,7 @@ fn load_or_create_progress(
             best_validation: None,
             best_epoch: None,
             best_step: None,
+            metrics_bytes: 0,
             completed_requested_steps: false,
             updated_at_unix: unix_seconds(),
         })
@@ -1046,19 +1106,36 @@ fn promote_best(output_dir: &Path, stage: &str) -> anyhow::Result<()> {
     atomic_copy(&source, &output_dir.join(format!("{stage}.safetensors")))
 }
 
-fn metrics_writer(path: &Path, append: bool) -> anyhow::Result<BufWriter<File>> {
+fn metrics_writer(root: &Path, stage: &str, append: bool) -> anyhow::Result<BufWriter<File>> {
+    let path = root.join(format!("{stage}-metrics.jsonl"));
+    if append {
+        let snapshot = TrainingSnapshot::load(root, stage)?;
+        let length = snapshot.manifest.progress["metrics_bytes"]
+            .as_u64()
+            .context("snapshot has no committed metrics boundary")? as usize;
+        let bytes = fs::read(&path)?;
+        ensure!(bytes.len() >= length, "metrics file lost committed records");
+        if bytes.len() > length {
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let archive = root.join(format!("{stage}-uncommitted-metrics-{stamp}.jsonl"));
+            le_wm_nv::models::skyjepa::checkpoint::atomic_bytes(&archive, &bytes[length..])?;
+            le_wm_nv::models::skyjepa::checkpoint::atomic_bytes(&path, &bytes[..length])?;
+            eprintln!("archived uncommitted metrics tail to {}", archive.display());
+        }
+    }
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .append(append)
         .truncate(!append)
-        .open(path)
+        .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     Ok(BufWriter::new(file))
 }
 
 fn batch_count(rows: usize, batch_size: usize) -> usize {
-    rows.div_ceil(batch_size)
+    // Never count an optimizer step that the latent objective would skip.
+    rows.div_ceil(batch_size) - usize::from(rows % batch_size == 1)
 }
 
 fn batch_rows(rows: &[usize], batch_index: usize, batch_size: usize) -> &[usize] {
@@ -1105,6 +1182,14 @@ fn scheduled_lr(step: usize, warmup: usize, cosine: usize, max_lr: f64, min_lr: 
 }
 
 fn validate_args(args: &Args) -> anyhow::Result<()> {
+    ensure!(
+        args.stop_after_step.is_none_or(|step| step > 0),
+        "stop-after-step must be positive"
+    );
+    ensure!(
+        args.stop_after_step.is_none() || args.stage != TrainingStage::Both,
+        "stop-after-step requires one explicit stage"
+    );
     ensure!(args.latent_epochs > 0, "latent_epochs must be positive");
     ensure!(args.prober_epochs > 0, "prober_epochs must be positive");
     ensure!(args.batch_size > 1, "batch_size must be at least two");
@@ -1249,5 +1334,6 @@ mod tests {
         let rows = (0..10).collect::<Vec<_>>();
         assert_eq!(batch_count(rows.len(), 4), 3);
         assert_eq!(batch_rows(&rows, 2, 4), &[8, 9]);
+        assert_eq!(batch_count(9, 4), 2);
     }
 }

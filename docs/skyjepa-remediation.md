@@ -11,7 +11,7 @@ pilot artifacts are preserved.
   before modifying an existing run.
 - [x] Crash-safe checkpoint generations: publish weights, optimizer, progress,
   and contract together; retain the previous committed generation.
-- [ ] Deterministic resume: step-addressed SIGReg randomness and independent
+- [x] Deterministic resume: step-addressed SIGReg randomness and independent
   validation; uninterrupted/interrupted equivalence tests.
 - [ ] Canonical 20 Hz contract across trainer, evaluator, and controller.
 - [ ] Domain/trajectory coverage audit and explicit evaluation populations.
@@ -64,3 +64,18 @@ optimizer, and before publication; corruption is rejected on load. Completed
 stages can be resumed to recover package export without repeating updates.
 
 Further experiment results pending.
+
+Resume regression: on the current CUDA environment, interrupted latent runs
+at steps 7, 8, and 9 (before/after epoch validation and into the next epoch)
+match a continuous 16-step run exactly: every f32 weight, every optimizer
+tensor, learning rates, losses, validation metrics, and best-step selection.
+The prober passes the same check across its epoch boundary. SIGReg randomness
+is keyed by run seed and optimizer step, with separate validation seeds.
+Singleton tail batches are excluded from the step schedule. `--stop-after-step`
+pauses an explicit stage without changing its target or adding validation.
+
+Snapshots also commit the durable metrics byte boundary. Resume preserves
+uncommitted/partial log tails in separate files and restores the committed log
+before appending, so replay does not duplicate updates in reported metrics.
+This is a same-hardware/software determinism guarantee, not a claim of bitwise
+equivalence across GPU models or CUDA/library versions.

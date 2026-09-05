@@ -4,6 +4,7 @@ use le_wm_nv::{
 };
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
@@ -56,6 +57,9 @@ fn generate(path: &Path, seed: &str) {
     );
 }
 fn trainer(data: &Path, output: &Path, stage: &str) -> Command {
+    trainer_with_steps(data, output, stage, "2")
+}
+fn trainer_with_steps(data: &Path, output: &Path, stage: &str, steps: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_lewm-train-skyjepa"));
     cmd.arg("--dataset-dir")
         .arg(data)
@@ -67,14 +71,16 @@ fn trainer(data: &Path, output: &Path, stage: &str) -> Command {
             "--batch-size",
             "16",
             "--latent-max-steps",
-            "2",
+            steps,
             "--prober-max-steps",
-            "2",
+            steps,
             "--warmup-steps",
             "1",
             "--cosine-steps",
             "3",
             "--save-every",
+            "1",
+            "--log-every",
             "1",
             "--validation-batches",
             "1",
@@ -170,5 +176,112 @@ fn prober_reuses_parent_normalization_and_rejects_resume_changes_without_writes(
         String::from_utf8_lossy(&rejected.stderr).contains("optimizer.safetensors fingerprint")
     );
     assert_eq!(corrupted, tree_fingerprint(&prober)?);
+    Ok(())
+}
+
+fn assert_tensor_files_equal(lhs: &Path, rhs: &Path) -> anyhow::Result<()> {
+    let a = candle::safetensors::load(lhs, &candle::Device::Cpu)?;
+    let b = candle::safetensors::load(rhs, &candle::Device::Cpu)?;
+    assert_eq!(a.len(), b.len());
+    for (key, tensor) in a {
+        assert_eq!(tensor.dims(), b[&key].dims());
+        assert_eq!(
+            tensor.flatten_all()?.to_vec1::<f32>()?,
+            b[&key].flatten_all()?.to_vec1::<f32>()?,
+            "tensor {key} differs between uninterrupted and resumed training"
+        );
+    }
+    Ok(())
+}
+
+fn training_metrics(path: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    fs::read_to_string(path)?
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line)?;
+            value.as_object_mut().unwrap().remove("elapsed_sec");
+            Ok(value)
+        })
+        .collect()
+}
+
+#[test]
+fn cuda_resume_matches_uninterrupted_updates_across_validation_and_epoch_boundaries()
+-> anyhow::Result<()> {
+    let scratch = Scratch::new();
+    let data = scratch.0.join("data");
+    generate(&data, "31");
+    let continuous = scratch.0.join("continuous");
+    successful(trainer_with_steps(&data, &continuous, "latent", "16").output()?);
+    let original = TrainingSnapshot::load(&continuous, "latent")?;
+    // This fixture has eight batches per epoch. Exercise both sides of the
+    // epoch validation and the first batch of the next epoch.
+    assert_eq!(original.manifest.progress["batches_per_epoch"], 8);
+    for interruption in [7, 8, 9] {
+        let resumed = scratch.0.join(format!("resumed-{interruption}"));
+        successful(
+            trainer_with_steps(&data, &resumed, "latent", "16")
+                .arg("--stop-after-step")
+                .arg(interruption.to_string())
+                .output()?,
+        );
+        assert_eq!(
+            TrainingSnapshot::load(&resumed, "latent")?.manifest.step,
+            interruption
+        );
+        // Model a crash after logging an update but before publishing its
+        // snapshot. Recovery must not leave duplicate/uncommitted metrics.
+        let mut log = fs::OpenOptions::new()
+            .append(true)
+            .open(resumed.join("latent-metrics.jsonl"))?;
+        log.write_all(b"{\"step\":999,\"kind\":\"train\"}\n{\"partial\":")?;
+        drop(log);
+        successful(
+            trainer_with_steps(&data, &resumed, "latent", "16")
+                .arg("--resume")
+                .output()?,
+        );
+        let actual = TrainingSnapshot::load(&resumed, "latent")?;
+        assert_tensor_files_equal(&original.weights_path(), &actual.weights_path())?;
+        assert_tensor_files_equal(&original.optimizer_path(), &actual.optimizer_path())?;
+        assert_eq!(
+            training_metrics(&continuous.join("latent-metrics.jsonl"))?,
+            training_metrics(&resumed.join("latent-metrics.jsonl"))?
+        );
+        assert_eq!(
+            original.manifest.progress["best_step"],
+            actual.manifest.progress["best_step"]
+        );
+    }
+    let prober_a = scratch.0.join("prober-continuous");
+    let prober_b = scratch.0.join("prober-resumed");
+    successful(
+        trainer_with_steps(&data, &prober_a, "prober", "16")
+            .arg("--latent-checkpoint")
+            .arg(&continuous)
+            .output()?,
+    );
+    successful(
+        trainer_with_steps(&data, &prober_b, "prober", "16")
+            .arg("--latent-checkpoint")
+            .arg(&continuous)
+            .args(["--stop-after-step", "8"])
+            .output()?,
+    );
+    successful(
+        trainer_with_steps(&data, &prober_b, "prober", "16")
+            .arg("--latent-checkpoint")
+            .arg(&continuous)
+            .arg("--resume")
+            .output()?,
+    );
+    let a = TrainingSnapshot::load(&prober_a, "prober")?;
+    let b = TrainingSnapshot::load(&prober_b, "prober")?;
+    assert_tensor_files_equal(&a.weights_path(), &b.weights_path())?;
+    assert_tensor_files_equal(&a.optimizer_path(), &b.optimizer_path())?;
+    assert_eq!(
+        training_metrics(&prober_a.join("prober-metrics.jsonl"))?,
+        training_metrics(&prober_b.join("prober-metrics.jsonl"))?
+    );
     Ok(())
 }
