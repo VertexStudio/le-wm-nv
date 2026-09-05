@@ -3,7 +3,10 @@ use std::{fs, path::PathBuf, time::Instant};
 use anyhow::{Context, ensure};
 use clap::Parser;
 use le_wm_nv::{
-    models::skyjepa::{SkyJepaControllerSession, SkyJepaSessionConfig, SkyJepaWarmStart},
+    models::skyjepa::{
+        SkyJepaControllerSession, SkyJepaSessionConfig, SkyJepaWarmStart,
+        checkpoint::{SkyJepaCheckpoint, file_sha256},
+    },
     runtime::DeviceSpec,
     skyjepa_sim::{SkyJepaDomain, SkyJepaRotorPlant, SkyJepaRotorState},
     skyjepa_task::{SkyJepaReferenceKind, skyjepa_reference_horizon, skyjepa_reference_state},
@@ -59,6 +62,13 @@ struct Args {
 
 #[derive(Debug, Serialize)]
 struct SimulationReport {
+    report_version: u32,
+    checkpoint_sha256: String,
+    executable_sha256: String,
+    configuration: serde_json::Value,
+    finite: bool,
+    ground_contact: bool,
+    trace: Vec<SimulationStep>,
     reference: SkyJepaReferenceKind,
     control_steps: usize,
     samples: usize,
@@ -88,11 +98,23 @@ struct SimulationReport {
     first_predicted_states: Vec<[f32; 18]>,
 }
 
+#[derive(Debug, Serialize)]
+struct SimulationStep {
+    time_seconds: f32,
+    state: SkyJepaRotorState,
+    reference: [f32; 18],
+    action: [f32; 4],
+    prior_action: [f32; 4],
+    action_correction: [f32; 4],
+    plan_ms: f64,
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
     let started = Instant::now();
     let checkpoint_dir = args.checkpoint_dir.unwrap_or_else(default_checkpoint_dir);
+    let checkpoint = SkyJepaCheckpoint::load(&checkpoint_dir)?;
     let device = args.device.resolve()?;
     let domain = if args.randomize_domain {
         SkyJepaDomain::sample(args.domain_seed)
@@ -107,8 +129,12 @@ fn main() -> anyhow::Result<()> {
         warm_start: args.warm_start,
         ..SkyJepaSessionConfig::default()
     };
-    let mut controller =
-        SkyJepaControllerSession::load(&checkpoint_dir, device, session_cfg, plant.state())?;
+    let mut controller = SkyJepaControllerSession::load(
+        &checkpoint_dir,
+        device,
+        session_cfg.clone(),
+        plant.state(),
+    )?;
     let dt = controller.dt();
     let sim_substeps = (args.simulation_rate_hz as f32 * dt).round() as usize;
     ensure!(
@@ -128,6 +154,9 @@ fn main() -> anyhow::Result<()> {
     let mut first_predicted_states = Vec::new();
     let mut correction_sum = 0.0f64;
     let mut maximum_correction = 0.0f64;
+    let mut trace = Vec::with_capacity(args.control_steps);
+    let mut ground_contact = false;
+    let mut finite = true;
     let warmup_reference = skyjepa_reference_horizon(
         args.reference,
         0.0,
@@ -178,6 +207,7 @@ fn main() -> anyhow::Result<()> {
         }
         for _ in 0..sim_substeps {
             plant.step(action, sim_dt);
+            ground_contact |= plant.state().position[2] <= 0.051;
         }
         controller.commit_observation(plant.state(), action);
         let reference = skyjepa_reference_state(
@@ -197,6 +227,22 @@ fn main() -> anyhow::Result<()> {
             .sum::<f64>();
         squared_position_error += error_sq;
         maximum_position_error = maximum_position_error.max(error_sq.sqrt());
+        finite &= plant
+            .state()
+            .as_state18()
+            .iter()
+            .chain(action.iter())
+            .all(|value| value.is_finite());
+        trace.push(SimulationStep {
+            time_seconds: time + dt,
+            state: plant.state(),
+            reference,
+            action,
+            prior_action: plan.prior_action,
+            action_correction: plan.action_correction,
+            plan_ms: plan.plan_ms,
+        });
+        ensure!(finite, "non-finite simulation state/action at step {step}");
     }
     let mean_plan_seconds = total_plan_seconds / args.control_steps as f64;
     let steady_mean_plan_seconds = if plan_times.len() > 1 {
@@ -211,6 +257,16 @@ fn main() -> anyhow::Result<()> {
         sorted_plan_times[index]
     };
     let report = SimulationReport {
+        report_version: 2,
+        checkpoint_sha256: checkpoint.fingerprint()?,
+        executable_sha256: file_sha256(&std::env::current_exe()?)?,
+        configuration: serde_json::json!({"argv":std::env::args().collect::<Vec<_>>(),
+            "session":session_cfg,"domain_seed":args.domain_seed,"simulation_rate_hz":args.simulation_rate_hz,
+            "radius_m":args.radius_m,"period_seconds":args.period_seconds,
+            "timing_scope":"planning only; simulated time does not model scheduling overruns; first measured cycle includes prediction export"}),
+        finite,
+        ground_contact,
+        trace,
         reference: args.reference,
         control_steps: args.control_steps,
         samples: args.samples,
@@ -253,8 +309,8 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     ensure!(args.samples > 0, "samples must be positive");
     ensure!(args.horizon > 0, "horizon must be positive");
     ensure!(
-        args.simulation_rate_hz >= 20,
-        "simulation_rate_hz must be at least 20"
+        args.simulation_rate_hz >= 20 && args.simulation_rate_hz.is_multiple_of(20),
+        "simulation_rate_hz must be a positive multiple of the 20 Hz model rate"
     );
     ensure!(
         args.radius_m.is_finite() && args.radius_m > 0.0,

@@ -184,3 +184,20 @@ as three independent training-seed measurements. Reuse requires exact equality
 of all three packages' model/preprocessing/physics contracts. Trained results
 are measured separately for every seed. The runner refuses concurrent training
 or compilation for timing measurements and preserves each invocation/report.
+
+Full `cargo test --locked --workspace -- --test-threads=1` passes, including
+LeWM CUDA training/runtime regressions. The three local-uv evaluation-protocol
+tests also pass. Simulator reports now bind the checkpoint/executable and
+configuration, retain a per-control-step state/reference/action/correction trace,
+and report finite-state and substep ground-contact checks. Its new integration
+smoke test passes. Trim stress affects the geometric prior in every comparator
+and the nominal model's calibration; learned/untrained model inputs retain their
+true metric actions, matching the training data contract.
+
+Seed 7 completed its fixed budgets: latent 1,000 steps in 1,724.665 seconds,
+prober 5,000 steps in 343.128 seconds. Best latent validation prediction loss
+0.259284 (24 active dimensions), best prober validation MSE 0.019535 at step
+4,860. Training checkpoint selection uses the recorded eight validation batches
+per epoch, not the complete validation population. Follow-up open-loop evaluation
+will cover the complete selected test populations. These validation numbers are
+not directly comparable to the historical pilot's different preprocessing/split.

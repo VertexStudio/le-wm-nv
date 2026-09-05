@@ -436,10 +436,10 @@ fn tracking_scores(
     cost: &SkyJepaTrackingCost,
 ) -> Result<Tensor> {
     let reference = reference_states.unsqueeze(1)?;
-    let position = grouped_squared_error(&predicted, &reference, 0, 3)?;
-    let velocity = grouped_squared_error(&predicted, &reference, 3, 3)?;
-    let attitude = grouped_squared_error(&predicted, &reference, 6, 9)?;
-    let angular_velocity = grouped_squared_error(&predicted, &reference, 15, 3)?;
+    let position = grouped_squared_error(predicted, &reference, 0, 3)?;
+    let velocity = grouped_squared_error(predicted, &reference, 3, 3)?;
+    let attitude = grouped_squared_error(predicted, &reference, 6, 9)?;
+    let angular_velocity = grouped_squared_error(predicted, &reference, 15, 3)?;
     let action_error = action_candidates
         .broadcast_sub(&reference_actions.unsqueeze(1)?)?
         .sqr()?

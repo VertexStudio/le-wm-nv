@@ -424,5 +424,33 @@ fn domain_split_and_external_evaluation_report_the_actual_population() -> anyhow
             assert_eq!(scenario["plan_times_ms"].as_array().unwrap().len(), 2);
         }
     }
+    successful(
+        Command::new(env!("CARGO_BIN_EXE_lewm-sim-skyjepa"))
+            .arg("--checkpoint-dir")
+            .arg(&run)
+            .arg("--output")
+            .arg(&report)
+            .args([
+                "--control-steps",
+                "2",
+                "--samples",
+                "8",
+                "--horizon",
+                "3",
+                "--warm-start",
+                "shifted-residual",
+            ])
+            .output()?,
+    );
+    let simulation: serde_json::Value = serde_json::from_slice(&fs::read(&report)?)?;
+    assert_eq!(simulation["trace"].as_array().unwrap().len(), 2);
+    assert_eq!(simulation["finite"], true);
+    assert_eq!(simulation["ground_contact"], false);
+    assert_eq!(
+        simulation["configuration"]["session"]["warm_start"],
+        "shifted_residual"
+    );
+    assert_eq!(simulation["checkpoint_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(simulation["executable_sha256"].as_str().unwrap().len(), 64);
     Ok(())
 }

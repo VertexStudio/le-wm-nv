@@ -61,7 +61,8 @@ struct Args {
     #[arg(long, value_enum, default_value_t = SkyJepaWarmStart::FreshPrior)]
     warm_start: SkyJepaWarmStart,
 
-    /// Perturb prior/model trim calibration, not the observed command history.
+    /// Perturb geometric-prior and nominal-model trim, not learned-model inputs
+    /// or the observed command history.
     #[arg(long, default_value_t = 1.0)]
     trim_multiplier: f32,
 
@@ -300,7 +301,7 @@ fn main() -> anyhow::Result<()> {
             "domain_distribution":args.domain_distribution,
             "max_position_rmse_m":args.max_position_rmse_m,"max_position_error_m":args.max_position_error_m,
             "max_p95_plan_ms":args.max_p95_plan_ms,"min_success_rate":args.min_success_rate,
-            "trim_history":"true observed commands; multiplier changes calibration only",
+            "trim_history":"true observed commands; multiplier changes geometric prior for all modes and nominal model calibration; learned models retain raw metric actions",
             "nominal_model":"nominal rigid body, 200 Hz substeps, trim-calibrated actions and command-filtered motor state"}),
         environment_before,
         environment_after: capture_environment(),
